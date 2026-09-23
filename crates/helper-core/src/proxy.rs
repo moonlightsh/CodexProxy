@@ -8,8 +8,9 @@
 //! - 自识端点 `GET /__codex_helper_proxy_id` 用于端口复用判定；
 //! - 每条连接结束后产生 [`ConnectionRecord`]，交给回调（界面环形缓冲）并按采样写日志。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -101,6 +102,9 @@ pub struct ProxyConfig {
     pub socks5_port: u16,
     /// 每条连接结束后调用
     pub on_record: Option<RecordSink>,
+    /// 仅供测试：直连时把主机名（规范化后）映射到固定地址，用于验证“命中规则但上游失败时
+    /// 目标未收到直连”。生产必须为 `None`；只影响直连路径，不影响分流判定与 SOCKS5 路径。
+    pub direct_overrides: Option<Arc<HashMap<String, SocketAddr>>>,
 }
 
 impl Default for ProxyConfig {
@@ -109,6 +113,7 @@ impl Default for ProxyConfig {
             socks5_host: crate::consts::SOCKS5_HOST.to_string(),
             socks5_port: crate::consts::SOCKS5_PORT,
             on_record: None,
+            direct_overrides: None,
         }
     }
 }
@@ -119,6 +124,7 @@ impl fmt::Debug for ProxyConfig {
             .field("socks5_host", &self.socks5_host)
             .field("socks5_port", &self.socks5_port)
             .field("on_record", &self.on_record.as_ref().map(|_| "<fn>"))
+            .field("direct_overrides", &self.direct_overrides)
             .finish()
     }
 }
