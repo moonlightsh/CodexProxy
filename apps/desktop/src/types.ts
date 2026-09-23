@@ -69,7 +69,17 @@ export interface ErrorPayload {
   message: string;
 }
 
+export type ReconcileOutcome = "idle" | "residueFound" | "applied" | "needsKey" | "failed";
+
+export interface ReconcileReport {
+  outcome: ReconcileOutcome;
+  error: ErrorPayload | null;
+  status: Status;
+}
+
 /** Rust → 前端事件名 */
 export const EVENT_STATUS_CHANGED = "status-changed";
 export const EVENT_CONNECTION_RECORDED = "connection-recorded";
 export const EVENT_KEY_REQUIRED = "key-required";
+export const EVENT_RECONCILE_FINISHED = "reconcile-finished";
+export const EVENT_OPERATION_FAILED = "operation-failed";

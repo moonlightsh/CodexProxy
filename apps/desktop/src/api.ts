@@ -4,6 +4,7 @@ import type {
   ConnectionRecord,
   EnableRequest,
   ErrorPayload,
+  ReconcileReport,
   SaveKeyRequest,
   Status,
 } from "./types";
@@ -19,6 +20,7 @@ export const api = {
   removeLegacyEnvBlock: () => invoke<Status>("remove_legacy_env_block"),
   setAutostart: (enabled: boolean) => invoke<Status>("set_autostart", { enabled }),
   recentConnections: () => invoke<ConnectionRecord[]>("recent_connections"),
+  getReconcileReport: () => invoke<ReconcileReport | null>("get_reconcile_report"),
 };
 
 /** 把 invoke 抛出的错误规范化为 ErrorPayload。 */

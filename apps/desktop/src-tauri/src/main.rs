@@ -20,6 +20,7 @@ fn main() {
             commands::remove_legacy_env_block,
             commands::set_autostart,
             commands::recent_connections,
+            commands::get_reconcile_report,
         ])
         .run(tauri::generate_context!())
         .expect("CodexHelper 启动失败");

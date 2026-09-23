@@ -5,7 +5,9 @@
 //! 事件（Rust → 前端）：
 //! - `status-changed`：payload 为 `Status`，任何状态变化后推送；
 //! - `connection-recorded`：payload 为 `ConnectionRecord`，每条代理连接结束后推送；
-//! - `key-required`：payload 为空，启动对账发现已启用但凭据缺失时推送（前端聚焦 Key 录入）。
+//! - `key-required`：payload 为空，启动对账发现已启用但凭据缺失时推送（前端聚焦 Key 录入）；
+//! - `reconcile-finished`：payload 为 `ReconcileReport`，启动对账完成后推送一次；
+//! - `operation-failed`：payload 为 `ErrorPayload`，非前端发起的操作（如托盘开关）失败时推送。
 
 // 阶段 3 任务 3.1 接入事件推送后移除本行。
 #![allow(dead_code)]
@@ -13,7 +15,9 @@
 use std::sync::Arc;
 
 use helper_core::manager::Manager;
-use helper_core::types::{ConnectionRecord, EnableRequest, ErrorPayload, SaveKeyRequest, Status};
+use helper_core::types::{
+    ConnectionRecord, EnableRequest, ErrorPayload, ReconcileReport, SaveKeyRequest, Status,
+};
 
 /// 事件名：状态变化。
 pub const EVENT_STATUS_CHANGED: &str = "status-changed";
@@ -21,6 +25,10 @@ pub const EVENT_STATUS_CHANGED: &str = "status-changed";
 pub const EVENT_CONNECTION_RECORDED: &str = "connection-recorded";
 /// 事件名：需要录入 Key。
 pub const EVENT_KEY_REQUIRED: &str = "key-required";
+/// 事件名：启动对账完成。
+pub const EVENT_RECONCILE_FINISHED: &str = "reconcile-finished";
+/// 事件名：非前端发起的操作失败。
+pub const EVENT_OPERATION_FAILED: &str = "operation-failed";
 
 /// 托管给 Tauri 的共享状态。
 pub struct AppState {
@@ -105,6 +113,13 @@ pub async fn set_autostart(
 /// 最近连接（最新在前，最多 50 条）。
 #[tauri::command]
 pub fn recent_connections(state: tauri::State<'_, AppState>) -> Vec<ConnectionRecord> {
+    let _ = &state.manager;
+    todo!("阶段 3 任务 3.1")
+}
+
+/// 最近一次启动对账的报告；对账尚未完成时为 `None`（前端加载晚于 `reconcile-finished` 事件时用它补齐）。
+#[tauri::command]
+pub fn get_reconcile_report(state: tauri::State<'_, AppState>) -> Option<ReconcileReport> {
     let _ = &state.manager;
     todo!("阶段 3 任务 3.1")
 }
