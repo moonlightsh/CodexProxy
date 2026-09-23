@@ -10,4 +10,4 @@ if [[ ! -x "$TC/cargo" ]]; then
   exit 0
 fi
 RUSTC="$TC/rustc" CARGO_TARGET_DIR=target/wincheck "$TC/cargo" check \
-  --target x86_64-pc-windows-msvc -p helper-core -p codex-helper-credential --all-targets "$@"
+  --target x86_64-pc-windows-msvc -p helper-core -p codex-helper-credential -p codex-helper --all-targets "$@"

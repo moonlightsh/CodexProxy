@@ -7,4 +7,6 @@ echo "== cargo clippy";        cargo clippy --workspace --all-targets -- -D warn
 echo "== cargo test";          cargo test --workspace
 echo "== windows check";       scripts/check-windows.sh
 echo "== tsc";                 npm --prefix apps/desktop run check
+echo "== frontend test";       npm --prefix apps/desktop test
+echo "== frontend build";      npm --prefix apps/desktop run build
 echo "== gate passed"
