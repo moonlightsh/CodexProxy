@@ -27,7 +27,8 @@ jobs:
       - name: 安装 Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          # 24：前端单元测试用 `node --test --experimental-strip-types` 直接运行 .ts。
+          node-version: "24"
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
 
@@ -47,3 +48,6 @@ jobs:
 
       - name: 前端类型检查
         run: npm --prefix apps/desktop run check
+
+      - name: 前端单元测试
+        run: npm --prefix apps/desktop test
