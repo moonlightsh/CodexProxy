@@ -1,0 +1,49 @@
+name: CI
+
+# push / pull_request 均触发（设计 §12、实施计划 §4 门禁）。
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存 cargo 构建产物
+        uses: Swatinem/rust-cache@v2
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: 安装前端依赖
+        run: npm ci --prefix apps/desktop
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Windows 矩阵上本步骤会一并跑 Credential Manager 真实读写测试
+      # 与 codex-helper-credential 的 stdout / stderr 约定测试（设计 §11「Windows 专属」）。
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: 前端类型检查
+        run: npm --prefix apps/desktop run check
