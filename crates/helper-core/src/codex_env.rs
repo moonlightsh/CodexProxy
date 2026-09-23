@@ -75,24 +75,16 @@ fn block_lines(proxy_port: u16) -> [String; 5] {
     ]
 }
 
-/// 剥离指定标记块（起止标记 + 中间内容）后的结果。
-struct BlockScan {
-    /// 保留下来的行（不含任何被剥离的块）。
-    kept: Vec<String>,
-    /// 找到的完整块（起止标记成对出现）数量。
-    complete_blocks: usize,
-}
-
 /// 在 `text` 中查找并剥离 `begin`/`end` 标记之间的块，其余标记（如另一套标记）与用户内容原样保留。
+/// 返回保留下来的行（已去掉结尾空行）。
 ///
 /// 对不完整块的保守处理：
 /// - 只有起始标记、直到文件末尾或下一个起始标记都没有匹配的结束标记：只删起始标记行，以及紧随其后
 ///   连续的受管键行（`HTTP_PROXY=` / `HTTPS_PROXY=` / `NO_PROXY=`），其后的用户内容原样保留。
 /// - 只有结束标记、没有配对的起始标记：只删该行。
-fn scan_and_strip(text: &str, begin: &str, end: &str) -> BlockScan {
+fn scan_and_strip(text: &str, begin: &str, end: &str) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
     let mut kept: Vec<String> = Vec::with_capacity(lines.len());
-    let mut complete_blocks = 0usize;
     let mut i = 0usize;
     while i < lines.len() {
         let trimmed = lines[i].trim();
@@ -113,7 +105,6 @@ fn scan_and_strip(text: &str, begin: &str, end: &str) -> BlockScan {
             }
             match matched_end {
                 Some(end_idx) => {
-                    complete_blocks += 1;
                     i = end_idx + 1;
                 }
                 None => {
@@ -136,10 +127,7 @@ fn scan_and_strip(text: &str, begin: &str, end: &str) -> BlockScan {
     while kept.last().is_some_and(|line| line.trim().is_empty()) {
         kept.pop();
     }
-    BlockScan {
-        kept,
-        complete_blocks,
-    }
+    kept
 }
 
 /// 渲染受管块文本（含结尾换行）。
@@ -154,7 +142,7 @@ pub fn render_block(proxy_port: u16) -> String {
 pub fn upsert_block(existing: &str, proxy_port: u16) -> String {
     let (has_bom, body) = strip_bom(existing);
     let eol = detect_eol(body);
-    let BlockScan { mut kept, .. } = scan_and_strip(body, BEGIN_MARKER, END_MARKER);
+    let mut kept = scan_and_strip(body, BEGIN_MARKER, END_MARKER);
     if !kept.is_empty() {
         kept.push(String::new()); // 用户内容与受管块之间留一空行
     }
@@ -180,7 +168,7 @@ pub fn remove_legacy_block(existing: &str) -> String {
 fn strip_and_render(existing: &str, begin: &str, end: &str) -> String {
     let (has_bom, body) = strip_bom(existing);
     let eol = detect_eol(body);
-    let BlockScan { kept, .. } = scan_and_strip(body, begin, end);
+    let kept = scan_and_strip(body, begin, end);
     let mut out = join_lines(&kept, eol);
     if has_bom && !out.is_empty() {
         out.insert(0, '\u{feff}');
