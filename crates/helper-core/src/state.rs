@@ -82,7 +82,8 @@ pub fn load(path: &Path) -> anyhow::Result<Option<HelperState>> {
 pub fn save(path: &Path, state: &HelperState) -> anyhow::Result<()> {
     let mut text = serde_json::to_string_pretty(state)?;
     text.push('\n');
-    crate::fsutil::atomic_write(path, text.as_bytes())?;
+    crate::fsutil::atomic_write(path, text.as_bytes())
+        .map_err(|error| anyhow::anyhow!("写入状态文件 {} 失败：{error}", path.display()))?;
     Ok(())
 }
 

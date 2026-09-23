@@ -303,10 +303,16 @@ NO_PROXY=10.20.30.61,127.0.0.1,localhost
 - `ci.yml`：push / PR 触发；`windows-latest` 与 `macos-latest` 上运行
   `cargo fmt --check`、`cargo clippy --workspace -- -D warnings`、`cargo test --workspace`、前端 `tsc`。
 - `release.yml`：`v*` tag 触发；`windows-latest` 上 `tauri build` 生成 NSIS 安装包并上传 GitHub Release。
-- NSIS：`installMode: currentUser`，安装到 `%LOCALAPPDATA%\Programs\CodexHelper`，无需管理员。
-- `codex-helper-credential.exe` 作为 Tauri `externalBin` 与主程序同目录发布。
-- 卸载：`installerHooks` 的 `NSIS_HOOK_PREUNINSTALL` 中调用 `codex-helper-credential.exe cleanup`，
-  随后弹窗询问“是否同时清除 API Key？”，选“是”追加 `--purge-key`。
+- NSIS：`installMode: currentUser`，无需管理员。安装目录为 Tauri 2 的默认值 `%LOCALAPPDATA%\CodexHelper`
+  （实施时查证 tauri-bundler 模板确认；原设想的 `...\Programs\CodexHelper` 需自定义模板，不采用），
+  与工具数据目录相同：`state.json`、`logs\` 与程序文件同目录，卸载时程序文件被删除，状态与日志保留。
+- `codex-helper-credential.exe` 作为 Tauri `externalBin` 与主程序同目录发布；externalBin 放在
+  `tauri.bundle.conf.json`，仅发布构建时通过 `tauri build --config` 合并，不影响日常 `cargo` 构建。
+- 卸载：`NSIS_HOOK_PREUNINSTALL` 中先询问“是否同时清除 API Key？”（静默卸载默认“否”），并把
+  `codex-helper-credential.exe` 复制到卸载器临时目录；`NSIS_HOOK_POSTUNINSTALL` 中再执行
+  `cleanup`（选“是”追加 `--purge-key`）。放到 POSTUNINSTALL 是因为 Tauri 模板在 PREUNINSTALL 之后才检测
+  主程序是否在运行，用户此时取消会中止卸载，若已先清理会出现“程序还在、配置已撤销”的中间态。
+- 覆盖安装 / 升级触发的旧版本卸载不清理、不弹窗（`$UpdateMode = 1` 或卸载器在 `$INSTDIR` 原地运行）。
 
 ## 13. Windows 实机验收
 
@@ -320,6 +326,7 @@ NO_PROXY=10.20.30.61,127.0.0.1,localhost
 8. 开启自启并重启：工具仅驻留托盘，代理可用。
 9. 占用 17891 后启用：失败且未写 `.env`。
 10. 卸载两种选择（保留 Key / 清除 Key）结果符合预期。
+11. 用新版本安装包覆盖安装（“先卸载再安装”）：不弹 Key 询问框，受管配置与启用状态保持不变。
 
 ## 14. 兼容性关注点
 

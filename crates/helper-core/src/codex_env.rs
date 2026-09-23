@@ -191,9 +191,9 @@ fn strip_and_render(existing: &str, begin: &str, end: &str) -> String {
 /// 检查文本内容。
 pub fn inspect_text(existing: &str, proxy_port: u16) -> EnvInspection {
     let (_, body) = strip_bom(existing);
-    let has_block = scan_and_strip(body, BEGIN_MARKER, END_MARKER).complete_blocks > 0;
-    let has_legacy_block =
-        scan_and_strip(body, LEGACY_BEGIN_MARKER, LEGACY_END_MARKER).complete_blocks > 0;
+    // 不完整块（只有起始或结束标记）也算残留：停用状态下的残留检测与旧块警告都不能漏掉它。
+    let has_block = has_marker(body, BEGIN_MARKER, END_MARKER);
+    let has_legacy_block = has_marker(body, LEGACY_BEGIN_MARKER, LEGACY_END_MARKER);
     // “块内容等于 render_block(port) 且位于末尾”等价于 upsert 结果与原文一致（幂等）。
     let block_up_to_date = has_block && upsert_block(existing, proxy_port) == existing;
     EnvInspection {
@@ -225,20 +225,34 @@ pub fn write_block_to_file(env_path: &Path, proxy_port: u16) -> std::io::Result<
 
 /// 从文件移除受管块；移除后只剩空白则删除文件。文件或块不存在视为成功。返回是否有改动。
 pub fn remove_block_from_file(env_path: &Path) -> std::io::Result<bool> {
-    remove_via(env_path, remove_block)
+    remove_via(env_path, BEGIN_MARKER, END_MARKER)
 }
 
 /// 从文件移除 Codex++ 旧块；移除后只剩空白则删除文件。文件或块不存在视为成功。返回是否有改动。
 pub fn remove_legacy_block_from_file(env_path: &Path) -> std::io::Result<bool> {
-    remove_via(env_path, remove_legacy_block)
+    remove_via(env_path, LEGACY_BEGIN_MARKER, LEGACY_END_MARKER)
+}
+
+/// 文本中是否出现指定标记（完整块或不完整块都算）。
+fn has_marker(body: &str, begin: &str, end: &str) -> bool {
+    body.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == begin || trimmed == end
+    })
 }
 
 /// `remove_block_from_file` / `remove_legacy_block_from_file` 的共同实现。
-fn remove_via(env_path: &Path, remove: impl Fn(&str) -> String) -> std::io::Result<bool> {
+///
+/// 文件中没有对应标记时不做任何改写（不规范化换行、不删除只含空白的文件），返回 `Ok(false)`，
+/// 保证“是否有改动”如实反映受管块是否被移除。
+fn remove_via(env_path: &Path, begin: &str, end: &str) -> std::io::Result<bool> {
     let Some(existing) = fsutil::read_optional(env_path)? else {
         return Ok(false);
     };
-    let updated = remove(&existing);
+    if !has_marker(strip_bom(&existing).1, begin, end) {
+        return Ok(false);
+    }
+    let updated = strip_and_render(&existing, begin, end);
     if updated == existing {
         return Ok(false);
     }
@@ -629,5 +643,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".env");
         assert!(!remove_legacy_block_from_file(&path).unwrap());
+    }
+
+    // ---- 阶段 1 合并后的补充 ----
+
+    #[test]
+    fn remove_from_file_without_markers_leaves_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        for original in ["  \n\n", "KEEP=1\r\nOTHER=2\n\n\n"] {
+            std::fs::write(&path, original).unwrap();
+            assert!(!remove_block_from_file(&path).unwrap());
+            assert!(!remove_legacy_block_from_file(&path).unwrap());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn inspect_detects_incomplete_blocks_as_residue() {
+        let current = format!("KEEP=1\n{BEGIN_MARKER}\nHTTPS_PROXY=http://127.0.0.1:17891\n");
+        let inspection = inspect_text(&current, 17891);
+        assert!(inspection.has_block);
+        assert!(!inspection.block_up_to_date);
+
+        let legacy = format!("{LEGACY_BEGIN_MARKER}\nHTTP_PROXY=http://127.0.0.1:1\n");
+        assert!(inspect_text(&legacy, 17891).has_legacy_block);
+        let orphan_end = format!("KEEP=1\n{LEGACY_END_MARKER}\n");
+        assert!(inspect_text(&orphan_end, 17891).has_legacy_block);
     }
 }

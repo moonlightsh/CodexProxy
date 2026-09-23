@@ -26,6 +26,10 @@ pub async fn verify_key(key: &str) -> KeyCheck {
 /// 客户端固定关闭代理（网关在内网，即便环境变量或系统代理配置有误也不应影响本工具自身的
 /// 请求）、关闭重定向跟随（避免把 Bearer 头带去重定向目标主机）。
 pub async fn verify_key_at(base_url: &str, key: &str, timeout: Duration) -> KeyCheck {
+    // 先单独校验 Key 能否作为请求头值，避免把 base_url 等其他构建错误也误判为 Key 无效。
+    if reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).is_err() {
+        return KeyCheck::Unauthorized;
+    }
     let client = match reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -38,8 +42,6 @@ pub async fn verify_key_at(base_url: &str, key: &str, timeout: Duration) -> KeyC
     let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
     let response = match client.get(&url).bearer_auth(key).send().await {
         Ok(response) => response,
-        // 请求构建失败（多为 Key 含非法请求头字符）与真正的网络/超时错误分开判定。
-        Err(error) if error.is_builder() => return KeyCheck::Unauthorized,
         Err(_) => return KeyCheck::TimeoutOrNetwork,
     };
     match response.status().as_u16() {
@@ -52,9 +54,9 @@ pub async fn verify_key_at(base_url: &str, key: &str, timeout: Duration) -> KeyC
 
 /// TCP 可达性：在超时内能否建立连接（设计 §5.1 第 7 步，仅用于状态灯）。
 pub async fn tcp_reachable(host: &str, port: u16, timeout: Duration) -> bool {
-    let target = format!("{host}:{port}");
+    // 用 (host, port) 元组解析，IPv6 字面量（如 `::1`）无需方括号。
     matches!(
-        tokio::time::timeout(timeout, tokio::net::TcpStream::connect(target)).await,
+        tokio::time::timeout(timeout, tokio::net::TcpStream::connect((host, port))).await,
         Ok(Ok(_))
     )
 }
@@ -204,8 +206,24 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         assert!(tcp_reachable("127.0.0.1", addr.port(), TCP_PROBE_TIMEOUT).await);
         drop(listener);
-        // 释放后的端口应无人监听；直接连接会被拒绝（不使用超时探测同一端口，避免与操作系统
-        // 端口重用时机产生竞争）。
-        assert!(!tcp_reachable("127.0.0.1", 9, TCP_PROBE_TIMEOUT).await);
+        assert!(!tcp_reachable("127.0.0.1", addr.port(), TCP_PROBE_TIMEOUT).await);
+    }
+
+    #[tokio::test]
+    async fn tcp_reachable_accepts_bare_ipv6_literal() {
+        // 部分环境没有 IPv6 回环，绑定失败时跳过。
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        assert!(tcp_reachable("::1", port, TCP_PROBE_TIMEOUT).await);
+    }
+
+    #[tokio::test]
+    async fn invalid_base_url_is_network_error_not_key_rejection() {
+        assert_eq!(
+            verify_key_at("not a url", "sk-valid", KEY_CHECK_TIMEOUT).await,
+            KeyCheck::TimeoutOrNetwork
+        );
     }
 }
