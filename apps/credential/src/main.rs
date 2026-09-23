@@ -472,12 +472,20 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let paths = HelperPaths::new(codex_home.path(), data_dir.path());
 
+        // 无状态文件：按残留规则清理。用户自己的键与变量必须原样保留。
         std::fs::write(
             paths.config_toml(),
-            "model_provider = \"managed_gateway\"\n\n[model_providers.managed_gateway]\nname = \"Managed Gateway\"\n",
+            "model = \"o3\"\nmodel_provider = \"managed_gateway\"\n\n[model_providers.managed_gateway]\nname = \"Managed Gateway\"\n",
         )
         .unwrap();
-        std::fs::write(paths.env_file(), codex_env::render_block(17891)).unwrap();
+        std::fs::write(
+            paths.env_file(),
+            format!(
+                "# 用户自己的变量\nFOO=bar\n\n{}",
+                codex_env::render_block(17891)
+            ),
+        )
+        .unwrap();
 
         let store = MemoryCredentialStore::with_token("sk-purge-me");
         let mut stdout = Vec::new();
@@ -497,6 +505,17 @@ mod tests {
             "cleanup done: env_block_removed=true config_restored=true state_reset=false key=deleted\n"
         );
         assert!(store.read().unwrap().is_none(), "--purge-key 应删除凭据");
+
+        // 实际还原结果：受管 model_provider 与受管节被删除，用户内容逐字节保留
+        assert_eq!(
+            std::fs::read_to_string(paths.config_toml()).unwrap(),
+            "model = \"o3\"\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.env_file()).unwrap(),
+            "# 用户自己的变量\nFOO=bar\n"
+        );
+        assert!(!paths.state_file().exists(), "状态文件缺失时不创建");
     }
 
     #[test]

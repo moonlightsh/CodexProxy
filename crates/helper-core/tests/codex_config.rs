@@ -302,3 +302,37 @@ fn residue_cleanup_matches_restore_without_previous_values() {
         assert!(doc.get("model_provider").is_none(), "{name}");
     }
 }
+
+/// 启用在记录原值之后中断：停用状态下的残留清理按记录的原值还原，逐字节回到原文。
+#[test]
+fn interrupted_enable_is_restored_from_recorded_previous() {
+    for (name, original) in FIXTURES {
+        let sandbox = Sandbox::with(original);
+        let previous = sandbox.enable();
+        codex_config::remove_residue_with(&sandbox.config, &previous).unwrap();
+        assert_eq!(sandbox.read(), *original, "夹具 {name} 未能逐字节还原");
+        assert!(
+            !codex_config::has_residue(&sandbox.config).unwrap(),
+            "{name}"
+        );
+    }
+}
+
+/// 结构不符时 inspect 与 apply_managed 一致地报错，且不写入任何内容。
+#[test]
+fn inspect_reports_structure_errors_without_writing() {
+    let text = "model = \"o3\"\n\n[model_providers.managed_gateway]\nauth = [\"x\"]\n";
+    let sandbox = Sandbox::with(text);
+    match codex_config::inspect(&sandbox.config, COMMAND) {
+        Err(codex_config::ConfigError::NotATable { key }) => {
+            assert_eq!(key, "model_providers.managed_gateway.auth")
+        }
+        other => panic!("应返回 NotATable，实际 {other:?}"),
+    }
+    assert_eq!(sandbox.read(), text);
+    assert!(!sandbox.backup.exists());
+    // 残留判定与清理对结构宽松
+    assert!(codex_config::has_residue(&sandbox.config).unwrap());
+    assert!(codex_config::remove_residue(&sandbox.config).unwrap());
+    assert_eq!(sandbox.read(), "model = \"o3\"\n");
+}

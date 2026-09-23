@@ -76,8 +76,10 @@ pub struct ApplyOutcome {
     pub original: Option<String>,
 }
 
-/// 只读检查。文件不存在返回 `exists = false` 的默认值；无法解析返回 `ConfigError::Parse`。
+/// 只读检查。文件不存在返回 `exists = false` 的默认值。
 ///
+/// 与 [`apply_managed`] 的判定一致：无法解析返回 `ConfigError::Parse`；`model_providers`、受管节或其
+/// `auth` 存在但不是标准 table 时返回 `ConfigError::NotATable`（即“这份配置无法被校正”）。
 /// `credential_command` 用于判定 `fully_managed`（auth.command 是否指向当前安装目录）。
 pub fn inspect(
     config_path: &Path,
@@ -88,20 +90,30 @@ pub fn inspect(
         return Ok(ConfigInspection::default());
     }
     let doc = &loaded.doc;
-    let has_managed_provider = doc
-        .get(MODEL_PROVIDERS_KEY)
-        .and_then(Item::as_table_like)
-        .is_some_and(|providers| providers.contains_key(consts::PROVIDER_ID));
-    // 在副本上跑一遍校正：没有任何改动即“完全受管”，判定标准与 apply_managed 天然一致。
+    // 在副本上跑一遍校正：结构不符即报错，没有任何改动即“完全受管”，判定标准与 apply_managed 天然一致。
     let mut probe = doc.clone();
-    let fully_managed = matches!(ensure_managed(&mut probe, credential_command), Ok(false));
+    let fully_managed = !ensure_managed(&mut probe, credential_command)?;
     Ok(ConfigInspection {
         exists: true,
         model_provider: root_string(doc, MODEL_PROVIDER_KEY),
         model_catalog_json: root_string(doc, MODEL_CATALOG_JSON_KEY),
-        has_managed_provider,
+        has_managed_provider: has_managed_provider(doc),
         fully_managed,
     })
+}
+
+/// 只读检查是否残留任何受管内容（同 [`ConfigInspection::has_managed_residue`]）。
+///
+/// 与 [`remove_residue`] 一样对结构宽松：`model_providers` 等不是标准 table 时不报错，只在文件无法解析
+/// 时返回 `ConfigError::Parse`。用于 [`inspect`] 因结构不符报错时仍能判定“是否需要一键清理”。
+/// 文件不存在返回 `Ok(false)`。
+pub fn has_residue(config_path: &Path) -> Result<bool, ConfigError> {
+    let LoadedConfig { original, doc } = load(config_path)?;
+    if original.is_none() {
+        return Ok(false);
+    }
+    Ok(has_managed_provider(&doc)
+        || doc.get(MODEL_PROVIDER_KEY).and_then(Item::as_str) == Some(consts::PROVIDER_ID))
 }
 
 /// 校正受管内容（幂等）：
@@ -165,10 +177,38 @@ pub fn restore(config_path: &Path, previous: &PreviousConfig) -> Result<bool, Co
 
 /// 无状态文件时的残留清理（设计 §5.4）：`model_provider == "managed_gateway"` 时删除该键，
 /// 并删除受管 provider 节。文件不存在视为成功。返回是否实际写入。
+///
+/// 等价于 `remove_residue_with(config_path, &PreviousConfig::default())`。
 pub fn remove_residue(config_path: &Path) -> Result<bool, ConfigError> {
+    remove_residue_with(config_path, &PreviousConfig::default())
+}
+
+/// 停用状态下的残留清理，兼顾“启用中断”：
+///
+/// - `model_provider == "managed_gateway"` 且 `recorded` 非空（启用在记录原值之后、置为已启用之前中断，
+///   状态文件仍为停用但配置已被接管）→ 与 [`restore`] 相同，按记录的原值还原两个根键；
+/// - `model_provider == "managed_gateway"` 且 `recorded` 为空 → 删除该键；
+/// - 其他 `model_provider`（用户自己的）→ 不动，`model_catalog_json` 同样不动；
+/// - 一律删除受管 provider 节。
+///
+/// 与 [`restore`] 一样对结构宽松（只在无法解析时报错）。文件不存在视为成功。返回是否实际写入。
+pub fn remove_residue_with(
+    config_path: &Path,
+    recorded: &PreviousConfig,
+) -> Result<bool, ConfigError> {
+    let has_record = *recorded != PreviousConfig::default();
     edit_existing(config_path, |doc| {
         if doc.get(MODEL_PROVIDER_KEY).and_then(Item::as_str) == Some(consts::PROVIDER_ID) {
-            remove_root_key(doc, MODEL_PROVIDER_KEY);
+            if has_record {
+                restore_root_string(doc, MODEL_PROVIDER_KEY, recorded.model_provider.as_deref());
+                restore_root_string(
+                    doc,
+                    MODEL_CATALOG_JSON_KEY,
+                    recorded.model_catalog_json.as_deref(),
+                );
+            } else {
+                remove_root_key(doc, MODEL_PROVIDER_KEY);
+            }
         }
         remove_managed_provider(doc);
     })
@@ -317,6 +357,13 @@ fn child_table<'a>(
         .ok_or_else(|| ConfigError::NotATable {
             key: path.to_string(),
         })
+}
+
+/// 是否存在受管 provider 节（标准 table 或 inline table 中的同名项，与删除时的判定一致）。
+fn has_managed_provider(doc: &DocumentMut) -> bool {
+    doc.get(MODEL_PROVIDERS_KEY)
+        .and_then(Item::as_table_like)
+        .is_some_and(|providers| providers.contains_key(consts::PROVIDER_ID))
 }
 
 /// 读取根键的字符串值（类型已在 [`load`] 校验）。
@@ -766,7 +813,37 @@ mod tests {
             }
             assert_eq!(fixture.read(), text);
             assert!(!fixture.backup.exists());
-            assert!(!inspect(&fixture.config, COMMAND).unwrap().fully_managed);
+            // inspect 与 apply_managed 判定一致：同样报 NotATable（只读，不写入）
+            match inspect(&fixture.config, COMMAND) {
+                Err(ConfigError::NotATable { key }) => assert_eq!(key, expected_key, "{text}"),
+                other => panic!("{text} 的 inspect 应返回 NotATable，实际 {other:?}"),
+            }
+            assert_eq!(fixture.read(), text);
+            assert!(!fixture.backup.exists());
+        }
+    }
+
+    #[test]
+    fn residue_check_and_cleanup_tolerate_non_table_structures() {
+        let cases = [
+            ("model_providers = \"x\"\n", false),
+            (
+                "model_provider = \"managed_gateway\"\nmodel_providers = [1]\n",
+                true,
+            ),
+            (
+                "[model_providers]\nmanaged_gateway = { name = \"x\" }\n",
+                true,
+            ),
+            ("[model_providers.managed_gateway]\nauth = \"x\"\n", true),
+        ];
+        for (text, residue) in cases {
+            let fixture = Fixture::with(text);
+            assert!(inspect(&fixture.config, COMMAND).is_err(), "{text}");
+            assert_eq!(has_residue(&fixture.config).unwrap(), residue, "{text}");
+            // 清理路径对结构宽松：能删的受管内容照删，不因结构不符失败
+            assert_eq!(remove_residue(&fixture.config).unwrap(), residue, "{text}");
+            assert!(!has_residue(&fixture.config).unwrap(), "{text}");
         }
     }
 
@@ -1161,6 +1238,55 @@ mod tests {
         );
         assert!(remove_residue(&other.config).unwrap());
         assert_eq!(other.read(), "model_provider = \"custom\"\n");
+    }
+
+    #[test]
+    fn remove_residue_with_record_restores_interrupted_enable() {
+        // 启用在记录原值后中断：配置已被接管，状态文件记录了原值
+        let original =
+            "model_provider = \"custom\"   # 公司代理\nmodel_catalog_json = \"c.json\"\n";
+        let fixture = Fixture::with(original);
+        fixture.apply(COMMAND).unwrap();
+        let recorded = PreviousConfig {
+            model_provider: Some("custom".into()),
+            model_catalog_json: Some("c.json".into()),
+        };
+        assert!(remove_residue_with(&fixture.config, &recorded).unwrap());
+        assert_eq!(fixture.read(), original);
+        assert!(!has_residue(&fixture.config).unwrap());
+
+        // model_provider 已是用户自己的值：原记录不生效，不改 model_provider 与 catalog
+        let user = Fixture::with(
+            "model_provider = \"mine\"\n\n[model_providers.managed_gateway]\nname = \"x\"\n",
+        );
+        assert!(remove_residue_with(&user.config, &recorded).unwrap());
+        assert_eq!(user.read(), "model_provider = \"mine\"\n");
+
+        // 记录为空：等同于 remove_residue
+        let empty = Fixture::with("model_provider = \"managed_gateway\"\nmodel = \"o3\"\n");
+        assert!(remove_residue_with(&empty.config, &PreviousConfig::default()).unwrap());
+        assert_eq!(empty.read(), "model = \"o3\"\n");
+    }
+
+    #[test]
+    fn has_residue_matches_inspection() {
+        let missing = Fixture::new();
+        assert!(!has_residue(&missing.config).unwrap());
+        let clean = Fixture::with("model_provider = \"custom\"\n");
+        assert!(!has_residue(&clean.config).unwrap());
+        let managed = Fixture::new();
+        managed.apply(COMMAND).unwrap();
+        assert!(has_residue(&managed.config).unwrap());
+        assert!(
+            inspect(&managed.config, COMMAND)
+                .unwrap()
+                .has_managed_residue()
+        );
+        let broken = Fixture::with("model = [\n");
+        assert!(matches!(
+            has_residue(&broken.config),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 
     #[test]

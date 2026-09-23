@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use helper_core::codex_config;
 use helper_core::codex_env;
 use helper_core::consts;
 use helper_core::credential::{CredentialStore, MemoryCredentialStore};
@@ -138,11 +139,20 @@ impl Sandbox {
 
     /// 假网关对 `GET /v1/models` 固定返回 `status`。
     async fn with_gateway(status: u16) -> Self {
+        Self::with_response(ResponseTemplate::new(status)).await
+    }
+
+    /// 假网关延迟 `delay` 后返回 200（模拟慢速 Key 校验）。
+    async fn with_slow_gateway(delay: Duration) -> Self {
+        Self::with_response(ResponseTemplate::new(200).set_delay(delay)).await
+    }
+
+    async fn with_response(response: ResponseTemplate) -> Self {
         log_dir();
         let gateway = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
-            .respond_with(ResponseTemplate::new(status))
+            .respond_with(response)
             .mount(&gateway)
             .await;
         let gateway_url = gateway.uri();
@@ -1224,6 +1234,64 @@ async fn cleanup_residue_uses_same_logic_and_stops_proxy() {
     sandbox.assert_no_key_on_disk();
 }
 
+/// 受管节结构不符（inspect 报 NotATable）时：status 同时给出 config_error 与 residue，
+/// 一键清理与卸载清理对结构宽松，仍能完成 .env、config.toml 与状态文件的清理。
+#[tokio::test]
+async fn cleanup_tolerates_structure_errors_in_residue() {
+    let broken = format!("{USER_CONFIG}\n[model_providers.managed_gateway]\nauth = \"x\"\n");
+    for uninstall in [false, true] {
+        let sandbox = Sandbox::new().await;
+        sandbox.write_config(&broken);
+        sandbox.write_env(&format!(
+            "{USER_ENV}{}",
+            codex_env::render_block(sandbox.port)
+        ));
+        sandbox.write_state(&HelperState {
+            enabled: false,
+            previous_model_provider: Some("other".into()),
+            ..Default::default()
+        });
+        let manager = sandbox.manager();
+
+        let status = manager.status().await;
+        let message = status.config_error.expect("应报告结构不符");
+        assert!(
+            message.contains("model_providers.managed_gateway.auth"),
+            "{message}"
+        );
+        assert!(status.residue && !status.config_managed);
+        let report = manager.reconcile_on_startup().await;
+        assert_eq!(report.outcome, ReconcileOutcome::ResidueFound);
+
+        if uninstall {
+            let report =
+                manager::cleanup(&sandbox.paths(), sandbox.credentials.as_ref(), false).unwrap();
+            assert_eq!(
+                report,
+                CleanupReport {
+                    env_block_removed: true,
+                    config_restored: true,
+                    state_reset: true,
+                    key_purged: false,
+                }
+            );
+        } else {
+            manager.cleanup_residue().await.expect("一键清理应成功");
+        }
+        let status = manager.status().await;
+        assert!(
+            !status.residue && status.config_error.is_none(),
+            "{uninstall}"
+        );
+        assert_eq!(
+            read(&sandbox.config()),
+            Some(USER_CONFIG.as_bytes().to_vec())
+        );
+        assert_eq!(read(&sandbox.env()), Some(USER_ENV.as_bytes().to_vec()));
+        assert_eq!(sandbox.state().unwrap(), HelperState::default());
+    }
+}
+
 // ---- 12. 清除 Key、旧块、自启 ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1321,6 +1389,11 @@ async fn proxy_connections_are_recorded_and_forwarded() {
     assert_eq!(record.port, target);
     assert_eq!(record.decision, Route::Direct);
     assert!(record.ok);
+    // 回调先写环形缓冲、再调用外部回调：看到缓冲非空时外部回调可能尚未执行，带超时等待
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while sandbox.records.load(Ordering::SeqCst) < 1 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(
         sandbox.records.load(Ordering::SeqCst),
         1,
@@ -1638,4 +1711,280 @@ fn production_options_use_fixed_parameters() {
             .ends_with(consts::CREDENTIAL_EXE_NAME)
     );
     assert!(Path::new(&options.credential_command).is_absolute());
+}
+
+// ---- 16. 启用中断（崩溃窗口） ----
+
+/// 模拟启用在“记录原值”之后、“置为已启用”之前崩溃：config.toml 已被接管、.env 已写入受管块，
+/// 状态文件仍为停用但留有原值。
+fn simulate_interrupted_enable(sandbox: &Sandbox) {
+    sandbox.write_config(USER_CONFIG);
+    codex_config::apply_managed(&sandbox.config(), &sandbox.backup(), COMMAND).unwrap();
+    sandbox.write_env(&format!(
+        "{USER_ENV}\n{}",
+        codex_env::render_block(sandbox.port)
+    ));
+    sandbox.write_state(&HelperState {
+        enabled: false,
+        previous_model_provider: Some("custom".into()),
+        ..Default::default()
+    });
+}
+
+fn assert_fully_restored(sandbox: &Sandbox) {
+    assert_eq!(
+        read(&sandbox.config()),
+        Some(USER_CONFIG.as_bytes().to_vec()),
+        "应还原为用户原来的 provider，而不是删除 model_provider"
+    );
+    assert_eq!(read(&sandbox.env()), Some(USER_ENV.as_bytes().to_vec()));
+    assert_eq!(sandbox.state().unwrap(), HelperState::default());
+}
+
+#[tokio::test]
+async fn interrupted_enable_is_restored_by_disable() {
+    let sandbox = Sandbox::new().await;
+    simulate_interrupted_enable(&sandbox);
+    let manager = sandbox.manager();
+
+    let status = manager.status().await;
+    assert!(!status.enabled && status.residue);
+    let report = manager.reconcile_on_startup().await;
+    assert_eq!(report.outcome, ReconcileOutcome::ResidueFound);
+
+    let status = manager.disable().await.expect("停用应成功");
+    assert!(!status.enabled && !status.residue);
+    assert_fully_restored(&sandbox);
+}
+
+#[tokio::test]
+async fn interrupted_enable_is_restored_by_cleanup_residue() {
+    let sandbox = Sandbox::new().await;
+    simulate_interrupted_enable(&sandbox);
+    let status = sandbox.manager().cleanup_residue().await.unwrap();
+    assert!(!status.residue);
+    assert_fully_restored(&sandbox);
+}
+
+#[tokio::test]
+async fn interrupted_enable_is_restored_by_uninstall_cleanup() {
+    let sandbox = Sandbox::new().await;
+    simulate_interrupted_enable(&sandbox);
+    let report = manager::cleanup(&sandbox.paths(), sandbox.credentials.as_ref(), false).unwrap();
+    assert_eq!(
+        report,
+        CleanupReport {
+            env_block_removed: true,
+            config_restored: true,
+            state_reset: true,
+            key_purged: false,
+        }
+    );
+    assert_fully_restored(&sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn re_enable_after_interruption_keeps_recorded_previous() {
+    let sandbox = Sandbox::new().await;
+    simulate_interrupted_enable(&sandbox);
+    let manager = sandbox.manager();
+
+    let status = manager.enable(with_key(KEY)).await.expect("启用应成功");
+    assert!(status.enabled && status.config_managed && status.env_managed);
+    let state = sandbox.state().unwrap();
+    assert!(state.enabled);
+    assert_eq!(
+        state.previous_model_provider.as_deref(),
+        Some("custom"),
+        "不得用受管残留（视为 None）覆盖已记录的原值"
+    );
+
+    manager.disable().await.unwrap();
+    assert_fully_restored(&sandbox);
+    sandbox.assert_no_key_on_disk();
+}
+
+// ---- 17. 停用状态下的停用 ----
+
+/// 停用状态下再次停用：用户自己的 model_provider 保留（即使状态文件留有其他原值），受管残留节移除。
+#[tokio::test]
+async fn disable_when_disabled_keeps_user_provider_and_removes_residue() {
+    for recorded in [None, Some("other")] {
+        let sandbox = Sandbox::new().await;
+        sandbox.write_state(&HelperState {
+            enabled: false,
+            previous_model_provider: recorded.map(str::to_string),
+            ..Default::default()
+        });
+        sandbox.write_config(&format!(
+            "{USER_CONFIG}\n[model_providers.managed_gateway]\nname = \"Managed Gateway\"\n"
+        ));
+        let manager = sandbox.manager();
+        assert!(manager.status().await.residue);
+
+        let status = manager.disable().await.expect("停用应成功");
+        assert!(!status.enabled && !status.residue);
+        assert_eq!(
+            read(&sandbox.config()),
+            Some(USER_CONFIG.as_bytes().to_vec()),
+            "{recorded:?}"
+        );
+        assert_eq!(sandbox.state().unwrap(), HelperState::default());
+    }
+}
+
+/// 给文件加 macOS 的用户不可变标志（`chflags uchg`），使其无法被原子替换；drop 时恢复。
+#[cfg(target_os = "macos")]
+struct Immutable(PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Immutable {
+    fn set(path: &Path) -> Self {
+        let status = std::process::Command::new("chflags")
+            .arg("uchg")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "chflags uchg 失败");
+        Self(path.to_path_buf())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Immutable {
+    fn drop(&mut self) {
+        // 必须恢复，否则临时目录无法删除
+        let _ = std::process::Command::new("chflags")
+            .arg("nouchg")
+            .arg(&self.0)
+            .status();
+    }
+}
+
+/// 停用时配置还原成功而 `.env` 块移除失败：返回 Io 错误，状态置为停用，`.env` 残留由 residue 提示，
+/// 启动对账报告 ResidueFound；恢复可写后一键清理即可完成。
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_env_failure_after_config_restore_leaves_residue() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.unwrap();
+    let env_before = read(&sandbox.env());
+
+    let immutable = Immutable::set(&sandbox.env());
+    let error = manager
+        .disable()
+        .await
+        .expect_err(".env 不可替换时停用应失败");
+    assert_eq!(error.code(), "io", "{error}");
+    assert!(error.to_string().contains(".env"), "{error}");
+
+    assert_eq!(read(&sandbox.env()), env_before, ".env 未被改动");
+    assert_eq!(
+        read(&sandbox.config()),
+        Some(USER_CONFIG.as_bytes().to_vec()),
+        "配置仍应还原"
+    );
+    assert_eq!(
+        sandbox.state().unwrap(),
+        HelperState::default(),
+        "配置已还原：状态置为停用"
+    );
+    let status = manager.status().await;
+    assert!(!status.enabled && status.residue && !status.config_managed);
+    assert_eq!(status.proxy.state, ProxyState::Stopped);
+    assert!(port_is_free(sandbox.port).await);
+
+    let report = manager.reconcile_on_startup().await;
+    assert_eq!(report.outcome, ReconcileOutcome::ResidueFound);
+    assert!(port_is_free(sandbox.port).await, "停用状态下对账不启动代理");
+
+    drop(immutable);
+    let status = manager.cleanup_residue().await.unwrap();
+    assert!(!status.residue);
+    assert_eq!(read(&sandbox.env()), Some(USER_ENV.as_bytes().to_vec()));
+    sandbox.assert_no_key_on_disk();
+}
+
+// ---- 18. 锁粒度 ----
+
+/// Key 校验在操作锁之外：假网关延迟 1.5 秒时，启用进行中 status / probe_reachability / shutdown
+/// 都立即返回，启用随后照常完成。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_does_not_wait_for_slow_key_check() {
+    let sandbox = Sandbox::with_slow_gateway(Duration::from_millis(1500)).await;
+    sandbox.write_config(USER_CONFIG);
+    let manager = Arc::new(sandbox.manager());
+
+    let worker = Arc::clone(&manager);
+    let enabling = tokio::spawn(async move { worker.enable(with_key(KEY)).await });
+    // 等到 Key 校验请求已发出（启用正在等待网关响应）
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while sandbox.gateway_hits().await == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(sandbox.gateway_hits().await, 1);
+
+    let started = std::time::Instant::now();
+    let status = manager.status().await;
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "status 耗时 {:?}",
+        started.elapsed()
+    );
+    assert!(!status.enabled);
+
+    let started = std::time::Instant::now();
+    let status = manager.probe_reachability().await;
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "probe_reachability 耗时 {:?}",
+        started.elapsed()
+    );
+    assert_eq!(status.gateway, Reachability::Reachable);
+
+    let started = std::time::Instant::now();
+    manager.shutdown().await;
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "shutdown 耗时 {:?}",
+        started.elapsed()
+    );
+    assert!(!enabling.is_finished(), "以上调用应发生在 Key 校验期间");
+
+    let status = enabling.await.unwrap().expect("启用应成功");
+    assert!(status.enabled && status.config_managed && status.env_managed);
+    assert_eq!(status.proxy.state, ProxyState::Running);
+    // 可达性缓存不被启用覆盖
+    assert_eq!(status.gateway, Reachability::Reachable);
+    manager.shutdown().await;
+    sandbox.assert_no_key_on_disk();
+}
+
+/// 锁外校验期间文件被改动：锁内重新预检，以最新内容为准（catalog 指针需确认时不写入任何内容）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enable_rechecks_preflight_after_key_check() {
+    let sandbox = Sandbox::with_slow_gateway(Duration::from_millis(500)).await;
+    sandbox.write_config(USER_CONFIG);
+    let manager = Arc::new(sandbox.manager());
+
+    let worker = Arc::clone(&manager);
+    let enabling = tokio::spawn(async move { worker.enable(with_key(KEY)).await });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while sandbox.gateway_hits().await == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // 校验期间用户加入了 catalog 指针
+    sandbox.write_config(CATALOG_CONFIG);
+    let before = sandbox.snapshot();
+
+    match enabling.await.unwrap() {
+        Err(ManagerError::CatalogConfirmationRequired { path }) => assert_eq!(path, CATALOG_PATH),
+        other => panic!("应要求确认 catalog，实际 {other:?}"),
+    }
+    assert_eq!(sandbox.snapshot(), before);
+    assert_eq!(sandbox.credential(), None);
+    assert!(port_is_free(sandbox.port).await);
 }
