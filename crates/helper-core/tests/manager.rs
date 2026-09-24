@@ -1910,11 +1910,11 @@ async fn disable_env_failure_after_config_restore_leaves_residue() {
 
 // ---- 18. 锁粒度 ----
 
-/// Key 校验在操作锁之外：假网关延迟 1.5 秒时，启用进行中 status / probe_reachability / shutdown
-/// 都立即返回，启用随后照常完成。
+/// Key 校验在操作锁之外：假网关延迟 6 秒时，启用进行中 status / probe_reachability / shutdown
+/// 都立即返回（以「启用尚未完成」表达不等待语义，避免 CI 高负载下的墙钟抖动），启用随后照常完成。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_does_not_wait_for_slow_key_check() {
-    let sandbox = Sandbox::with_slow_gateway(Duration::from_millis(1500)).await;
+    let sandbox = Sandbox::with_slow_gateway(Duration::from_secs(6)).await;
     sandbox.write_config(USER_CONFIG);
     let manager = Arc::new(sandbox.manager());
 
@@ -1927,32 +1927,19 @@ async fn status_does_not_wait_for_slow_key_check() {
     }
     assert_eq!(sandbox.gateway_hits().await, 1);
 
-    let started = std::time::Instant::now();
     let status = manager.status().await;
-    assert!(
-        started.elapsed() < Duration::from_millis(200),
-        "status 耗时 {:?}",
-        started.elapsed()
-    );
     assert!(!status.enabled);
+    assert!(!enabling.is_finished(), "status 应在 Key 校验期间返回");
 
-    let started = std::time::Instant::now();
     let status = manager.probe_reachability().await;
-    assert!(
-        started.elapsed() < Duration::from_millis(1000),
-        "probe_reachability 耗时 {:?}",
-        started.elapsed()
-    );
     assert_eq!(status.gateway, Reachability::Reachable);
-
-    let started = std::time::Instant::now();
-    manager.shutdown().await;
     assert!(
-        started.elapsed() < Duration::from_millis(200),
-        "shutdown 耗时 {:?}",
-        started.elapsed()
+        !enabling.is_finished(),
+        "probe_reachability 应在 Key 校验期间返回"
     );
-    assert!(!enabling.is_finished(), "以上调用应发生在 Key 校验期间");
+
+    manager.shutdown().await;
+    assert!(!enabling.is_finished(), "shutdown 应在 Key 校验期间返回");
 
     let status = enabling.await.unwrap().expect("启用应成功");
     assert!(status.enabled && status.config_managed && status.env_managed);
@@ -1966,7 +1953,7 @@ async fn status_does_not_wait_for_slow_key_check() {
 /// 锁外校验期间文件被改动：锁内重新预检，以最新内容为准（catalog 指针需确认时不写入任何内容）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enable_rechecks_preflight_after_key_check() {
-    let sandbox = Sandbox::with_slow_gateway(Duration::from_millis(500)).await;
+    let sandbox = Sandbox::with_slow_gateway(Duration::from_secs(3)).await;
     sandbox.write_config(USER_CONFIG);
     let manager = Arc::new(sandbox.manager());
 
