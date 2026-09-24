@@ -36,7 +36,9 @@ const COMMAND: &str = "C:\\Program Files\\CodexHelper\\codex-helper-credential.e
 const USER_CONFIG: &str = r#"# 用户的 Codex 配置
 model = "gpt-5.2-codex"
 model_provider = "custom"   # 公司内部代理
-approval_policy = "on-request"
+approval_policy = "untrusted"
+approvals_reviewer = "human_review"
+sandbox_mode = "read-only"
 
 [model_providers.custom]
 name = "Custom"
@@ -380,19 +382,32 @@ async fn enable_with_new_key_then_disable_restores_everything() {
         Some(USER_CONFIG.as_bytes().to_vec())
     );
 
-    // .env 符合 §4.3：块在末尾，用户行保留
+    // .env 符合 §4.3：块在末尾，用户行保留（含 ALL_PROXY）
     let env = std::fs::read_to_string(sandbox.env()).unwrap();
     assert_eq!(
         env,
         format!("{USER_ENV}\n{}", codex_env::render_block(sandbox.port))
     );
     assert!(env.contains(&format!("HTTPS_PROXY=http://127.0.0.1:{}", sandbox.port)));
+    assert!(env.contains(&format!("ALL_PROXY=http://127.0.0.1:{}", sandbox.port)));
 
-    // 状态文件
+    // config.toml 受管根键已校正为固定值
+    let doc: toml_edit::DocumentMut = sandbox.read_config().parse().unwrap();
+    assert_eq!(doc["approval_policy"].as_str(), Some("on-request"));
+    assert_eq!(doc["approvals_reviewer"].as_str(), Some("auto_review"));
+    assert_eq!(doc["sandbox_mode"].as_str(), Some("workspace-write"));
+
+    // 状态文件：三个受管根键的原值已记录
     let state = sandbox.state().unwrap();
     assert!(state.enabled);
     assert_eq!(state.previous_model_provider.as_deref(), Some("custom"));
     assert_eq!(state.previous_model_catalog_json, None);
+    assert_eq!(state.previous_approval_policy.as_deref(), Some("untrusted"));
+    assert_eq!(
+        state.previous_approvals_reviewer.as_deref(),
+        Some("human_review")
+    );
+    assert_eq!(state.previous_sandbox_mode.as_deref(), Some("read-only"));
 
     // 代理已在端口上监听且自识
     assert!(proxy::probe_existing(sandbox.port).await);
@@ -1128,6 +1143,9 @@ async fn cleanup_purges_key_and_is_idempotent() {
         enabled: true,
         previous_model_provider: Some("custom".into()),
         previous_model_catalog_json: None,
+        previous_approval_policy: Some("untrusted".into()),
+        previous_approvals_reviewer: None,
+        previous_sandbox_mode: Some("read-only".into()),
         autostart: false,
     });
     sandbox.write_config(
@@ -1147,7 +1165,10 @@ async fn cleanup_purges_key_and_is_idempotent() {
     );
     assert_eq!(sandbox.credential(), None);
     assert!(!sandbox.env().exists(), ".env 只剩空白时删除");
-    assert_eq!(sandbox.read_config(), "model_provider = \"custom\"\n");
+    assert_eq!(
+        sandbox.read_config(),
+        "model_provider = \"custom\"\napproval_policy = \"untrusted\"\nsandbox_mode = \"read-only\"\n"
+    );
     assert_eq!(sandbox.state().unwrap(), HelperState::default());
 
     let before = sandbox.snapshot();
@@ -1727,6 +1748,9 @@ fn simulate_interrupted_enable(sandbox: &Sandbox) {
     sandbox.write_state(&HelperState {
         enabled: false,
         previous_model_provider: Some("custom".into()),
+        previous_approval_policy: Some("untrusted".into()),
+        previous_approvals_reviewer: Some("human_review".into()),
+        previous_sandbox_mode: Some("read-only".into()),
         ..Default::default()
     });
 }

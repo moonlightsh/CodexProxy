@@ -19,7 +19,7 @@ pub const LEGACY_BEGIN_MARKER: &str =
 pub const LEGACY_END_MARKER: &str = "# <<< codex-plus-plus managed gateway <<<";
 
 /// 受管块内允许出现的键（顺序固定，绝不包含凭据）。
-const MANAGED_KEYS: [&str; 3] = ["HTTP_PROXY=", "HTTPS_PROXY=", "NO_PROXY="];
+const MANAGED_KEYS: [&str; 4] = ["HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "NO_PROXY="];
 
 /// `.env` 文件的只读检查结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -58,18 +58,19 @@ fn join_lines(lines: &[String], eol: &str) -> String {
     }
 }
 
-/// 判断一行是否是受管键行（`HTTP_PROXY=` / `HTTPS_PROXY=` / `NO_PROXY=`）。
+/// 判断一行是否是受管键行（`HTTP_PROXY=` / `HTTPS_PROXY=` / `ALL_PROXY=` / `NO_PROXY=`）。
 fn is_managed_key_line(line: &str) -> bool {
     MANAGED_KEYS.iter().any(|key| line.starts_with(key))
 }
 
-/// 受管块的 5 行内容（不含行终止符）：起始标记 + 3 个键 + 结束标记。
-fn block_lines(proxy_port: u16) -> [String; 5] {
+/// 受管块的 6 行内容（不含行终止符）：起始标记 + 4 个键 + 结束标记。
+fn block_lines(proxy_port: u16) -> [String; 6] {
     let proxy = format!("http://127.0.0.1:{proxy_port}");
     [
         BEGIN_MARKER.to_string(),
         format!("HTTP_PROXY={proxy}"),
         format!("HTTPS_PROXY={proxy}"),
+        format!("ALL_PROXY={proxy}"),
         format!("NO_PROXY={},127.0.0.1,localhost", consts::GATEWAY_HOST),
         END_MARKER.to_string(),
     ]
@@ -80,7 +81,7 @@ fn block_lines(proxy_port: u16) -> [String; 5] {
 ///
 /// 对不完整块的保守处理：
 /// - 只有起始标记、直到文件末尾或下一个起始标记都没有匹配的结束标记：只删起始标记行，以及紧随其后
-///   连续的受管键行（`HTTP_PROXY=` / `HTTPS_PROXY=` / `NO_PROXY=`），其后的用户内容原样保留。
+///   连续的受管键行（`HTTP_PROXY=` / `HTTPS_PROXY=` / `ALL_PROXY=` / `NO_PROXY=`），其后的用户内容原样保留。
 /// - 只有结束标记、没有配对的起始标记：只删该行。
 fn scan_and_strip(text: &str, begin: &str, end: &str) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
@@ -263,6 +264,7 @@ mod tests {
         let block = render_block(17891);
         assert!(block.contains("HTTP_PROXY=http://127.0.0.1:17891"));
         assert!(block.contains("HTTPS_PROXY=http://127.0.0.1:17891"));
+        assert!(block.contains("ALL_PROXY=http://127.0.0.1:17891"));
         assert!(block.contains("NO_PROXY=10.20.30.61,127.0.0.1,localhost"));
         assert!(block.starts_with(BEGIN_MARKER));
         assert!(block.trim_end().ends_with(END_MARKER));
@@ -274,20 +276,21 @@ mod tests {
         let expected = "# >>> codex-helper managed gateway (自动生成，请勿手改) >>>\n\
              HTTP_PROXY=http://127.0.0.1:17891\n\
              HTTPS_PROXY=http://127.0.0.1:17891\n\
+             ALL_PROXY=http://127.0.0.1:17891\n\
              NO_PROXY=10.20.30.61,127.0.0.1,localhost\n\
              # <<< codex-helper managed gateway <<<\n";
         assert_eq!(render_block(17891), expected);
     }
 
     #[test]
-    fn block_contains_only_three_managed_keys_and_no_credentials() {
+    fn block_contains_only_four_managed_keys_and_no_credentials() {
         let block = render_block(17891);
         let inner: Vec<&str> = block
             .lines()
             .filter(|line| !line.trim().is_empty())
             .filter(|line| *line != BEGIN_MARKER && *line != END_MARKER)
             .collect();
-        assert_eq!(inner.len(), 3);
+        assert_eq!(inner.len(), 4);
         for line in &inner {
             assert!(is_managed_key_line(line));
         }
@@ -332,6 +335,17 @@ mod tests {
         assert!(new.contains("HTTPS_PROXY=http://127.0.0.1:18000"));
         assert!(!new.contains("17891"));
         assert_eq!(new.matches(BEGIN_MARKER).count(), 1);
+    }
+
+    #[test]
+    fn upsert_replaces_legacy_three_key_block_with_four_key_block() {
+        // 旧版本块（无 ALL_PROXY）：upsert 后被替换为当前的四键块。
+        let legacy = format!(
+            "{BEGIN_MARKER}\nHTTP_PROXY=http://127.0.0.1:17891\nHTTPS_PROXY=http://127.0.0.1:17891\nNO_PROXY=10.20.30.61,127.0.0.1,localhost\n{END_MARKER}\n"
+        );
+        let out = upsert_block(&format!("KEEP=1\n{legacy}"), 17891);
+        assert_eq!(out, format!("KEEP=1\n\n{}", render_block(17891)));
+        assert_eq!(out.matches("ALL_PROXY=").count(), 1);
     }
 
     #[test]
@@ -388,6 +402,19 @@ mod tests {
             .find("HTTPS_PROXY=http://127.0.0.1:17891")
             .expect("managed line present");
         // dotenvy 逐行 set_var，后面的赋值生效
+        assert!(managed_pos > user_pos);
+    }
+
+    #[test]
+    fn managed_block_wins_over_user_defined_all_proxy() {
+        let existing = "ALL_PROXY=socks5://user-proxy:1080\n";
+        let out = upsert_block(existing, 17891);
+        let user_pos = out
+            .find("socks5://user-proxy:1080")
+            .expect("user line kept");
+        let managed_pos = out
+            .find("ALL_PROXY=http://127.0.0.1:17891")
+            .expect("managed line present");
         assert!(managed_pos > user_pos);
     }
 

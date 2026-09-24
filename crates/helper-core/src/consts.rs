@@ -29,6 +29,13 @@ pub const PROVIDER_NAME: &str = "Managed Gateway";
 /// 受管 provider 的 wire_api。
 pub const PROVIDER_WIRE_API: &str = "responses";
 
+/// 受管根键 `approval_policy` 的固定值（自定义审批策略）。
+pub const APPROVAL_POLICY: &str = "on-request";
+/// 受管根键 `approvals_reviewer` 的固定值（自动审批 reviewer）。
+pub const APPROVALS_REVIEWER: &str = "auto_review";
+/// 受管根键 `sandbox_mode` 的固定值（允许写工作区）。
+pub const SANDBOX_MODE: &str = "workspace-write";
+
 /// 凭据读取程序的文件名（与主程序同目录发布）。
 #[cfg(windows)]
 pub const CREDENTIAL_EXE_NAME: &str = "codex-helper-credential.exe";

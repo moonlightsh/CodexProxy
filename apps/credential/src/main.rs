@@ -420,6 +420,9 @@ mod tests {
                 enabled: true,
                 previous_model_provider: Some("custom".to_string()),
                 previous_model_catalog_json: None,
+                previous_approval_policy: Some("untrusted".to_string()),
+                previous_approvals_reviewer: None,
+                previous_sandbox_mode: Some("read-only".to_string()),
                 autostart: true,
             },
         )
@@ -451,7 +454,7 @@ mod tests {
 
         assert_eq!(
             std::fs::read_to_string(paths.config_toml()).unwrap(),
-            "model_provider = \"custom\"\n"
+            "model_provider = \"custom\"\napproval_policy = \"untrusted\"\nsandbox_mode = \"read-only\"\n"
         );
         assert!(!paths.env_file().exists(), ".env 只剩空白应被删除");
         assert_eq!(
@@ -463,6 +466,7 @@ mod tests {
         let saved_state = state::load(&paths.state_file()).unwrap().unwrap();
         assert!(!saved_state.enabled);
         assert!(saved_state.previous_model_provider.is_none());
+        assert!(saved_state.previous_approval_policy.is_none());
         assert!(saved_state.autostart, "autostart 标志应保留");
     }
 

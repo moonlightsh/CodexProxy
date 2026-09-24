@@ -17,6 +17,12 @@ pub struct PreviousConfig {
     pub model_provider: Option<String>,
     /// 启用时被移除的根键 `model_catalog_json`；不存在为 `None`
     pub model_catalog_json: Option<String>,
+    /// 启用前根键 `approval_policy` 的值；不存在为 `None`
+    pub approval_policy: Option<String>,
+    /// 启用前根键 `approvals_reviewer` 的值；不存在为 `None`
+    pub approvals_reviewer: Option<String>,
+    /// 启用前根键 `sandbox_mode` 的值；不存在为 `None`
+    pub sandbox_mode: Option<String>,
 }
 
 /// `config.toml` 的只读检查结果。
@@ -28,6 +34,12 @@ pub struct ConfigInspection {
     pub model_provider: Option<String>,
     /// 根键 `model_catalog_json`（字符串值）
     pub model_catalog_json: Option<String>,
+    /// 根键 `approval_policy`（字符串值）
+    pub approval_policy: Option<String>,
+    /// 根键 `approvals_reviewer`（字符串值）
+    pub approvals_reviewer: Option<String>,
+    /// 根键 `sandbox_mode`（字符串值）
+    pub sandbox_mode: Option<String>,
     /// 是否存在 `[model_providers.managed_gateway]` 节
     pub has_managed_provider: bool,
     /// 受管内容是否完全正确（model_provider 指向受管 provider，且受管节的全部受管键与期望一致，
@@ -43,13 +55,28 @@ impl ConfigInspection {
     }
 
     /// 由当前配置得出“启用前原值”；若 model_provider 已指向受管 provider（残留），视为 `None`。
+    ///
+    /// 三个审批 / 沙箱键：仅当配置已带受管痕迹（[`Self::has_managed_residue`]）且值等于受管固定值时
+    /// 才视为残留、记为 `None`（否则会把本工具自己写入的值当成用户原值写回，造成永久残留）。
+    /// 干净配置里的同值键是用户真正的配置，必须如实记录：受管固定值并非全部等于 Codex 默认值
+    /// （`sandbox_mode` 的默认是 `read-only`），过度过滤会在停用后静默删掉用户的配置行。
     pub fn previous(&self) -> PreviousConfig {
+        let managed = self.has_managed_residue();
+        // 只在已带受管痕迹时把“值等于受管固定值”视为残留
+        let strip = |value: &Option<String>, managed_value: &str| {
+            value
+                .clone()
+                .filter(|value| !(managed && value == managed_value))
+        };
         PreviousConfig {
             model_provider: self
                 .model_provider
                 .clone()
                 .filter(|value| value != crate::consts::PROVIDER_ID),
             model_catalog_json: self.model_catalog_json.clone(),
+            approval_policy: strip(&self.approval_policy, crate::consts::APPROVAL_POLICY),
+            approvals_reviewer: strip(&self.approvals_reviewer, crate::consts::APPROVALS_REVIEWER),
+            sandbox_mode: strip(&self.sandbox_mode, crate::consts::SANDBOX_MODE),
         }
     }
 }
@@ -97,6 +124,9 @@ pub fn inspect(
         exists: true,
         model_provider: root_string(doc, MODEL_PROVIDER_KEY),
         model_catalog_json: root_string(doc, MODEL_CATALOG_JSON_KEY),
+        approval_policy: root_string(doc, APPROVAL_POLICY_KEY),
+        approvals_reviewer: root_string(doc, APPROVALS_REVIEWER_KEY),
+        sandbox_mode: root_string(doc, SANDBOX_MODE_KEY),
         has_managed_provider: has_managed_provider(doc),
         fully_managed,
     })
@@ -119,6 +149,8 @@ pub fn has_residue(config_path: &Path) -> Result<bool, ConfigError> {
 /// 校正受管内容（幂等）：
 ///
 /// - `model_provider = "managed_gateway"`；
+/// - 受管根键 `approval_policy = "on-request"`、`approvals_reviewer = "auto_review"`、
+///   `sandbox_mode = "workspace-write"`（自定义审批策略；调用方已记录原值）；
 /// - `[model_providers.managed_gateway]`：name / base_url / wire_api；移除 env_key、
 ///   experimental_bearer_token、requires_openai_auth；`[...auth]` command = `credential_command`、
 ///   args = ["get", "codex-helper/managed-gateway"]；
@@ -159,7 +191,8 @@ pub fn rollback(config_path: &Path, outcome: &ApplyOutcome) -> Result<(), Config
 
 /// 停用还原（设计 §5.2 第 2 步）：定点修改，不以备份整文件覆盖。
 ///
-/// - `model_provider`、`model_catalog_json` 还原为 `previous` 中的值（`None` 则删除该键）；
+/// - `model_provider`、`model_catalog_json`、`approval_policy`、`approvals_reviewer`、
+///   `sandbox_mode` 还原为 `previous` 中的值（`None` 则删除该键）；
 /// - 删除 `[model_providers.managed_gateway]` 整节（若 `model_providers` 因此为空且原本是隐式表则一并移除）。
 ///
 /// 文件不存在视为成功。返回是否实际写入。
@@ -171,6 +204,17 @@ pub fn restore(config_path: &Path, previous: &PreviousConfig) -> Result<bool, Co
             MODEL_CATALOG_JSON_KEY,
             previous.model_catalog_json.as_deref(),
         );
+        restore_root_string(
+            doc,
+            APPROVAL_POLICY_KEY,
+            previous.approval_policy.as_deref(),
+        );
+        restore_root_string(
+            doc,
+            APPROVALS_REVIEWER_KEY,
+            previous.approvals_reviewer.as_deref(),
+        );
+        restore_root_string(doc, SANDBOX_MODE_KEY, previous.sandbox_mode.as_deref());
         remove_managed_provider(doc);
     })
 }
@@ -186,8 +230,9 @@ pub fn remove_residue(config_path: &Path) -> Result<bool, ConfigError> {
 /// 停用状态下的残留清理，兼顾“启用中断”：
 ///
 /// - `model_provider == "managed_gateway"` 且 `recorded` 非空（启用在记录原值之后、置为已启用之前中断，
-///   状态文件仍为停用但配置已被接管）→ 与 [`restore`] 相同，按记录的原值还原两个根键；
-/// - `model_provider == "managed_gateway"` 且 `recorded` 为空 → 删除该键；
+///   状态文件仍为停用但配置已被接管）→ 与 [`restore`] 相同，按记录的原值还原全部受管根键；
+/// - `model_provider == "managed_gateway"` 且 `recorded` 为空 → 删除该键，并删除值等于受管固定值的
+///   审批 / 沙箱键（值不同则是用户自己的，不动）；
 /// - 其他 `model_provider`（用户自己的）→ 不动，`model_catalog_json` 同样不动；
 /// - 一律删除受管 provider 节。
 ///
@@ -198,7 +243,9 @@ pub fn remove_residue_with(
 ) -> Result<bool, ConfigError> {
     let has_record = *recorded != PreviousConfig::default();
     edit_existing(config_path, |doc| {
-        if doc.get(MODEL_PROVIDER_KEY).and_then(Item::as_str) == Some(consts::PROVIDER_ID) {
+        let managed_active =
+            doc.get(MODEL_PROVIDER_KEY).and_then(Item::as_str) == Some(consts::PROVIDER_ID);
+        if managed_active {
             if has_record {
                 restore_root_string(doc, MODEL_PROVIDER_KEY, recorded.model_provider.as_deref());
                 restore_root_string(
@@ -206,8 +253,24 @@ pub fn remove_residue_with(
                     MODEL_CATALOG_JSON_KEY,
                     recorded.model_catalog_json.as_deref(),
                 );
+                restore_root_string(
+                    doc,
+                    APPROVAL_POLICY_KEY,
+                    recorded.approval_policy.as_deref(),
+                );
+                restore_root_string(
+                    doc,
+                    APPROVALS_REVIEWER_KEY,
+                    recorded.approvals_reviewer.as_deref(),
+                );
+                restore_root_string(doc, SANDBOX_MODE_KEY, recorded.sandbox_mode.as_deref());
             } else {
                 remove_root_key(doc, MODEL_PROVIDER_KEY);
+                for (key, value) in MANAGED_ROOT_KEYS {
+                    if doc.get(key).and_then(Item::as_str) == Some(value) {
+                        remove_root_key(doc, key);
+                    }
+                }
             }
         }
         remove_managed_provider(doc);
@@ -218,6 +281,16 @@ const MODEL_PROVIDER_KEY: &str = "model_provider";
 const MODEL_CATALOG_JSON_KEY: &str = "model_catalog_json";
 const MODEL_PROVIDERS_KEY: &str = "model_providers";
 const AUTH_KEY: &str = "auth";
+/// 受管根键：审批策略、自动审批 reviewer、沙箱模式（自定义审批策略）。
+const APPROVAL_POLICY_KEY: &str = "approval_policy";
+const APPROVALS_REVIEWER_KEY: &str = "approvals_reviewer";
+const SANDBOX_MODE_KEY: &str = "sandbox_mode";
+/// 启用时写入受管根键、停用时还原的键值对。
+const MANAGED_ROOT_KEYS: [(&str, &str); 3] = [
+    (APPROVAL_POLICY_KEY, consts::APPROVAL_POLICY),
+    (APPROVALS_REVIEWER_KEY, consts::APPROVALS_REVIEWER),
+    (SANDBOX_MODE_KEY, consts::SANDBOX_MODE),
+];
 /// 与命令鉴权互斥、校正时从受管节移除的键。
 const EXCLUSIVE_AUTH_KEYS: [&str; 3] = [
     "env_key",
@@ -256,7 +329,10 @@ fn load(config_path: &Path) -> Result<LoadedConfig, ConfigError> {
         .map_err(|error| ConfigError::Parse {
             message: describe_parse_error(body, &error),
         })?;
-    for key in [MODEL_PROVIDER_KEY, MODEL_CATALOG_JSON_KEY] {
+    for key in [MODEL_PROVIDER_KEY, MODEL_CATALOG_JSON_KEY]
+        .into_iter()
+        .chain(MANAGED_ROOT_KEYS.map(|(key, _)| key))
+    {
         if doc.get(key).is_some_and(|item| item.as_str().is_none()) {
             return Err(ConfigError::Parse {
                 message: format!("{key} 不是字符串"),
@@ -315,6 +391,9 @@ fn ensure_managed(doc: &mut DocumentMut, credential_command: &str) -> Result<boo
 
     set_string(doc, MODEL_PROVIDER_KEY, consts::PROVIDER_ID);
     remove_root_key(doc, MODEL_CATALOG_JSON_KEY);
+    for (key, value) in MANAGED_ROOT_KEYS {
+        set_string(doc, key, value);
+    }
 
     // 新建的 model_providers 设为隐式表，不输出空的 [model_providers] 表头。
     let providers = child_table(doc, MODEL_PROVIDERS_KEY, MODEL_PROVIDERS_KEY, true)?;
@@ -1095,6 +1174,7 @@ mod tests {
             PreviousConfig {
                 model_provider: Some("custom".into()),
                 model_catalog_json: Some("C:\\c.json".into()),
+                ..Default::default()
             }
         );
 
@@ -1138,6 +1218,15 @@ mod tests {
             ),
             format!("model_catalog_json = \"c.json\"\n{managed}"),
             managed.replace("args = [\"get\", \"codex-helper/managed-gateway\"]\n", ""),
+            managed.replace(
+                "approval_policy = \"on-request\"\n",
+                "approval_policy = \"untrusted\"\n",
+            ),
+            managed.replace("approvals_reviewer = \"auto_review\"\n", ""),
+            managed.replace(
+                "sandbox_mode = \"workspace-write\"\n",
+                "sandbox_mode = \"read-only\"\n",
+            ),
         ];
         for drift in drifts {
             assert_ne!(drift, managed);
@@ -1184,11 +1273,20 @@ mod tests {
         let previous = PreviousConfig {
             model_provider: Some("custom".into()),
             model_catalog_json: Some("C:\\c.json".into()),
+            approval_policy: Some("untrusted".into()),
+            approvals_reviewer: Some("human_review".into()),
+            sandbox_mode: Some("read-only".into()),
         };
         assert!(restore(&fixture.config, &previous).unwrap());
         let inspection = inspect(&fixture.config, COMMAND).unwrap();
         assert_eq!(inspection.model_provider.as_deref(), Some("custom"));
         assert_eq!(inspection.model_catalog_json.as_deref(), Some("C:\\c.json"));
+        assert_eq!(inspection.approval_policy.as_deref(), Some("untrusted"));
+        assert_eq!(
+            inspection.approvals_reviewer.as_deref(),
+            Some("human_review")
+        );
+        assert_eq!(inspection.sandbox_mode.as_deref(), Some("read-only"));
         assert!(!inspection.has_managed_residue());
 
         assert!(restore(&fixture.config, &PreviousConfig::default()).unwrap());
@@ -1250,6 +1348,22 @@ mod tests {
         let recorded = PreviousConfig {
             model_provider: Some("custom".into()),
             model_catalog_json: Some("c.json".into()),
+            ..Default::default()
+        };
+        assert!(remove_residue_with(&fixture.config, &recorded).unwrap());
+        assert_eq!(fixture.read(), original);
+        assert!(!has_residue(&fixture.config).unwrap());
+
+        // 启用中断时原值同样可能包含审批 / 沙箱键：按记录还原，逐字节回到原文
+        let original = "model_provider = \"custom\"\napproval_policy = \"untrusted\"\napprovals_reviewer = \"human_review\"\nsandbox_mode = \"read-only\"\nmodel_catalog_json = \"c.json\"\n";
+        let fixture = Fixture::with(original);
+        fixture.apply(COMMAND).unwrap();
+        let recorded = PreviousConfig {
+            model_provider: Some("custom".into()),
+            model_catalog_json: Some("c.json".into()),
+            approval_policy: Some("untrusted".into()),
+            approvals_reviewer: Some("human_review".into()),
+            sandbox_mode: Some("read-only".into()),
         };
         assert!(remove_residue_with(&fixture.config, &recorded).unwrap());
         assert_eq!(fixture.read(), original);

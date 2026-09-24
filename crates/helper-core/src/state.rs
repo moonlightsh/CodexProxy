@@ -15,6 +15,12 @@ pub struct HelperState {
     pub previous_model_provider: Option<String>,
     /// 启用时被移除的外部 catalog 指针；无则为 `null`
     pub previous_model_catalog_json: Option<String>,
+    /// 启用前 `approval_policy` 的值；不存在为 `null`
+    pub previous_approval_policy: Option<String>,
+    /// 启用前 `approvals_reviewer` 的值；不存在为 `null`
+    pub previous_approvals_reviewer: Option<String>,
+    /// 启用前 `sandbox_mode` 的值；不存在为 `null`
+    pub previous_sandbox_mode: Option<String>,
     pub autostart: bool,
 }
 
@@ -24,6 +30,9 @@ impl HelperState {
         PreviousConfig {
             model_provider: self.previous_model_provider.clone(),
             model_catalog_json: self.previous_model_catalog_json.clone(),
+            approval_policy: self.previous_approval_policy.clone(),
+            approvals_reviewer: self.previous_approvals_reviewer.clone(),
+            sandbox_mode: self.previous_sandbox_mode.clone(),
         }
     }
 
@@ -31,12 +40,18 @@ impl HelperState {
     pub fn set_previous(&mut self, previous: PreviousConfig) {
         self.previous_model_provider = previous.model_provider;
         self.previous_model_catalog_json = previous.model_catalog_json;
+        self.previous_approval_policy = previous.approval_policy;
+        self.previous_approvals_reviewer = previous.approvals_reviewer;
+        self.previous_sandbox_mode = previous.sandbox_mode;
     }
 
     /// 清空原值（停用完成后）。
     pub fn clear_previous(&mut self) {
         self.previous_model_provider = None;
         self.previous_model_catalog_json = None;
+        self.previous_approval_policy = None;
+        self.previous_approvals_reviewer = None;
+        self.previous_sandbox_mode = None;
     }
 }
 
@@ -106,6 +121,9 @@ mod tests {
             enabled: true,
             previous_model_provider: Some("custom".into()),
             previous_model_catalog_json: Some("/path/catalog.json".into()),
+            previous_approval_policy: Some("untrusted".into()),
+            previous_approvals_reviewer: Some("human_review".into()),
+            previous_sandbox_mode: Some("read-only".into()),
             autostart: true,
         };
         save(&path, &state).unwrap();
@@ -135,6 +153,9 @@ mod tests {
                 enabled: true,
                 previous_model_provider: None,
                 previous_model_catalog_json: None,
+                previous_approval_policy: None,
+                previous_approvals_reviewer: None,
+                previous_sandbox_mode: None,
                 autostart: false,
             }
         );
@@ -225,6 +246,9 @@ mod tests {
                 enabled: true,
                 previous_model_provider: Some("custom".into()),
                 previous_model_catalog_json: None,
+                previous_approval_policy: None,
+                previous_approvals_reviewer: None,
+                previous_sandbox_mode: None,
                 autostart: false,
             }
         );
@@ -236,17 +260,29 @@ mod tests {
         state.set_previous(PreviousConfig {
             model_provider: Some("custom".into()),
             model_catalog_json: Some("/catalog.json".into()),
+            approval_policy: Some("untrusted".into()),
+            approvals_reviewer: Some("human_review".into()),
+            sandbox_mode: Some("read-only".into()),
         });
         assert_eq!(state.previous_model_provider.as_deref(), Some("custom"));
         assert_eq!(
             state.previous_model_catalog_json.as_deref(),
             Some("/catalog.json")
         );
+        assert_eq!(state.previous_approval_policy.as_deref(), Some("untrusted"));
+        assert_eq!(
+            state.previous_approvals_reviewer.as_deref(),
+            Some("human_review")
+        );
+        assert_eq!(state.previous_sandbox_mode.as_deref(), Some("read-only"));
         assert_eq!(
             state.previous(),
             PreviousConfig {
                 model_provider: Some("custom".into()),
                 model_catalog_json: Some("/catalog.json".into()),
+                approval_policy: Some("untrusted".into()),
+                approvals_reviewer: Some("human_review".into()),
+                sandbox_mode: Some("read-only".into()),
             }
         );
 

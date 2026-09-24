@@ -105,7 +105,7 @@ const FIXTURES: &[(&str, &str)] = &[
     ("只有注释无结尾换行", "# Codex 配置"),
     (
         "已有 model_provider 带行尾注释",
-        "model = \"gpt-5.2-codex\"\nmodel_provider = \"custom\"   # 公司代理\napproval_policy = \"on-request\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://example.invalid/v1\"\n",
+        "model = \"gpt-5.2-codex\"\nmodel_provider = \"custom\"   # 公司代理\napproval_policy = \"untrusted\"\napprovals_reviewer = \"human_review\"\nsandbox_mode = \"read-only\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://example.invalid/v1\"\n",
     ),
     (
         "无 model_provider",
@@ -316,6 +316,107 @@ fn interrupted_enable_is_restored_from_recorded_previous() {
             "{name}"
         );
     }
+}
+
+/// 干净配置（无受管痕迹）里用户原值恰好等于受管固定值（如本来就是 `on-request`）：
+/// 如实记录为原值，停用后逐字节写回——因为受管固定值并非全部等于 Codex 默认值
+/// （`sandbox_mode` 默认 `read-only`），不能静默删掉用户显式写的行。
+#[test]
+fn clean_config_values_equal_to_managed_constants_are_recorded_and_restored() {
+    let original = concat!(
+        "model = \"o3\"\n",
+        "model_provider = \"custom\"\n",
+        "approval_policy = \"on-request\"\n",
+        "approvals_reviewer = \"auto_review\"\n",
+        "sandbox_mode = \"workspace-write\"\n",
+    );
+    let sandbox = Sandbox::with(original);
+    let previous = sandbox.enable();
+    // 启用前无受管痕迹：同值键是用户真正的配置，如实记录
+    assert_eq!(previous.approval_policy.as_deref(), Some("on-request"));
+    assert_eq!(previous.approvals_reviewer.as_deref(), Some("auto_review"));
+    assert_eq!(previous.sandbox_mode.as_deref(), Some("workspace-write"));
+
+    // 停用后逐字节回到原文（不丢用户显式写的行）
+    assert!(codex_config::restore(&sandbox.config, &previous).unwrap());
+    assert_eq!(sandbox.read(), original);
+    assert!(!codex_config::has_residue(&sandbox.config).unwrap());
+}
+
+/// 已带受管痕迹（启用中断 / 残留）时，值等于受管固定值的键才视为残留、不当作原值：
+/// 避免把本工具自己写入的值当成用户原值写回而造成永久残留。
+#[test]
+fn managed_valued_keys_are_absorbed_only_when_residue_present() {
+    // model_provider 指向受管 provider（残留）+ 三个键值等于受管固定值
+    let residue = concat!(
+        "model_provider = \"managed_gateway\"\n",
+        "approval_policy = \"on-request\"\n",
+        "approvals_reviewer = \"auto_review\"\n",
+        "sandbox_mode = \"workspace-write\"\n",
+    );
+    let sandbox = Sandbox::with(residue);
+    let previous = codex_config::inspect(&sandbox.config, COMMAND)
+        .unwrap()
+        .previous();
+    assert_eq!(previous.model_provider, None);
+    assert_eq!(previous.approval_policy, None);
+    assert_eq!(previous.approvals_reviewer, None);
+    assert_eq!(previous.sandbox_mode, None);
+}
+
+/// 启用时受管根键被校正为固定值、停用时还原为用户原值（含值不同于受管值与不存在的情形）。
+#[test]
+fn approval_and_sandbox_keys_are_set_and_restored() {
+    let original = concat!(
+        "model = \"o3\"\n",
+        "approval_policy = \"never\"\n",
+        "sandbox_mode = \"danger-full-access\"\n",
+    );
+    let sandbox = Sandbox::with(original);
+    let previous = sandbox.enable();
+    assert_eq!(previous.approval_policy.as_deref(), Some("never"));
+    assert_eq!(previous.sandbox_mode.as_deref(), Some("danger-full-access"));
+    assert_eq!(previous.approvals_reviewer, None);
+
+    let doc = parse(&sandbox.read());
+    assert_eq!(
+        doc["approval_policy"].as_str(),
+        Some(consts::APPROVAL_POLICY)
+    );
+    assert_eq!(
+        doc["approvals_reviewer"].as_str(),
+        Some(consts::APPROVALS_REVIEWER)
+    );
+    assert_eq!(doc["sandbox_mode"].as_str(), Some(consts::SANDBOX_MODE));
+
+    assert!(codex_config::restore(&sandbox.config, &previous).unwrap());
+    assert_eq!(sandbox.read(), original);
+}
+
+/// 无记录的残留清理：值等于受管固定值的审批 / 沙箱键被删除，其他值保留。
+#[test]
+fn residue_cleanup_drops_managed_valued_approval_keys_keeps_user_values() {
+    let original = concat!("model = \"o3\"\n", "approval_policy = \"never\"\n",);
+    let sandbox = Sandbox::with(original);
+    sandbox.enable();
+    // 模拟启用中断后状态文件丢失：无记录，但值等于受管值的键应被清理
+    let text = sandbox.read().replace("approval_policy = \"never\"\n", "");
+    sandbox.write(&text);
+    assert!(codex_config::remove_residue(&sandbox.config).unwrap());
+    let doc = parse(&sandbox.read());
+    assert!(doc.get("model_provider").is_none());
+    assert!(doc.get("approval_policy").is_none());
+    assert!(doc.get("approvals_reviewer").is_none());
+    assert!(doc.get("sandbox_mode").is_none());
+
+    // 用户自己的值（不同于受管值）：即使 model_provider 指向受管 provider 也不删
+    let user = "approval_policy = \"never\"\napprovals_reviewer = \"mine\"\n";
+    let sandbox = Sandbox::with(&format!("{user}model_provider = \"managed_gateway\"\n"));
+    assert!(codex_config::remove_residue(&sandbox.config).unwrap());
+    let doc = parse(&sandbox.read());
+    assert_eq!(doc["approval_policy"].as_str(), Some("never"));
+    assert_eq!(doc["approvals_reviewer"].as_str(), Some("mine"));
+    assert!(doc.get("sandbox_mode").is_none());
 }
 
 /// 结构不符时 inspect 与 apply_managed 一致地报错，且不写入任何内容。

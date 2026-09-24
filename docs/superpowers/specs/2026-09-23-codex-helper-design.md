@@ -28,6 +28,9 @@ CodexHelper 只保留其中最小可用的部分，做成一个独立的单窗�
 | OpenAI 规则 | BlackMatrix7 OpenAI Clash 规则 2025-06-06 域名类快照（7 精确 + 24 后缀 + 关键字 `openai`） |
 | 凭据 target | `codex-helper/managed-gateway` |
 | provider id | `managed_gateway` |
+| 审批策略 | `approval_policy = "on-request"`（启用时写入，停用时还原） |
+| 自动审批 reviewer | `approvals_reviewer = "auto_review"`（启用时写入，停用时还原） |
+| 沙箱模式 | `sandbox_mode = "workspace-write"`（启用时写入，停用时还原） |
 
 ### 1.2 非目标（第一阶段）
 
@@ -44,7 +47,7 @@ CodexHelper 只保留其中最小可用的部分，做成一个独立的单窗�
 ```text
 codex.exe app-server（Rust 引擎，reqwest）
   │  启动时 load_dotenv() 读 ~/.codex/.env
-  │    HTTP_PROXY / HTTPS_PROXY = http://127.0.0.1:17891
+  │    HTTP_PROXY / HTTPS_PROXY / ALL_PROXY = http://127.0.0.1:17891
   │    NO_PROXY = 10.20.30.61,127.0.0.1,localhost
   │  模型请求：provider managed_gateway → http://10.20.30.61:8080
   │    鉴权：auth.command = codex-helper-credential.exe get codex-helper/managed-gateway
@@ -103,18 +106,26 @@ codex-helper/                         Cargo workspace
   "enabled": true,
   "previous_model_provider": "custom",
   "previous_model_catalog_json": null,
+  "previous_approval_policy": "untrusted",
+  "previous_approvals_reviewer": null,
+  "previous_sandbox_mode": "read-only",
   "autostart": false
 }
 ```
 
 - `previous_model_provider`：启用前 `model_provider` 的值；不存在则为 `null`。
 - `previous_model_catalog_json`：启用时被移除的外部 catalog 指针；无则为 `null`。
+- `previous_approval_policy` / `previous_approvals_reviewer` / `previous_sandbox_mode`：启用前对应
+  受管根键的值；不存在或已等于受管固定值则为 `null`。
 - 原值只在“停用 → 启用”的转换时记录，已启用状态下的重复校正不得覆盖。
 
 ### 4.2 `~/.codex/config.toml` 受管内容
 
 ```toml
 model_provider = "managed_gateway"
+approval_policy = "on-request"
+approvals_reviewer = "auto_review"
+sandbox_mode = "workspace-write"
 
 [model_providers.managed_gateway]
 name = "Managed Gateway"
@@ -127,6 +138,9 @@ args = ["get", "codex-helper/managed-gateway"]
 ```
 
 - `command` 每次校正时改写为当前安装目录下 credential.exe 的规范化绝对路径。
+- 受管根键 `approval_policy = "on-request"`、`approvals_reviewer = "auto_review"`、
+  `sandbox_mode = "workspace-write"`（自定义审批策略）：启用时写入，原值记录到状态文件，停用时还原；
+  启用前已等于受管固定值的视为残留，停用后不写回（这些值同时是 Codex 默认值，行为不变）。
 - 校正时移除受管 provider 中的 `env_key`、`experimental_bearer_token`、`requires_openai_auth`
   （与命令鉴权互斥）。
 - 若存在根键 `model_catalog_json`：启用前在界面确认，记录原值后移除该指针，不删除外部文件。
@@ -138,12 +152,13 @@ args = ["get", "codex-helper/managed-gateway"]
 # >>> codex-helper managed gateway (自动生成，请勿手改) >>>
 HTTP_PROXY=http://127.0.0.1:17891
 HTTPS_PROXY=http://127.0.0.1:17891
+ALL_PROXY=http://127.0.0.1:17891
 NO_PROXY=10.20.30.61,127.0.0.1,localhost
 # <<< codex-helper managed gateway <<<
 ```
 
 - 幂等块编辑，只管理两行标记之间的内容，保留用户其他行。
-- 块固定在文件末尾（dotenv 后定义生效），覆盖用户自定义的 `HTTPS_PROXY`。
+- 块固定在文件末尾（dotenv 后定义生效），覆盖用户自定义的 `HTTPS_PROXY` / `ALL_PROXY`。
 - 移除后文件只剩空白则删除文件。
 - 绝不写入任何凭据。
 - 检测到 Codex++ 的旧块（`codex-plus-plus managed gateway` 标记）时，界面警告并提供一键移除；
@@ -177,7 +192,8 @@ NO_PROXY=10.20.30.61,127.0.0.1,localhost
 ### 5.2 停用
 
 1. 移除 `.env` 受管块。
-2. 还原 `model_provider`、`model_catalog_json` 为 `previous_*`（原为 `null` 则删除该键）；
+2. 还原 `model_provider`、`model_catalog_json`、`approval_policy`、`approvals_reviewer`、
+   `sandbox_mode` 为 `previous_*`（原为 `null` 则删除该键）；
    删除 `[model_providers.managed_gateway]` 整节。
 3. 停止 17891。
 4. 更新状态文件 `enabled = false`，清空 `previous_*`。
@@ -201,7 +217,8 @@ NO_PROXY=10.20.30.61,127.0.0.1,localhost
 
 - 执行 §5.2 的第 1、2、4 步（代理随主程序退出已停止）。
 - 状态文件缺失时：仍移除 `.env` 受管块；`config.toml` 中若 `model_provider = "managed_gateway"`
-  则删除该键，并删除受管 provider 节。
+  则删除该键、删除受管 provider 节，并删除值恰好等于受管固定值的 `approval_policy` /
+  `approvals_reviewer` / `sandbox_mode`（值不同则是用户自己的，不动）。
 - `--purge-key` 时同时删除凭据。
 - 文件或块不存在都视为成功。
 

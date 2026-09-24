@@ -38,6 +38,7 @@ export interface KeyPanelRegion {
 const INTRO_LINES = [
   "CodexHelper 会：录入网关 API Key 并安全保存到系统凭据管理器；" +
     "接管 Codex 的 config.toml 与 .env，让 Codex 使用受管网关；" +
+    "把审批策略设为 on-request、沙箱模式设为 workspace-write（停用后还原为原值）；" +
     "在本机常驻一个本地分流代理，把相关请求转发到上游 SOCKS5，其余直连。",
   "首次使用请先录入 API Key。",
 ];
