@@ -208,6 +208,21 @@ export function installDevMock(): void {
           return status;
         }
 
+        case "check_update":
+          // 预览可用更新：`?scenario=updateAvailable`；其余场景返回“已是最新”。
+          return scenario === "updateAvailable"
+            ? {
+                available: true,
+                currentVersion: "0.1.1",
+                version: "0.2.0",
+                notes: "示例更新说明（仅预览用）。",
+                date: "2026-09-26T00:00:00Z",
+              }
+            : { available: false, currentVersion: "0.1.1", version: null, notes: null, date: null };
+
+        case "install_update":
+          return reject({ code: "update", message: "开发预览不支持真实安装更新。" });
+
         case "recent_connections":
           return connections;
 

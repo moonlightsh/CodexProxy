@@ -39,7 +39,7 @@ CodexHelper 只保留其中最小可用的部分，做成一个独立的单窗�
 - 不支持 macOS / Linux 正式使用（macOS 仅作开发调试）。
 - 不支持修改网关、SOCKS5、端口或规则；不在运行时下载规则。
 - 不修改 Windows 系统代理。
-- 不做自动更新、诊断包导出、多语言（界面仅中文）。
+- 不做诊断包导出、多语言（界面仅中文）。内部升级渠道见 §15（第一阶段之后新增，可选启用）。
 - 不修改 `~/.codex/auth.json`，ChatGPT 官方登录状态完全保留。
 
 ## 2. 总体架构
@@ -350,3 +350,46 @@ NO_PROXY=10.20.30.61,127.0.0.1,localhost
 - Codex 升级后确认：`arg0::load_dotenv()` 仍读取 `CODEX_HOME/.env`；`auth.command` 命令鉴权格式未变；
   引擎仍尊重代理环境变量。
 - 官方功能新增域名时，更新规则快照需经代码评审与测试，随版本发布。
+
+## 15. 内部升级渠道
+
+第一阶段的“不做自动更新”后续放开：新增一条**内部升级渠道**，把一个 HTTP 服务器地址作为升级
+检测地址，复用 Tauri 官方 `tauri-plugin-updater` 完成检测 / 下载 / 签名校验 / 安装，避免自研。
+
+### 15.1 组件与依赖
+
+- 复用 `tauri-plugin-updater`（`native-tls` 特性，避免 rustls 依赖的 `ring` 在 macOS 交叉编译到
+  windows-msvc 时编译 C 源码；保留 `zip` 供 NSIS 更新包解压、`system-proxy` 跟随系统代理）。
+- 升级逻辑封装为 Rust 命令 `check_update` / `install_update`（`apps/desktop/src-tauri/src/update.rs`），
+  前端只通过这两个命令交互，不直接调用 JS 插件 API——因为“运行时覆盖检测地址”的 API 只在 Rust 侧可用。
+- 权限：`capabilities/default.json` 增加 `updater:default`。
+
+### 15.2 检测地址（可配置）
+
+- 检测地址指向服务器上的**静态 `latest.json`**（Tauri updater 标准格式：`version`、`notes`、`pub_date`、
+  `platforms.<os-arch>.{url, signature}`）；安装包本体（`*.nsis.zip` 及其 `.sig`）放在同一 HTTP 服务器。
+- 地址优先级：环境变量 `CODEX_HELPER_UPDATE_URL`（运行时覆盖，界面不暴露，与端口 `CODEX_HELPER_PROXY_PORT`
+  的应急覆盖同一思路）> `tauri.conf.json` 的 `plugins.updater.endpoints`（构建期默认，占位值需替换为真实内网地址）。
+- **允许明文 HTTP**：`plugins.updater.dangerousInsecureTransportProtocol = true`。完整性由 Ed25519 签名保证，
+  内网明文传输可接受。
+
+### 15.3 签名（强制，不可关闭）
+
+- Tauri updater 只安装带 Ed25519 签名的产物。公钥写在 `tauri.conf.json` 的 `plugins.updater.pubkey`；
+  私钥由 `tauri signer generate` 生成，仅在构建签名时经环境变量 `TAURI_SIGNING_PRIVATE_KEY` 使用，**绝不入库**。
+- 构建：`bundle.createUpdaterArtifacts = true` 让 bundler 产出更新包与 `.sig`；发布流程需在环境变量里提供私钥。
+
+### 15.4 交互（设计 §8 界面的补充）
+
+- 更新区常驻界面底部（独立于首次运行/受管开关的显隐），显示当前版本与“检查更新”按钮。
+- 启动时**静默自检**一次：失败不打扰（内网服务器可能暂不可达）；发现新版本则在更新区提示。
+- 手动“检查更新”：无更新提示“已是最新”，有更新展示“立即更新”。
+- 安装前**由用户确认**（确认框展示目标版本与 notes）；确认后下载并安装，成功后应用自动重启
+  （Windows `installMode = passive`，安装器无需交互）。
+
+### 15.5 兼容性关注点
+
+- 运行时覆盖地址仅经 Rust `UpdaterBuilder::endpoints`；JS 侧 `check()` 只读构建期配置，故不用于本渠道。
+- 与现有 NSIS `installMode: currentUser`（§12）一致：升级安装无需管理员权限。
+- 服务器需对 `latest.json` 与安装包提供稳定可达的 HTTP 访问；`latest.json` 的 `signature` 必须是对应
+  `.sig` 文件的**内容**（不是路径或 URL）。

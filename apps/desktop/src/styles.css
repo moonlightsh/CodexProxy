@@ -517,6 +517,34 @@ input[type="text"]:focus,
   font-size: 12px;
 }
 
+/* ---- 更新区 ---- */
+
+.update-region {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+.update-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.update-version {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-right: auto;
+}
+
+.update-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 /* ---- 模态框 ---- */
 
 .modal-overlay {

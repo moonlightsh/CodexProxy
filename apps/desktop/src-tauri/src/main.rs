@@ -11,6 +11,7 @@ mod lifecycle;
 mod process;
 mod startup;
 mod tray;
+mod update;
 
 use std::sync::{Arc, OnceLock};
 
@@ -47,6 +48,7 @@ fn main() {
             Some(vec![startup::MINIMIZED_ARG]),
         ))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::new(manager, handle))
         .manage(lifecycle::Lifecycle::default())
         .setup(move |app| {
@@ -71,6 +73,8 @@ fn main() {
             commands::set_autostart,
             commands::recent_connections,
             commands::get_reconcile_report,
+            update::check_update,
+            update::install_update,
         ])
         .build(tauri::generate_context!())
         .expect("CodexHelper 启动失败");

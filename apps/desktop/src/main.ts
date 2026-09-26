@@ -18,7 +18,8 @@ import { createMessageRegion } from "./message";
 import { confirmModal } from "./modal";
 import { createStatusLightsRegion } from "./statuslights";
 import { createSwitchRegion } from "./switchcontrol";
-import type { ConnectionRecord, ErrorPayload, ReconcileReport, Status } from "./types";
+import { createUpdatePanel } from "./updatepanel";
+import type { ConnectionRecord, ErrorPayload, ReconcileReport, Status, UpdateCheck } from "./types";
 import {
   EVENT_CONNECTION_RECORDED,
   EVENT_KEY_REQUIRED,
@@ -35,7 +36,9 @@ type OpKind =
   | "clearKey"
   | "cleanupResidue"
   | "removeLegacyEnvBlock"
-  | "setAutostart";
+  | "setAutostart"
+  | "checkUpdate"
+  | "installUpdate";
 
 async function main(): Promise<void> {
   // 开发预览：仅在 DEV 构建且不存在 Tauri 运行时注入时加载；`import.meta.env.DEV`
@@ -50,6 +53,9 @@ async function main(): Promise<void> {
 
   let status: Status | null = null;
   let connections: ConnectionRecord[] = [];
+  // 升级渠道：当前版本与最近一次检测到的可用更新（升级检测/安装逻辑在 Rust 侧）。
+  let updateCurrentVersion: string | null = null;
+  let updateAvailable: UpdateCheck | null = null;
   const busy = new Set<OpKind>();
 
   const messageRegion = createMessageRegion();
@@ -95,6 +101,15 @@ async function main(): Promise<void> {
     },
   });
 
+  const updatePanel = createUpdatePanel({
+    onCheck: () => {
+      void runCheckUpdate(true);
+    },
+    onInstall: () => {
+      void runInstallUpdate();
+    },
+  });
+
   const title = el("h1", { class: "app-title" }, ["CodexHelper"]);
   const loading = el("p", { class: "app-loading" }, ["加载中…"]);
   const connectionsTitle = el("h2", { class: "section-title" }, ["最近连接（最多 50 条）"]);
@@ -106,12 +121,14 @@ async function main(): Promise<void> {
     connectionsListRegion.root,
     footerRegion.root,
   ]);
-  // 布局自上而下：横幅 → 受管模式开关 → API Key → 状态灯/连接/底部（任务 3.2 要求 1）。
+  // 布局自上而下：横幅 → 受管模式开关 → API Key → 状态灯/连接/底部 → 更新区（任务 3.2 要求 1）。
+  // 更新区放在 normalModeRegion 之外，首次运行也可见（升级与是否配置 Key 无关）。
   const content = el("div", { class: "app-content" }, [
     bannerRegion.root,
     switchRegion.root,
     keyPanel.root,
     normalModeRegion,
+    updatePanel.root,
   ]);
   content.hidden = true;
 
@@ -136,6 +153,12 @@ async function main(): Promise<void> {
     statusLightsRegion.update(status);
     connectionsListRegion.update(connections);
     footerRegion.update(status, busy.has("setAutostart"));
+    updatePanel.update({
+      currentVersion: updateCurrentVersion,
+      checking: busy.has("checkUpdate"),
+      installing: busy.has("installUpdate"),
+      available: updateAvailable,
+    });
   }
 
   /** enable / saveKey 的通用重试编排：Key 只作为函数参数在调用链中传递，不落入任何模块状态。 */
@@ -283,6 +306,55 @@ async function main(): Promise<void> {
     }
   }
 
+  /** 检查更新：manual=true 为用户点击（无更新时提示“已是最新”），false 为启动时静默自检。 */
+  async function runCheckUpdate(manual: boolean): Promise<void> {
+    if (busy.has("checkUpdate") || busy.has("installUpdate")) return;
+    busy.add("checkUpdate");
+    render();
+    try {
+      const result = await api.checkUpdate();
+      updateCurrentVersion = result.currentVersion;
+      updateAvailable = result.available ? result : null;
+      if (result.available) {
+        messageRegion.show(`发现新版本 v${result.version}，可在下方“立即更新”安装。`, "info");
+      } else if (manual) {
+        messageRegion.show(`已是最新版本 v${result.currentVersion}。`, "success");
+      }
+    } catch (error) {
+      // 启动静默自检失败不打扰用户（例如内网升级服务器暂不可达）；仅手动检查时提示。
+      if (manual) messageRegion.show(toErrorPayload(error).message, "error");
+    } finally {
+      busy.delete("checkUpdate");
+      render();
+    }
+  }
+
+  /** 下载并安装更新：用户确认后执行，成功后应用自动重启（invoke 在成功时不会 resolve）。 */
+  async function runInstallUpdate(): Promise<void> {
+    if (!updateAvailable) return;
+    const versionLabel = updateAvailable.version ? `v${updateAvailable.version}` : "新版本";
+    const message = ["确认下载并安装更新吗？安装完成后应用会自动重启。"];
+    const notes = updateAvailable.notes?.trim();
+    if (notes) message.push(notes);
+    const ok = await confirmModal({
+      title: `更新到 ${versionLabel}`,
+      message,
+      confirmText: "下载并安装",
+      cancelText: "取消",
+    });
+    if (!ok) return;
+    busy.add("installUpdate");
+    render();
+    try {
+      await api.installUpdate();
+      // 成功时应用已开始重启，这里通常不会执行到；万一 resolve 也不做额外处理。
+    } catch (error) {
+      messageRegion.show(toErrorPayload(error).message, "error");
+      busy.delete("installUpdate");
+      render();
+    }
+  }
+
   /** reconcile-finished 事件（实时）：对账是当前正在发生的操作，其 status 就是最新状态。 */
   function applyReconcileReport(report: ReconcileReport): void {
     status = report.status;
@@ -345,6 +417,9 @@ async function main(): Promise<void> {
   } catch (error) {
     messageRegion.show(toErrorPayload(error).message, "error");
   }
+
+  // 启动时静默自检更新（不阻塞初始加载，失败不打扰）；发现新版本时在更新区提示，由用户确认安装。
+  void runCheckUpdate(false);
 }
 
 void main();

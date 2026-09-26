@@ -7,6 +7,7 @@ import type {
   ReconcileReport,
   SaveKeyRequest,
   Status,
+  UpdateCheck,
 } from "./types";
 
 export const api = {
@@ -21,6 +22,10 @@ export const api = {
   setAutostart: (enabled: boolean) => invoke<Status>("set_autostart", { enabled }),
   recentConnections: () => invoke<ConnectionRecord[]>("recent_connections"),
   getReconcileReport: () => invoke<ReconcileReport | null>("get_reconcile_report"),
+  /** 检测是否有可用更新（只检测、不下载）。 */
+  checkUpdate: () => invoke<UpdateCheck>("check_update"),
+  /** 下载并安装可用更新，成功后应用自动重启（此 Promise 在成功时不会 resolve）。 */
+  installUpdate: () => invoke<void>("install_update"),
 };
 
 /** 把 invoke 抛出的错误规范化为 ErrorPayload。 */

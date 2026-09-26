@@ -62,6 +62,7 @@ export type ErrorCode =
   | "configInvalid"
   | "credential"
   | "io"
+  | "update"
   | "internal";
 
 export interface ErrorPayload {
@@ -75,6 +76,20 @@ export interface ReconcileReport {
   outcome: ReconcileOutcome;
   error: ErrorPayload | null;
   status: Status;
+}
+
+/** 内部升级渠道的检测结果（与 apps/desktop/src-tauri/src/update.rs 的 UpdateCheck 对应）。 */
+export interface UpdateCheck {
+  /** 是否有可用更新 */
+  available: boolean;
+  /** 当前运行版本 */
+  currentVersion: string;
+  /** 可用的新版本号（available 为 true 时存在） */
+  version: string | null;
+  /** 更新说明（manifest 的 notes 字段，可能为空） */
+  notes: string | null;
+  /** 发布日期（RFC3339 文本，可能为空） */
+  date: string | null;
 }
 
 /** Rust → 前端事件名 */
