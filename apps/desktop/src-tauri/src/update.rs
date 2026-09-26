@@ -51,8 +51,11 @@ fn validate_endpoint(raw: &str) -> Result<Url, String> {
         "http" | "https" => {}
         other => return Err(format!("协议 {other} 不受支持（仅允许 http/https）")),
     }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("不允许在地址中携带用户名或密码".to_string());
+    // authority 形如 "host:port" 或 "user[:pass]@host"；出现 '@' 即携带真实 userinfo，一律拒绝，
+    // 避免未来凭据入地址。（空 userinfo 如 http://@host 会被 url 规范化为无 userinfo、
+    // 等价普通 host、不携带凭据，因此不在此处单独拦截。）
+    if url.authority().contains('@') {
+        return Err("不允许在地址中携带用户信息（user[:pass]@）".to_string());
     }
     if url.fragment().is_some() {
         return Err("不允许在地址中携带片段（#...）".to_string());
