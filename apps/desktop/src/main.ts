@@ -331,27 +331,37 @@ async function main(): Promise<void> {
 
   /** 下载并安装更新：用户确认后执行，成功后应用自动重启（invoke 在成功时不会 resolve）。 */
   async function runInstallUpdate(): Promise<void> {
-    if (!updateAvailable) return;
-    const versionLabel = updateAvailable.version ? `v${updateAvailable.version}` : "新版本";
+    if (busy.has("installUpdate") || busy.has("checkUpdate")) return;
+    const target = updateAvailable;
+    if (!target?.version) return;
+    const expectedVersion = target.version;
+    // 先占用 installUpdate 并 render：确认框弹出期间“检查更新/立即更新”按钮均禁用，避免并发。
+    busy.add("installUpdate");
+    render();
     const message = ["确认下载并安装更新吗？安装完成后应用会自动重启。"];
-    const notes = updateAvailable.notes?.trim();
+    const notes = target.notes?.trim();
     if (notes) message.push(notes);
     const ok = await confirmModal({
-      title: `更新到 ${versionLabel}`,
+      title: `更新到 v${expectedVersion}`,
       message,
       confirmText: "下载并安装",
       cancelText: "取消",
     });
-    if (!ok) return;
-    busy.add("installUpdate");
-    render();
-    try {
-      await api.installUpdate();
-      // 成功时应用已开始重启，这里通常不会执行到；万一 resolve 也不做额外处理。
-    } catch (error) {
-      messageRegion.show(toErrorPayload(error).message, "error");
+    if (!ok) {
       busy.delete("installUpdate");
       render();
+      return;
+    }
+    try {
+      // 把用户确认的版本传给后端；若服务器版本已变，后端会拒绝安装。
+      await api.installUpdate(expectedVersion);
+      // 成功时应用已开始重启，这里通常不会执行到；万一 resolve 也不做额外处理。
+    } catch (error) {
+      busy.delete("installUpdate");
+      render();
+      messageRegion.show(toErrorPayload(error).message, "error");
+      // 版本可能已在服务器变化：重新静默检查，刷新更新区展示与可安装版本。
+      void runCheckUpdate(false);
     }
   }
 
@@ -397,6 +407,15 @@ async function main(): Promise<void> {
       messageRegion.show(event.payload.message, "error");
     }),
   ]);
+
+  // 当前版本来自本地（不依赖升级服务器可达）：独立获取，确保更新区始终显示版本。
+  try {
+    updateCurrentVersion = await api.appVersion();
+    render();
+  } catch {
+    // 极少失败；此时更新区显示“当前版本 —”，不打扰用户。
+    updateCurrentVersion = null;
+  }
 
   try {
     const [initialStatus, initialConnections, reconcileReport] = await Promise.all([

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主窗口所需的最小权限（事件监听、内部升级检测/安装）",
+  "description": "主窗口所需的最小权限（仅事件监听；升级检测/安装均通过自定义 Rust 命令，不暴露 updater IPC）",
   "windows": ["main"],
-  "permissions": ["core:default", "updater:default"]
+  "permissions": ["core:default"]
 }

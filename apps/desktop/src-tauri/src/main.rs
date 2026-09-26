@@ -75,6 +75,7 @@ fn main() {
             commands::get_reconcile_report,
             update::check_update,
             update::install_update,
+            update::app_version,
         ])
         .build(tauri::generate_context!())
         .expect("CodexHelper 启动失败");

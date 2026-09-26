@@ -24,8 +24,11 @@ export const api = {
   getReconcileReport: () => invoke<ReconcileReport | null>("get_reconcile_report"),
   /** 检测是否有可用更新（只检测、不下载）。 */
   checkUpdate: () => invoke<UpdateCheck>("check_update"),
-  /** 下载并安装可用更新，成功后应用自动重启（此 Promise 在成功时不会 resolve）。 */
-  installUpdate: () => invoke<void>("install_update"),
+  /** 下载并安装可用更新（expectedVersion 为用户在确认框里确认的版本，用于绑定校验）；
+   *  成功后应用自动重启（此 Promise 在成功时不会 resolve）。 */
+  installUpdate: (expectedVersion: string) => invoke<void>("install_update", { expectedVersion }),
+  /** 获取当前运行版本（不依赖升级服务器）。 */
+  appVersion: () => invoke<string>("app_version"),
 };
 
 /** 把 invoke 抛出的错误规范化为 ErrorPayload。 */

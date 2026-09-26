@@ -393,3 +393,18 @@ NO_PROXY=10.20.30.61,127.0.0.1,localhost
 - 与现有 NSIS `installMode: currentUser`（§12）一致：升级安装无需管理员权限。
 - 服务器需对 `latest.json` 与安装包提供稳定可达的 HTTP 访问；`latest.json` 的 `signature` 必须是对应
   `.sig` 文件的**内容**（不是路径或 URL）。
+
+### 15.6 残余风险与加固
+
+- **仅保证安装包完整性/真实性**：Ed25519 签名只证明安装包由持钥方签发，不保证 manifest/notes 的真实性、
+  传输机密性、更新可用性与发布新鲜度。明文 HTTP 下中间人仍可隐藏新版本、篡改 notes、回放合法旧包或阻断更新。
+- **已启用 `requireSignedVersion: true`**：要求签名可信注释内绑定的版本与 manifest 声明版本一致，堵住
+  “旧的有效签名包 + 伪造更高版本号”的降级攻击；发布门禁应校验 `.sig` 可信注释确实包含当前版本。
+- **endpoint 覆盖收敛**：`CODEX_HELPER_UPDATE_URL` 仅允许 `http`/`https`，拒绝携带 userinfo 或 fragment 的
+  URL，且错误信息不回显原始地址值（未来地址可能携带令牌）。该环境变量属“受信任运维输入”，不是远程攻击边界。
+- **无鉴权服务器**：静态升级服务器预期无需鉴权，应由内网 ACL/防火墙限制**读取**，发布目录的**写权限**须与签名
+  私钥严格分离。不要在明文 HTTP 上叠加 Bearer/Basic Auth——凭据会被直接窃听；如需机密性与真实性，改用 HTTPS。
+- **权限最小化**：前端只调用自定义 Rust 命令，capability 不授予 `updater:default`（不向 WebView 暴露 updater
+  的 check/download/install IPC）。
+- **私钥保护**：私钥仅存于仓库外（`~/.tauri/codex-helper.key`），文件权限应为 `0600`、目录 `0700`；CI 中经受保护
+  的 secret/密钥库注入 `TAURI_SIGNING_PRIVATE_KEY`，不落入普通构建日志。

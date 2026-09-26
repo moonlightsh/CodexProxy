@@ -221,7 +221,11 @@ export function installDevMock(): void {
             : { available: false, currentVersion: "0.1.1", version: null, notes: null, date: null };
 
         case "install_update":
+          // 忽略 expectedVersion 参数；开发预览不支持真实安装。
           return reject({ code: "update", message: "开发预览不支持真实安装更新。" });
+
+        case "app_version":
+          return "0.1.1";
 
         case "recent_connections":
           return connections;

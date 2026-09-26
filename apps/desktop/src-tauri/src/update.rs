@@ -42,13 +42,31 @@ fn override_endpoint() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// 校验运行时覆盖的检测地址：仅允许 http/https，拒绝携带 userinfo 或 fragment 的 URL。
+///
+/// 返回的错误信息**不包含原始地址值**——未来 URL 可能携带令牌，避免其泄露到日志或前端提示。
+fn validate_endpoint(raw: &str) -> Result<Url, String> {
+    let url = Url::parse(raw).map_err(|error| format!("无法解析为 URL：{error}"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("协议 {other} 不受支持（仅允许 http/https）")),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("不允许在地址中携带用户名或密码".to_string());
+    }
+    if url.fragment().is_some() {
+        return Err("不允许在地址中携带片段（#...）".to_string());
+    }
+    Ok(url)
+}
+
 /// 构建 updater：存在环境变量覆盖时替换 endpoints，否则沿用 `tauri.conf.json` 的配置。
 fn build_updater(app: &AppHandle) -> Result<Updater, ErrorPayload> {
     let mut builder = app.updater_builder();
     if let Some(url) = override_endpoint() {
-        let endpoint = Url::parse(&url).map_err(|error| ErrorPayload {
+        let endpoint = validate_endpoint(&url).map_err(|reason| ErrorPayload {
             code: "update".to_string(),
-            message: format!("检测地址无效（{UPDATE_URL_ENV}={url}）：{error}"),
+            message: format!("{UPDATE_URL_ENV} 无效：{reason}"),
         })?;
         builder = builder
             .endpoints(vec![endpoint])
@@ -103,9 +121,18 @@ pub async fn check_update(app: AppHandle) -> Result<UpdateCheck, ErrorPayload> {
     }
 }
 
-/// 下载并安装可用更新，成功后重启应用；无可用更新时返回错误由前端提示刷新。
+/// 返回当前运行版本（不依赖升级服务器，供界面始终展示本地版本）。
 #[tauri::command]
-pub async fn install_update(app: AppHandle) -> Result<(), ErrorPayload> {
+pub fn app_version(app: AppHandle) -> Result<String, ErrorPayload> {
+    Ok(app.package_info().version.to_string())
+}
+
+/// 下载并安装可用更新，成功后重启应用；无可用更新时返回错误由前端提示刷新。
+///
+/// `expected_version` 是前端在确认框里向用户展示并确认的版本。安装前重新检查一次，若
+/// 服务器此刻返回的版本与用户确认的不一致，则拒绝安装，避免“确认 A 却装了 B”的竞态。
+#[tauri::command]
+pub async fn install_update(app: AppHandle, expected_version: String) -> Result<(), ErrorPayload> {
     let updater = build_updater(&app)?;
     let update = match updater.check().await {
         Ok(Some(update)) => update,
@@ -117,6 +144,16 @@ pub async fn install_update(app: AppHandle) -> Result<(), ErrorPayload> {
         }
         Err(error) => return Err(map_error("检查更新失败", error)),
     };
+    if update.version != expected_version {
+        log::event(
+            "desktop.update.install",
+            json!({ "ok": false, "reason": "version_changed" }),
+        );
+        return Err(ErrorPayload {
+            code: "update".to_string(),
+            message: "可用版本已变化，请重新检查更新后再安装。".to_string(),
+        });
+    }
     log::event(
         "desktop.update.install",
         json!({ "version": update.version }),
@@ -128,4 +165,52 @@ pub async fn install_update(app: AppHandle) -> Result<(), ErrorPayload> {
     log::event("desktop.update.install", json!({ "ok": true }));
     // 安装器已在后台运行：退出并重启当前进程，让 NSIS 接管替换（`restart` 发散，不返回）。
     app.restart()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_endpoint_accepts_http_and_https() {
+        assert!(validate_endpoint("http://10.0.0.1:8080/codex-helper/latest.json").is_ok());
+        assert!(validate_endpoint("https://example.internal/codex-helper/latest.json").is_ok());
+    }
+
+    #[test]
+    fn validate_endpoint_rejects_non_http_scheme() {
+        assert!(validate_endpoint("ftp://example.internal/latest.json").is_err());
+        assert!(validate_endpoint("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_endpoint_rejects_userinfo() {
+        assert!(validate_endpoint("http://user:pass@host/latest.json").is_err());
+        assert!(validate_endpoint("http://user@host/latest.json").is_err());
+    }
+
+    #[test]
+    fn validate_endpoint_rejects_fragment() {
+        assert!(validate_endpoint("http://host/latest.json#frag").is_err());
+    }
+
+    #[test]
+    fn validate_endpoint_rejects_garbage() {
+        assert!(validate_endpoint("not a url").is_err());
+        assert!(validate_endpoint("").is_err());
+    }
+
+    #[test]
+    fn update_check_serializes_camel_case() {
+        let value = serde_json::to_value(UpdateCheck {
+            available: true,
+            current_version: "0.1.1".to_string(),
+            version: Some("0.2.0".to_string()),
+            notes: None,
+            date: None,
+        })
+        .expect("serialize");
+        assert!(value.get("currentVersion").is_some());
+        assert!(value.get("current_version").is_none());
+    }
 }
