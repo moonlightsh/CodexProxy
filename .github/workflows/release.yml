@@ -90,12 +90,12 @@ jobs:
 
       # 生成 updater 的 latest.json；若配置了 Nexus 部署凭据则一并发布到内网 cypub。
       # 注意：GitHub 云端 runner 访问不到内网 rdc.tiandy.com——需在内网自托管 runner 上
-      # 配置 NEXUS_DEPLOY_USER/NEXUS_DEPLOY_TOKEN 才会真正上传；否则本步骤仅生成 latest.json，
+      # 配置 NEXUS_DEPLOY_USER/NEXUS_DEPLOY_PASS 才会真正上传；否则本步骤仅生成 latest.json，
       # 可在内网机器上运行 scripts/publish-update.sh 完成发布（设计 §15.7）。
       - name: 生成 manifest 并（可选）发布到内网 Nexus
         env:
           NEXUS_DEPLOY_USER: ${{ secrets.NEXUS_DEPLOY_USER }}
-          NEXUS_DEPLOY_TOKEN: ${{ secrets.NEXUS_DEPLOY_TOKEN }}
+          NEXUS_DEPLOY_PASS: ${{ secrets.NEXUS_DEPLOY_PASS }}
         run: bash scripts/publish-update.sh
 
       - name: 上传安装包与更新产物到 GitHub Release

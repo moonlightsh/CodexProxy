@@ -5,3 +5,7 @@ apps/desktop/dist/
 apps/desktop/src-tauri/gen/
 apps/desktop/src-tauri/binaries/
 apps/desktop/src-tauri/target/
+
+# 本地凭据/环境变量（如 Nexus 部署账号），绝不入库
+.env
+.env.*

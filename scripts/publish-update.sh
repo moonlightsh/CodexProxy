@@ -4,7 +4,7 @@
 # 完成 `tauri build`，产物 *-setup.exe 与 *-setup.exe.sig 位于 BUNDLE_DIR。
 #
 # 环境变量：
-#   NEXUS_DEPLOY_USER / NEXUS_DEPLOY_TOKEN  上传凭据（两者齐备才上传；否则只生成 latest.json）
+#   NEXUS_DEPLOY_USER / NEXUS_DEPLOY_PASS   上传凭据（两者齐备才上传；否则只生成 latest.json）
 #   UPDATE_NOTES                            可选，更新说明（默认按版本号生成一句）
 #   BUNDLE_DIR                              可选，覆盖产物目录（默认 target/release/bundle/nsis）
 #
@@ -34,7 +34,7 @@ fi
 SIG_FILE="${sig_files[0]}"
 ARTIFACT="${SIG_FILE%.sig}"
 if [ ! -f "$ARTIFACT" ]; then
-  echo "错误：找到签名 $SIG_FILE，但缺少对应产物 $ARTIFACT。" >&2
+  echo "错误：找到签名 ${SIG_FILE}，但缺少对应产物 ${ARTIFACT}。" >&2
   exit 1
 fi
 ARTIFACT_NAME="$(basename "$ARTIFACT")"
@@ -61,15 +61,15 @@ const manifest = {
 };
 fs.writeFileSync(process.argv[1], JSON.stringify(manifest, null, 2) + "\n");
 ' "$LATEST_JSON"
-echo "已生成 $LATEST_JSON （version=$VERSION, url=$DOWNLOAD_BASE/$ARTIFACT_NAME）"
+echo "已生成 $LATEST_JSON （version=$VERSION, url=$DOWNLOAD_BASE/${ARTIFACT_NAME}）"
 
 # 上传（凭据齐备才执行）。-f：HTTP 错误码即失败退出；-k：跳过自签证书但仍走 TLS 加密。
-if [ -n "${NEXUS_DEPLOY_USER:-}" ] && [ -n "${NEXUS_DEPLOY_TOKEN:-}" ]; then
+if [ -n "${NEXUS_DEPLOY_USER:-}" ] && [ -n "${NEXUS_DEPLOY_PASS:-}" ]; then
   echo "上传产物与 manifest 到 Nexus（覆盖式 redeploy）……"
-  curl -fk -u "$NEXUS_DEPLOY_USER:$NEXUS_DEPLOY_TOKEN" --upload-file "$ARTIFACT"    "$UPLOAD_BASE/$ARTIFACT_NAME"
-  curl -fk -u "$NEXUS_DEPLOY_USER:$NEXUS_DEPLOY_TOKEN" --upload-file "$LATEST_JSON" "$UPLOAD_BASE/latest.json"
+  curl -fk -u "$NEXUS_DEPLOY_USER:$NEXUS_DEPLOY_PASS" --upload-file "$ARTIFACT"    "$UPLOAD_BASE/$ARTIFACT_NAME"
+  curl -fk -u "$NEXUS_DEPLOY_USER:$NEXUS_DEPLOY_PASS" --upload-file "$LATEST_JSON" "$UPLOAD_BASE/latest.json"
   echo "上传完成。检测地址：$DOWNLOAD_BASE/latest.json"
 else
-  echo "未提供 NEXUS_DEPLOY_USER/NEXUS_DEPLOY_TOKEN，跳过上传（仅生成 latest.json）。"
+  echo "未提供 NEXUS_DEPLOY_USER/NEXUS_DEPLOY_PASS，跳过上传（仅生成 latest.json）。"
   echo "可在能访问 rdc.tiandy.com 的机器上设置这两个环境变量后重跑本脚本完成发布。"
 fi

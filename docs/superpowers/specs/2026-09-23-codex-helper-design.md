@@ -423,11 +423,11 @@ NO_PROXY=10.20.30.61,127.0.0.1,localhost
 - **匿名读**：cypub 允许匿名 GET，客户端无需凭据、无需在每台机器信任内网 CA。
 - **redeploy**：仓库允许覆盖式 redeploy，`latest.json` 每次发版直接覆盖同名路径（安装器文件名带版本号、天然不覆盖）。
 - **发布脚本** `scripts/publish-update.sh`：在 `tauri build`（`createUpdaterArtifacts=true` 且提供私钥）之后运行——
-  生成 `latest.json`（内联 `.sig` 内容、按约定拼下载 URL），并在提供 `NEXUS_DEPLOY_USER`/`NEXUS_DEPLOY_TOKEN`
+  生成 `latest.json`（内联 `.sig` 内容、按约定拼下载 URL），并在提供 `NEXUS_DEPLOY_USER`/`NEXUS_DEPLOY_PASS`
   时用 HTTP PUT 覆盖上传安装器与 `latest.json`；未提供凭据则仅生成、跳过上传。
 - **CI 注意**：`release.yml` 在 `windows-latest`（GitHub 云端 runner）上构建，**访问不到内网 rdc.tiandy.com**。
   该工作流会注入签名私钥、生成 `latest.json`，并把三件产物（`*-setup.exe`、`.sig`、`latest.json`）传到 GitHub
   Release；真正发布到 Nexus 需在**能访问内网的机器/自托管 runner** 上配置 `NEXUS_DEPLOY_*` 后由脚本完成
   （云端 runner 未配置凭据时该步骤仅生成 `latest.json`、跳过上传，不会失败）。
 - **所需 Secrets**：`TAURI_SIGNING_PRIVATE_KEY`（必需，否则 `createUpdaterArtifacts` 构建失败）；
-  `NEXUS_DEPLOY_USER`/`NEXUS_DEPLOY_TOKEN`（发布到 Nexus 时需要，写凭据与签名私钥分开管理）。
+  `NEXUS_DEPLOY_USER`/`NEXUS_DEPLOY_PASS`（发布到 Nexus 时需要，写凭据与签名私钥分开管理）。
