@@ -362,14 +362,17 @@ NO_PROXY=10.20.30.61,127.0.0.1,localhost
   windows-msvc 时编译 C 源码；保留 `zip` 供 NSIS 更新包解压、`system-proxy` 跟随系统代理）。
 - 升级逻辑封装为 Rust 命令 `check_update` / `install_update`（`apps/desktop/src-tauri/src/update.rs`），
   前端只通过这两个命令交互，不直接调用 JS 插件 API——因为“运行时覆盖检测地址”的 API 只在 Rust 侧可用。
-- 权限：`capabilities/default.json` 增加 `updater:default`。
+- 权限：`capabilities/default.json` 仅 `core:default`；升级检测/安装均走上述 Rust 命令，
+  不向 WebView 暴露 `updater:default`（见 §15.6）。
 
 ### 15.2 检测地址（可配置）
 
 - 检测地址指向服务器上的**静态 `latest.json`**（Tauri updater 标准格式：`version`、`notes`、`pub_date`、
-  `platforms.<os-arch>.{url, signature}`）；安装包本体（`*.nsis.zip` 及其 `.sig`）放在同一 HTTP 服务器。
+  `platforms.<os-arch>.{url, signature}`；本项目平台键为 `windows-x86_64`）。因 `createUpdaterArtifacts=true`
+  非 v1 兼容模式，**更新产物就是 NSIS 安装器本体 `*-setup.exe`及其 `.sig`**（而非 zip），与 `latest.json`
+  放在同一 HTTP 服务器（具体渠道见 §15.7）。
 - 地址优先级：环境变量 `CODEX_HELPER_UPDATE_URL`（运行时覆盖，界面不暴露，与端口 `CODEX_HELPER_PROXY_PORT`
-  的应急覆盖同一思路）> `tauri.conf.json` 的 `plugins.updater.endpoints`（构建期默认，占位值需替换为真实内网地址）。
+  的应急覆盖同一思路）> `tauri.conf.json` 的 `plugins.updater.endpoints`（构建期默认，现指向内网 Nexus，见 §15.7）。
 - **允许明文 HTTP**：`plugins.updater.dangerousInsecureTransportProtocol = true`。完整性由 Ed25519 签名保证，
   内网明文传输可接受。
 
@@ -408,3 +411,23 @@ NO_PROXY=10.20.30.61,127.0.0.1,localhost
   的 check/download/install IPC）。
 - **私钥保护**：私钥仅存于仓库外（`~/.tauri/codex-helper.key`），文件权限应为 `0600`、目录 `0700`；CI 中经受保护
   的 secret/密钥库注入 `TAURI_SIGNING_PRIVATE_KEY`，不落入普通构建日志。
+
+### 15.7 发布渠道与发布流程（Nexus cypub）
+
+- **渠道**：复用现有内网 Nexus 的 raw(generic) 仓库 `cypub`（已用于分发内部工具）。约定目录 `codex-helper/`：
+  - 检测地址：`http://rdc.tiandy.com/nexus/repository/cypub/codex-helper/latest.json`
+  - 安装包：`http://rdc.tiandy.com/nexus/repository/cypub/codex-helper/CodexHelper_<版本>_x64-setup.exe`
+- **为何客户端走明文 HTTP 而非 HTTPS**：该 Nexus 证书为内网自签，`tauri-plugin-updater`（native-tls）对 HTTPS
+  会做证书校验且不暴露“忽略非法证书”的开关；而 Nexus 同样内容明文 HTTP 直接可取、不强制跳转。故客户端下载走
+  HTTP（完整性由 Ed25519 签名保证），上传走 HTTPS（保护部署凭据，`curl -k` 跳过自签校验）。
+- **匿名读**：cypub 允许匿名 GET，客户端无需凭据、无需在每台机器信任内网 CA。
+- **redeploy**：仓库允许覆盖式 redeploy，`latest.json` 每次发版直接覆盖同名路径（安装器文件名带版本号、天然不覆盖）。
+- **发布脚本** `scripts/publish-update.sh`：在 `tauri build`（`createUpdaterArtifacts=true` 且提供私钥）之后运行——
+  生成 `latest.json`（内联 `.sig` 内容、按约定拼下载 URL），并在提供 `NEXUS_DEPLOY_USER`/`NEXUS_DEPLOY_TOKEN`
+  时用 HTTP PUT 覆盖上传安装器与 `latest.json`；未提供凭据则仅生成、跳过上传。
+- **CI 注意**：`release.yml` 在 `windows-latest`（GitHub 云端 runner）上构建，**访问不到内网 rdc.tiandy.com**。
+  该工作流会注入签名私钥、生成 `latest.json`，并把三件产物（`*-setup.exe`、`.sig`、`latest.json`）传到 GitHub
+  Release；真正发布到 Nexus 需在**能访问内网的机器/自托管 runner** 上配置 `NEXUS_DEPLOY_*` 后由脚本完成
+  （云端 runner 未配置凭据时该步骤仅生成 `latest.json`、跳过上传，不会失败）。
+- **所需 Secrets**：`TAURI_SIGNING_PRIVATE_KEY`（必需，否则 `createUpdaterArtifacts` 构建失败）；
+  `NEXUS_DEPLOY_USER`/`NEXUS_DEPLOY_TOKEN`（发布到 Nexus 时需要，写凭据与签名私钥分开管理）。

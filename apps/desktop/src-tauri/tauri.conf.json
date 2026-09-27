@@ -55,7 +55,7 @@
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM4QUVERkRCOEMyOEVFQTgKUldTbzdpaU0yOSt1eUNEcmNwb0lQN3Bpd1huOXIrckJFbTd2UEIyUjdZRy9zdHR1VDJlK3E1VFIK",
       "requireSignedVersion": true,
       "endpoints": [
-        "http://10.20.30.61:8080/codex-helper/latest.json"
+        "http://rdc.tiandy.com/nexus/repository/cypub/codex-helper/latest.json"
       ],
       "dangerousInsecureTransportProtocol": true,
       "windows": {

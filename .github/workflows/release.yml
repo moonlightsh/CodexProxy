@@ -70,20 +70,40 @@ jobs:
       # tauri.conf.json 所在目录（src-tauri）为基准解析，与该配置文件放在哪里无关。
       - name: tauri build（合并 externalBin 配置）
         working-directory: apps/desktop
+        env:
+          # createUpdaterArtifacts=true 要求签名私钥；缺失会导致构建失败（设计 §15.3）。
+          # 私钥无密码，无需 *_PASSWORD；需在仓库 Secrets 配置。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: npx tauri build --config src-tauri/tauri.bundle.conf.json
 
       - name: 定位 NSIS 安装包
         id: find_installer
         run: |
-          INSTALLER=$(ls target/release/bundle/nsis/*.exe 2>/dev/null | head -n1)
-          if [ -z "$INSTALLER" ]; then
+          shopt -s nullglob
+          installers=(target/release/bundle/nsis/*-setup.exe)
+          shopt -u nullglob
+          if [ ${#installers[@]} -eq 0 ]; then
             echo "::error::未找到 NSIS 安装包，tauri build 可能未生成预期产物"
             exit 1
           fi
-          echo "path=$INSTALLER" >> "$GITHUB_OUTPUT"
+          echo "path=${installers[0]}" >> "$GITHUB_OUTPUT"
 
-      - name: 上传安装包到 GitHub Release
+      # 生成 updater 的 latest.json；若配置了 Nexus 部署凭据则一并发布到内网 cypub。
+      # 注意：GitHub 云端 runner 访问不到内网 rdc.tiandy.com——需在内网自托管 runner 上
+      # 配置 NEXUS_DEPLOY_USER/NEXUS_DEPLOY_TOKEN 才会真正上传；否则本步骤仅生成 latest.json，
+      # 可在内网机器上运行 scripts/publish-update.sh 完成发布（设计 §15.7）。
+      - name: 生成 manifest 并（可选）发布到内网 Nexus
+        env:
+          NEXUS_DEPLOY_USER: ${{ secrets.NEXUS_DEPLOY_USER }}
+          NEXUS_DEPLOY_TOKEN: ${{ secrets.NEXUS_DEPLOY_TOKEN }}
+        run: bash scripts/publish-update.sh
+
+      - name: 上传安装包与更新产物到 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.find_installer.outputs.path }}
+          # 同时上传：安装器 *-setup.exe（也是 updater 下载目标）、其 .sig 签名、以及 latest.json。
+          files: |
+            ${{ steps.find_installer.outputs.path }}
+            target/release/bundle/nsis/*-setup.exe.sig
+            target/release/bundle/nsis/latest.json
           fail_on_unmatched_files: true
