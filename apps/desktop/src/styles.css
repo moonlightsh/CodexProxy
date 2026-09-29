@@ -133,6 +133,106 @@ body {
   gap: 14px;
 }
 
+/* ---- 标签页 ---- */
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  padding: 6px 12px;
+  margin-bottom: -1px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.tab[aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* ---- 开发环境页 ---- */
+
+.devenv-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.devenv-intro {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.devenv-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.devenv-checked {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.devenv-results {
+  gap: 10px;
+}
+
+.devenv-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.devenv-addr {
+  overflow-wrap: anywhere;
+}
+
+.devenv-hint {
+  margin-left: 16px;
+  font-size: 12px;
+}
+
+.devenv-hint-text {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.devenv-code {
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.devenv-empty {
+  margin: 0;
+  color: var(--text-muted);
+  text-align: center;
+}
+
 /* ---- 按钮 / 表单控件 ---- */
 
 button {

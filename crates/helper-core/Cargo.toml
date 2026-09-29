@@ -17,7 +17,16 @@ tokio.workspace = true
 toml_edit.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows.workspace = true
+# 开发环境检测（设计 §16）：从注册表重新读取系统 / 用户 Path 并展开环境变量（Registry、Environment）；
+# 用“关闭即结束”的 Job Object 在超时时结束整棵子进程树（JobObjects；CreateJobObjectW 需要 Security，
+# JOBOBJECT_EXTENDED_LIMIT_INFORMATION 需要 Threading）。
+windows = { workspace = true, features = [
+    "Win32_System_Registry",
+    "Win32_System_Environment",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
 
 [dev-dependencies]
 wiremock.workspace = true

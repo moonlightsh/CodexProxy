@@ -1,4 +1,4 @@
-// 阶段 3 任务 3.2 实现：按设计 §8 的单页界面。
+// 阶段 3 任务 3.2 实现：按设计 §8 的界面；§16 起分为“受管网关”“开发环境”两个标签页。
 // 本文件只负责启动（挂载各区域、发起初始数据加载、注册 Tauri 事件监听）与
 // 各区域回调之间的编排；纯逻辑（格式化、错误码映射、连接列表截断）见对应的
 // 无 DOM 依赖模块，并有各自的单元测试。
@@ -9,6 +9,7 @@ import { createBannerRegion } from "./banners";
 import { catalogConfirmMessageForPath, confirmCatalogRemoval } from "./catalogconfirm";
 import { withNewConnection, truncateConnections } from "./connections";
 import { createConnectionsListRegion } from "./connectionslist";
+import { createDevEnvPanel } from "./devenvpanel";
 import { el } from "./dom";
 import { classifyKeyError } from "./errors";
 import { createFooterRegion } from "./footer";
@@ -18,8 +19,16 @@ import { createMessageRegion } from "./message";
 import { confirmModal } from "./modal";
 import { createStatusLightsRegion } from "./statuslights";
 import { createSwitchRegion } from "./switchcontrol";
+import { createTabs } from "./tabs";
 import { createUpdatePanel } from "./updatepanel";
-import type { ConnectionRecord, ErrorPayload, ReconcileReport, Status, UpdateCheck } from "./types";
+import type {
+  ConnectionRecord,
+  DevEnvReport,
+  ErrorPayload,
+  ReconcileReport,
+  Status,
+  UpdateCheck,
+} from "./types";
 import {
   EVENT_CONNECTION_RECORDED,
   EVENT_KEY_REQUIRED,
@@ -38,7 +47,8 @@ type OpKind =
   | "removeLegacyEnvBlock"
   | "setAutostart"
   | "checkUpdate"
-  | "installUpdate";
+  | "installUpdate"
+  | "detectDevEnv";
 
 async function main(): Promise<void> {
   // 开发预览：仅在 DEV 构建且不存在 Tauri 运行时注入时加载；`import.meta.env.DEV`
@@ -56,6 +66,9 @@ async function main(): Promise<void> {
   // 升级渠道：当前版本与最近一次检测到的可用更新（升级检测/安装逻辑在 Rust 侧）。
   let updateCurrentVersion: string | null = null;
   let updateAvailable: UpdateCheck | null = null;
+  // 开发环境页（设计 §16）：最近一次检测结果与完成时间。
+  let devEnvReport: DevEnvReport | null = null;
+  let devEnvCheckedAt: number | null = null;
   const busy = new Set<OpKind>();
 
   const messageRegion = createMessageRegion();
@@ -110,6 +123,12 @@ async function main(): Promise<void> {
     },
   });
 
+  const devEnvPanel = createDevEnvPanel({
+    onDetect: () => {
+      void runDetectDevEnv();
+    },
+  });
+
   const title = el("h1", { class: "app-title" }, ["CodexHelper"]);
   const loading = el("p", { class: "app-loading" }, ["加载中…"]);
   const connectionsTitle = el("h2", { class: "section-title" }, ["最近连接（最多 50 条）"]);
@@ -121,20 +140,49 @@ async function main(): Promise<void> {
     connectionsListRegion.root,
     footerRegion.root,
   ]);
-  // 布局自上而下：横幅 → 受管模式开关 → API Key → 状态灯/连接/底部 → 更新区（任务 3.2 要求 1）。
-  // 更新区放在 normalModeRegion 之外，首次运行也可见（升级与是否配置 Key 无关）。
+  // 布局自上而下：横幅 → 受管模式开关 → API Key → 状态灯/连接/底部（任务 3.2 要求 1）。
   const content = el("div", { class: "app-content" }, [
     bannerRegion.root,
     switchRegion.root,
     keyPanel.root,
     normalModeRegion,
-    updatePanel.root,
   ]);
   content.hidden = true;
 
-  appRoot.append(title, messageRegion.root, loading, content);
+  // 两个页面：受管网关（原单页）与开发环境（设计 §16）。更新区放在页面之外，两页都可见
+  // （升级与是否配置 Key 无关，首次运行也可见）。
+  const gatewayPage = el("div", { class: "page" }, [loading, content]);
+  const devEnvPage = el("div", { class: "page" }, [devEnvPanel.root]);
+  const tabs = createTabs(
+    [
+      { id: "gateway", label: "受管网关", panel: gatewayPage },
+      { id: "devenv", label: "开发环境", panel: devEnvPage },
+    ],
+    (page) => {
+      // 首次打开开发环境页时自动检测一次；启动时不检测，避免开机即拉起子进程。
+      if (page === "devenv" && devEnvReport === null) void runDetectDevEnv();
+    },
+  );
+  tabs.select("gateway");
+
+  appRoot.append(title, tabs.root, messageRegion.root, gatewayPage, devEnvPage, updatePanel.root);
 
   function render(): void {
+    renderGateway();
+    devEnvPanel.update({
+      detecting: busy.has("detectDevEnv"),
+      report: devEnvReport,
+      checkedAt: devEnvCheckedAt,
+    });
+    updatePanel.update({
+      currentVersion: updateCurrentVersion,
+      checking: busy.has("checkUpdate"),
+      installing: busy.has("installUpdate"),
+      available: updateAvailable,
+    });
+  }
+
+  function renderGateway(): void {
     if (!status) {
       loading.hidden = false;
       content.hidden = true;
@@ -153,12 +201,22 @@ async function main(): Promise<void> {
     statusLightsRegion.update(status);
     connectionsListRegion.update(connections);
     footerRegion.update(status, busy.has("setAutostart"));
-    updatePanel.update({
-      currentVersion: updateCurrentVersion,
-      checking: busy.has("checkUpdate"),
-      installing: busy.has("installUpdate"),
-      available: updateAvailable,
-    });
+  }
+
+  /** 开发环境检测：只读，失败（invoke 本身出错）时在消息区提示，保留上一次的结果。 */
+  async function runDetectDevEnv(): Promise<void> {
+    if (busy.has("detectDevEnv")) return;
+    busy.add("detectDevEnv");
+    render();
+    try {
+      devEnvReport = await api.detectDevEnv();
+      devEnvCheckedAt = Date.now();
+    } catch (error) {
+      messageRegion.show(toErrorPayload(error).message, "error");
+    } finally {
+      busy.delete("detectDevEnv");
+      render();
+    }
   }
 
   /** enable / saveKey 的通用重试编排：Key 只作为函数参数在调用链中传递，不落入任何模块状态。 */
@@ -397,6 +455,8 @@ async function main(): Promise<void> {
       connectionsListRegion.update(connections);
     }),
     listen<null>(EVENT_KEY_REQUIRED, () => {
+      // Key 录入区在受管网关页；用户停在开发环境页时先切回，否则录入框不可见、无法聚焦。
+      tabs.select("gateway");
       keyPanel.openForm();
       keyPanel.focusInput();
     }),
@@ -430,6 +490,7 @@ async function main(): Promise<void> {
     }
     render();
     if (status.needsKey) {
+      tabs.select("gateway");
       keyPanel.openForm();
       keyPanel.focusInput();
     }

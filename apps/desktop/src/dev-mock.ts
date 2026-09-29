@@ -11,6 +11,7 @@ import { mockIPC } from "@tauri-apps/api/mocks";
 
 import type {
   ConnectionRecord,
+  DevEnvReport,
   EnableRequest,
   ErrorPayload,
   ReconcileReport,
@@ -87,6 +88,78 @@ function applyScenario(status: Status, scenario: string): Status {
   }
 }
 
+/**
+ * 开发环境页预览：`?devenv=` 选择检测结果，可与 `?scenario=` 组合。
+ * 取值：ok（默认）、missing、old、stub、broken、nomirror、untrusted、failed、dev。
+ */
+function devEnvReport(kind: string): DevEnvReport {
+  const pip = "http://mirrors.aliyun.com/pypi/simple/";
+  const npm = "https://registry.npmmirror.com/";
+  const report: DevEnvReport = {
+    platformSupported: true,
+    python: {
+      state: "ok",
+      path: "C:\\Users\\dev\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+      version: "3.13.14",
+      minVersion: "3.13",
+      detail: null,
+    },
+    pipMirror: { state: "configured", current: pip, expected: pip, detail: null },
+    node: { state: "ok", path: "C:\\Tools\\nodejs\\node.exe", version: "24.16.0", minVersion: null, detail: null },
+    npmMirror: { state: "configured", current: npm, expected: npm, detail: null },
+  };
+  const skippedPip = { state: "skipped" as const, current: null, expected: pip, detail: null };
+  const skippedNpm = { state: "skipped" as const, current: null, expected: npm, detail: null };
+  switch (kind) {
+    case "missing":
+      return {
+        ...report,
+        python: { ...report.python, state: "missing", path: null, version: null },
+        pipMirror: skippedPip,
+        node: { ...report.node, state: "missing", path: null, version: null },
+        npmMirror: skippedNpm,
+      };
+    case "old":
+      return { ...report, python: { ...report.python, state: "tooOld", version: "3.12.9" }, pipMirror: skippedPip };
+    case "stub":
+      return {
+        ...report,
+        python: {
+          ...report.python,
+          state: "storeStub",
+          path: "C:\\Users\\dev\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe",
+          version: null,
+          detail: "python --version 没有输出版本号（退出码 9009）",
+        },
+        pipMirror: skippedPip,
+      };
+    case "broken":
+      return {
+        ...report,
+        node: { ...report.node, state: "broken", version: null, detail: "node --version 超过 15 秒未完成" },
+        npmMirror: skippedNpm,
+      };
+    case "nomirror":
+      return {
+        ...report,
+        pipMirror: { ...report.pipMirror, state: "notConfigured", current: null },
+        npmMirror: { ...report.npmMirror, state: "notConfigured", current: "https://registry.npmjs.org/" },
+      };
+    case "untrusted":
+      return { ...report, pipMirror: { ...report.pipMirror, state: "untrusted" } };
+    case "failed":
+      return {
+        ...report,
+        pipMirror: { ...report.pipMirror, state: "failed", current: null, detail: "当前 Python 没有安装 pip" },
+        npmMirror: { ...report.npmMirror, state: "failed", current: null, detail: "PATH 上找不到 npm" },
+      };
+    case "dev":
+      return { ...report, platformSupported: false };
+    default:
+      return report;
+  }
+}
+
 function sampleConnections(): ConnectionRecord[] {
   return [
     { time: Date.now() - 4000, host: "chatgpt.com", port: 443, decision: "socks5", ok: true, ms: 120 },
@@ -98,6 +171,7 @@ function sampleConnections(): ConnectionRecord[] {
 export function installDevMock(): void {
   const params = new URLSearchParams(window.location.search);
   const scenario = params.get("scenario") ?? "running";
+  const devEnvKind = params.get("devenv") ?? "ok";
 
   let status = applyScenario(baseStatus(), scenario);
   let connections = sampleConnections();
@@ -226,6 +300,12 @@ export function installDevMock(): void {
 
         case "app_version":
           return "0.1.1";
+
+        case "detect_dev_env":
+          // 模拟检测耗时，便于预览“检测中…”状态。
+          return new Promise((resolve) => {
+            window.setTimeout(() => resolve(devEnvReport(devEnvKind)), 800);
+          });
 
         case "recent_connections":
           return connections;

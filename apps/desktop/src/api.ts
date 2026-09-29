@@ -2,6 +2,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ConnectionRecord,
+  DevEnvReport,
   EnableRequest,
   ErrorPayload,
   ReconcileReport,
@@ -29,6 +30,8 @@ export const api = {
   installUpdate: (expectedVersion: string) => invoke<void>("install_update", { expectedVersion }),
   /** 获取当前运行版本（不依赖升级服务器）。 */
   appVersion: () => invoke<string>("app_version"),
+  /** 开发环境检测（只检测、不修改）。 */
+  detectDevEnv: () => invoke<DevEnvReport>("detect_dev_env"),
 };
 
 /** 把 invoke 抛出的错误规范化为 ErrorPayload。 */

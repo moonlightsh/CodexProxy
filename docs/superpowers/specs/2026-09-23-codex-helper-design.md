@@ -40,6 +40,7 @@ CodexHelper 只保留其中最小可用的部分，做成一个独立的单窗�
 - 不支持修改网关、SOCKS5、端口或规则；不在运行时下载规则。
 - 不修改 Windows 系统代理。
 - 不做诊断包导出、多语言（界面仅中文）。内部升级渠道见 §15（第一阶段之后新增，可选启用）。
+- 不安装 Python / Node.js、不修改 pip / npm 镜像配置；开发环境只做检测，见 §16。
 - 不修改 `~/.codex/auth.json`，ChatGPT 官方登录状态完全保留。
 
 ## 2. 总体架构
@@ -73,11 +74,12 @@ codex-helper/                         Cargo workspace
 │  ├─ credential.rs    Windows Credential Manager；非 Windows 为内存实现（开发模式）
 │  ├─ state.rs         工具自身状态文件
 │  ├─ log.rs           脱敏诊断日志
-│  └─ manager.rs       启用 / 停用 / 启动对账 / 清理的编排
+│  ├─ manager.rs       启用 / 停用 / 启动对账 / 清理的编排
+│  └─ devenv.rs        开发环境检测：Python / Node.js 与 pip / npm 镜像（§16，只检测不修改）
 ├─ apps/credential/                   codex-helper-credential.exe（控制台程序）
 └─ apps/desktop/                      Tauri 2 应用
-   ├─ src-tauri/   薄命令层，全部委托 helper-core::manager；托盘、单实例、自启
-   └─ src/         原生 TypeScript + HTML，单页，不引入 React / Tailwind
+   ├─ src-tauri/   薄命令层，委托 helper-core（manager / devenv）；升级在本层 update.rs（§15）；托盘、单实例、自启
+   └─ src/         原生 TypeScript + HTML，两个标签页（受管网关 / 开发环境，§16），不引入 React / Tailwind
 ```
 
 ### 3.1 从 CodexPlusPlus 移植的对应关系
@@ -313,6 +315,7 @@ NO_PROXY=10.20.30.61,127.0.0.1,localhost
 | 集成 | 假 SOCKS5 + 假目标服务器：命中隧道、命中但上游失败 502 且目标**未收到直连**、未命中直连、端口冲突；wiremock 网关：Key 校验 200/401/5xx/超时 | macOS + CI |
 | 编排 | 临时 `CODEX_HOME` 下启用→停用：`config.toml` 逐字节还原且保留启用期间的无关修改；中途失败回滚；启动对账修复漂移；损坏 `config.toml` 拒写；`cleanup` 在有无状态文件下的行为 | macOS + CI（可替换凭据实现） |
 | Windows 专属 | Credential Manager 读写覆盖删除；credential.exe `get` 的 stdout / stderr 约定 | CI `windows-latest` |
+| 开发环境检测（§16） | 纯函数（版本解析、PATH 查找、pip 配置解析与生效值、镜像判定）跨平台；集成测试用假 sh 脚本覆盖检测编排、超时、Store 占位；注册表 PATH 与 `.cmd` 调用另有 Windows 测试 | 纯函数与 sh 集成：macOS + CI；Windows 测试：CI `windows-latest` |
 | 前端 | `tsc --noEmit` | CI |
 
 ## 12. 构建与发布
@@ -344,6 +347,14 @@ NO_PROXY=10.20.30.61,127.0.0.1,localhost
 9. 占用 17891 后启用：失败且未写 `.env`。
 10. 卸载两种选择（保留 Key / 清除 Key）结果符合预期。
 11. 用新版本安装包覆盖安装（“先卸载再安装”）：不弹 Key 询问框，受管配置与启用状态保持不变。
+12. 开发环境检测（§16）：
+    - 只有 Microsoft Store 占位 `python` 时判为“Microsoft Store 占位程序”（storeStub）；
+    - 工具运行中安装 Python 并修改用户 Path 后，点“重新检测”能识别（验证读的是注册表 PATH）；
+    - 检测 `npm.cmd` 时不弹控制台窗口；
+    - pip 源为 http 且缺 `trusted-host` 时判为“缺少 trusted-host”（untrusted）；
+    - 检测超时后任务管理器里没有残留的 `node.exe` / `cmd.exe`。做法：在用户 Path 最前面的目录放一个 `npm.cmd`，
+      内容为 `@node -e "setTimeout(()=>{},60000)"`，点“重新检测”；等 npm 镜像行显示超时（15 秒）后，
+      在任务管理器里确认没有残留的 `node.exe` / `cmd.exe`，验收后删除该 `npm.cmd`。
 
 ## 14. 兼容性关注点
 
@@ -431,3 +442,52 @@ NO_PROXY=10.20.30.61,127.0.0.1,localhost
   （云端 runner 未配置凭据时该步骤仅生成 `latest.json`、跳过上传，不会失败）。
 - **所需 Secrets**：`TAURI_SIGNING_PRIVATE_KEY`（必需，否则 `createUpdaterArtifacts` 构建失败）；
   `NEXUS_DEPLOY_USER`/`NEXUS_DEPLOY_PASS`（发布到 Nexus 时需要，写凭据与签名私钥分开管理）。
+
+## 16. 开发环境检测页
+
+对应内网文档 `setup-for-company-network`（AI 工具常用的本地运行时与依赖源）。界面新增独立页面“开发环境”，
+**只检测、不安装、不修改任何配置**；与受管模式开关完全独立。
+
+### 16.1 页面与交互
+
+- 顶部标签页切换“受管网关 / 开发环境”；更新区在两页下方常驻。
+- 首次切到“开发环境”时检测一次，之后由“重新检测”按钮触发；启动时不检测（避免开机即拉起子进程）。
+- 四行结果（按显示顺序）：Python、pip 镜像、Node.js、npm 镜像；颜色 + 文字，未通过时给出修复提示（纯文本，可复制）。
+  结果未变时界面刷新不重建结果区，避免打断用户选中复制。
+- 标签栏与开发环境页在首次运行时同样可用（与 Key 无关）；收到 `key-required` 或启动时 `needsKey` 时自动切回“受管网关”页再打开 Key 录入。
+
+### 16.2 检测规则（固定参数写在 `consts.rs`）
+
+| 项 | 通过条件 |
+| --- | --- |
+| Python | PATH 上可运行的 `python`，`python --version` ≥ 3.13 |
+| Node.js | PATH 上可运行的 `node`（不限版本，展示版本号） |
+| pip 镜像 | `python -m pip config list` 的生效 `index-url` 指向 `mirrors.aliyun.com/pypi/simple`；为 http 时 `trusted-host` 必须包含该主机 |
+| npm 镜像 | `npm config get registry` 指向 `registry.npmmirror.com` |
+
+- 运行时满足要求（Python ≥ 3.13、Node.js 可运行）才检测对应镜像；否则镜像行显示“未检测”。
+- 命令行里的 `python` 只解析到 PATH 上第一个命中，故只检测第一个命中；它在 `...\Microsoft\WindowsApps\` 下且无法输出版本号时，
+  判定为 Microsoft Store 占位程序（未真正安装）。
+- pip 生效值优先级与 pip 一致：`:env:`（`PIP_*` 环境变量）> `install` 节 > `global` 节。
+- 以 pip / npm 自身解析的配置为准，不自行解析 `pip.ini` / `.npmrc` 的查找路径。
+
+### 16.3 实现要点
+
+- 可执行文件查找：Windows 从注册表重新读取“系统 Path + 用户 Path”（`REG_EXPAND_SZ` 自行展开），
+  而不是用工具进程启动时继承的旧 PATH；按 PATHEXT 中的 `.com/.exe/.bat/.cmd` 逐目录查找，不搜索当前目录。
+- 子进程：`CREATE_NO_WINDOW`、stdin 为空、工作目录为系统临时目录、单个 15 秒超时；PATH 设为上述重新读取的值；
+  Windows 上 spawn 后放进“关闭即结束”（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）的 Job Object，超时或结束时整棵进程树
+  （如 `npm.cmd` → cmd.exe → node.exe）一起结束；创建或关联失败时退回只结束直接子进程；
+  pip 用 `python -P -m pip config list`（`-P` 避免从工作目录导入同名模块）。
+- 结果中的地址去掉 userinfo 再展示；日志只记录各项状态与版本号，不记录路径与地址。
+
+### 16.4 残余风险
+
+- 检测会执行 PATH 上的 `python` / `node` / `npm`，与用户在终端里执行等价。
+- 只看用户级生效配置；项目目录内的 `.npmrc`、虚拟环境内的 `pip.ini` 不在检测范围。
+- 注册表 PATH 读取与 `.cmd` 调用只能在 Windows 实机 / CI 上验证。
+- 子进程除 PATH 外的环境变量（`PIP_*`、`npm_config_*` 等）取工具启动时的值；工具启动后才设置的这类变量，新终端能看到，检测看不到。
+- `REG_EXPAND_SZ` 用工具进程的环境展开：工具启动后新建的变量（如 Path 里引用的 `%NODE_HOME%`）展开不了，该条目被跳过，可能误报“未安装”。
+- pip / npm 的生效值来自环境变量（`PIP_INDEX_URL`、`NPM_CONFIG_REGISTRY` 等）时，按提示修改 `pip.ini` 或执行 `npm config set` 不会生效。
+- PowerShell 下若 Node 目录里有 `npm.ps1` 且执行策略受限，终端里的 `npm` 可能无法运行；本工具走 `npm.cmd`，仍会报告正常，属检测盲区。
+- Job Object 在 spawn 之后才关联：两者之间有极短窗口，若子进程在此期间已拉起孙进程，孙进程不在 job 内，超时时可能残留。

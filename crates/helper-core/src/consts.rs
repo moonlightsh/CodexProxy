@@ -56,3 +56,18 @@ pub const CODEX_PROCESS_NAME: &str = "codex.exe";
 
 /// 网关与 SOCKS5 可达性的定时重测间隔（秒）。
 pub const HEALTH_PROBE_INTERVAL_SECS: u64 = 30;
+
+/// 开发环境检测（设计 §16）：Python 最低版本（major, minor）。
+pub const PYTHON_MIN_VERSION: (u32, u32) = (3, 13);
+/// pip 镜像主机（内网文档 setup-for-company-network）。
+pub const PIP_MIRROR_HOST: &str = "mirrors.aliyun.com";
+/// pip 镜像的 simple 索引路径（比较时忽略末尾 `/`）。
+pub const PIP_MIRROR_PATH: &str = "/pypi/simple";
+/// pip 镜像的推荐 index-url（展示与修复提示用）。
+pub const PIP_MIRROR_INDEX_URL: &str = "http://mirrors.aliyun.com/pypi/simple/";
+/// npm 镜像主机。
+pub const NPM_MIRROR_HOST: &str = "registry.npmmirror.com";
+/// npm 镜像的推荐 registry（展示与修复提示用）。
+pub const NPM_MIRROR_REGISTRY: &str = "https://registry.npmmirror.com/";
+/// 检测时单个子进程的超时（秒）。
+pub const DEVENV_PROBE_TIMEOUT_SECS: u64 = 15;

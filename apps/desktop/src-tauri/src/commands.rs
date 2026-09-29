@@ -11,6 +11,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use helper_core::devenv::{self, DevEnvReport};
 use helper_core::log;
 use helper_core::manager::Manager;
 use helper_core::types::{
@@ -194,6 +195,12 @@ pub fn recent_connections(state: tauri::State<'_, AppState>) -> Vec<ConnectionRe
 #[tauri::command]
 pub fn get_reconcile_report(state: tauri::State<'_, AppState>) -> Option<ReconcileReport> {
     state.reconcile_report()
+}
+
+/// 开发环境检测（设计 §16）：Python 3.13+ / Node.js 与 pip / npm 镜像。只检测、不修改。
+#[tauri::command]
+pub async fn detect_dev_env() -> DevEnvReport {
+    devenv::detect().await
 }
 
 /// 让系统自启项与期望一致。已一致时不动（Windows 删除不存在的注册表值会报错）。

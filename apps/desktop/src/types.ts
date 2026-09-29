@@ -92,6 +92,42 @@ export interface UpdateCheck {
   date: string | null;
 }
 
+// ---- 开发环境检测（设计 §16），与 crates/helper-core/src/devenv.rs 一一对应 ----
+
+export type RuntimeState = "missing" | "storeStub" | "broken" | "tooOld" | "ok";
+
+export interface RuntimeReport {
+  state: RuntimeState;
+  /** 命令行实际会用到的可执行文件（PATH 上第一个命中） */
+  path: string | null;
+  /** 解析出的版本号，如 3.13.14 */
+  version: string | null;
+  /** 最低版本要求，如 3.13；无要求为 null */
+  minVersion: string | null;
+  /** state 为 broken / storeStub 时的原因 */
+  detail: string | null;
+}
+
+export type MirrorState = "skipped" | "configured" | "untrusted" | "notConfigured" | "failed";
+
+export interface MirrorReport {
+  state: MirrorState;
+  /** 当前生效的地址（已去掉 userinfo）；pip 使用默认源时为 null */
+  current: string | null;
+  /** 期望的地址 */
+  expected: string;
+  /** state 为 failed 时的原因 */
+  detail: string | null;
+}
+
+export interface DevEnvReport {
+  platformSupported: boolean;
+  python: RuntimeReport;
+  pipMirror: MirrorReport;
+  node: RuntimeReport;
+  npmMirror: MirrorReport;
+}
+
 /** Rust → 前端事件名 */
 export const EVENT_STATUS_CHANGED = "status-changed";
 export const EVENT_CONNECTION_RECORDED = "connection-recorded";
