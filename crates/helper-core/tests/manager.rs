@@ -2325,3 +2325,29 @@ async fn revoke_failure_without_env_block_leaves_proxy_stopped() {
     assert!(port_is_free(sandbox.port).await);
     assert_eq!(manager.status().await.proxy.state, ProxyState::Stopped);
 }
+
+/// 撤销失败且 `.env` 无法读取（这里被换成目录）：无法确认受管块已移除，按“块仍在”处理，
+/// 代理被重新拉起（macOS 计划 C6 行为第 4 条）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_failure_restarts_proxy_when_env_unreadable() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.unwrap();
+
+    std::fs::remove_file(sandbox.env()).unwrap();
+    std::fs::create_dir(sandbox.env()).unwrap();
+    manager
+        .revoke_managed_config()
+        .await
+        .expect_err(".env 无法读取时撤销应失败");
+    assert!(
+        proxy::probe_existing(sandbox.port).await,
+        "代理应被重新拉起"
+    );
+    assert_eq!(manager.status().await.proxy.state, ProxyState::Running);
+
+    manager.shutdown().await;
+    std::fs::remove_dir(sandbox.env()).unwrap();
+}
