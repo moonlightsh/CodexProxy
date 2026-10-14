@@ -17,10 +17,16 @@ pub const DEFAULT_PROXY_PORT: u16 = 17891;
 /// 仅供应急覆盖本地代理端口的环境变量；界面不暴露。
 pub const PROXY_PORT_ENV: &str = "CODEX_HELPER_PROXY_PORT";
 
-/// Windows Credential Manager 中的固定凭据 target。
+/// 固定凭据 target：Windows Credential Manager 的 target，macOS 钥匙串条目的 service。
 pub const CREDENTIAL_TARGET: &str = "codex-helper/managed-gateway";
 /// 写入凭据时使用的 UserName 字段。
 pub const CREDENTIAL_USER_NAME: &str = "CodexHelper";
+/// macOS 钥匙串条目的 account（`security -a`）；service 即 [`CREDENTIAL_TARGET`]。
+pub const KEYCHAIN_ACCOUNT: &str = "codex-helper";
+/// macOS 上读写钥匙串使用的系统工具（绝对路径，不查 PATH；设计 §3.1）。
+pub const SECURITY_TOOL: &str = "/usr/bin/security";
+/// 每次调用 `security` 子进程的超时（秒）。
+pub const SECURITY_TIMEOUT_SECS: u64 = 10;
 
 /// `config.toml` 中受管 provider 的 id。
 pub const PROVIDER_ID: &str = "managed_gateway";

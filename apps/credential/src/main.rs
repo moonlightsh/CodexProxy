@@ -611,4 +611,74 @@ mod tests {
         // 因为文件清理已失败而跳过后续的凭据删除，`MemoryCredentialStore::delete()` 也
         // 不会失败），因此这里凭据实际已被删除，但这不是本测试关注的点。
     }
+
+    /// `get` 的 stdout / stderr 约定在真实钥匙串下的契约测试（设计 §3.3）：进程内注入
+    /// `SystemCredentialStore::new(<临时 service>)`，参数仍是固定 target；绝不读写生产条目。
+    #[cfg(target_os = "macos")]
+    mod keychain_get {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use super::*;
+
+        /// 生成形如 `codex-helper/test-<pid>-<纳秒>-<计数>` 的临时 service。
+        fn unique_test_target() -> String {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let pid = std::process::id();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let target = format!("codex-helper/test-{pid}-{nanos}-{seq}");
+            assert_ne!(target, consts::CREDENTIAL_TARGET);
+            target
+        }
+
+        /// 测试结束（含 panic 时）删除临时条目。
+        struct TempTargetGuard(SystemCredentialStore);
+
+        impl Drop for TempTargetGuard {
+            fn drop(&mut self) {
+                let _ = self.0.delete();
+            }
+        }
+
+        #[test]
+        fn get_prints_real_keychain_token_only_to_stdout() {
+            let store = SystemCredentialStore::new(unique_test_target());
+            let _guard = TempTargetGuard(store.clone());
+            store.write("hk-cli-1").unwrap();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = run(
+                &args(&["get", consts::CREDENTIAL_TARGET]),
+                &store,
+                unreachable_paths,
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(code, 0);
+            assert_eq!(stdout, b"hk-cli-1\n");
+            assert!(stderr.is_empty());
+        }
+
+        #[test]
+        fn get_reports_not_found_for_missing_keychain_entry() {
+            let store = SystemCredentialStore::new(unique_test_target());
+            let _guard = TempTargetGuard(store.clone());
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = run(
+                &args(&["get", consts::CREDENTIAL_TARGET]),
+                &store,
+                unreachable_paths,
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(code, 2);
+            assert!(stdout.is_empty());
+            assert_eq!(stderr, b"credential not found\n");
+        }
+    }
 }
