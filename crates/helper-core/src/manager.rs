@@ -273,6 +273,51 @@ impl Manager {
         Ok(self.build_status())
     }
 
+    /// 撤销受管配置（macOS 托盘“撤销配置并退出”使用；macOS 设计 §6）：停止代理 → 执行
+    /// [`cleanup`]（`purge_key = false`）。不删 Key、不改 autostart（开机自启由桌面层随后关闭）。
+    ///
+    /// 与启用 / 停用串行。失败时返回 `cleanup` 遇到的第一个错误（保留原错误码）；若 `.env` 受管块
+    /// 仍在（或无法读取），尽力重新启动代理，避免 Codex 指向无人监听的端口。
+    pub async fn revoke_managed_config(&self) -> Result<Status, ManagerError> {
+        let mut ops = self.ops.lock().await;
+        self.stop_proxy(&mut ops).await;
+        let options = &self.options;
+        let result = cleanup(&options.paths, options.credentials.as_ref(), false)
+            .map(|_| ())
+            .map_err(|error| {
+                error
+                    .downcast::<ManagerError>()
+                    .unwrap_or_else(|error| ManagerError::Internal {
+                        message: format!("{error:#}"),
+                    })
+            });
+        let mut proxy_restarted = false;
+        if result.is_err() {
+            let block_remains =
+                codex_env::inspect_file(&options.paths.env_file(), options.proxy_port)
+                    .map_or(true, |inspection| inspection.has_block);
+            if block_remains {
+                match self.ensure_proxy(&mut ops).await {
+                    Ok(_) => proxy_restarted = true,
+                    Err(error) => log::event(
+                        "manager.revoke_proxy_restart_failed",
+                        json!({ "code": error.code() }),
+                    ),
+                }
+            }
+        }
+        log::event(
+            "manager.revoke",
+            json!({
+                "ok": result.is_ok(),
+                "code": result.as_ref().err().map(ManagerError::code),
+                "proxy_restarted": proxy_restarted,
+            }),
+        );
+        result?;
+        Ok(self.build_status())
+    }
+
     /// 检测网关与 SOCKS5 的 TCP 可达性并缓存结果，返回最新状态。
     pub async fn probe_reachability(&self) -> Status {
         // 网络探测不持任何锁、不等待操作锁；只在写缓存时持运行时短锁。

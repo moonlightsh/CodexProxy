@@ -1792,6 +1792,7 @@ fn manager_futures_are_send() {
     assert_send(&manager.set_autostart_flag(true));
     assert_send(&manager.probe_reachability());
     assert_send(&manager.shutdown());
+    assert_send(&manager.revoke_managed_config());
 }
 
 #[test]
@@ -2214,4 +2215,113 @@ async fn transient_location_is_ignored_off_macos() {
         Some(TRANSIENT_COMMAND)
     );
     manager.shutdown().await;
+}
+
+// ---- 20. 撤销受管配置 ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_restores_config_keeps_key_and_stops_proxy() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.unwrap();
+    manager.set_autostart_flag(true).await.unwrap();
+
+    let status = manager.revoke_managed_config().await.unwrap();
+    assert!(!status.enabled && !status.residue && status.key_configured && status.autostart);
+    assert_eq!(status.proxy.state, ProxyState::Stopped);
+    assert_eq!(
+        read(&sandbox.config()),
+        Some(USER_CONFIG.as_bytes().to_vec())
+    );
+    assert_eq!(read(&sandbox.env()), Some(USER_ENV.as_bytes().to_vec()));
+    assert_eq!(sandbox.credential().as_deref(), Some(KEY), "不删 Key");
+    assert_eq!(
+        sandbox.state(),
+        Some(HelperState {
+            autostart: true,
+            ..Default::default()
+        }),
+        "不改 autostart"
+    );
+    assert!(port_is_free(sandbox.port).await);
+
+    // 幂等
+    let before = sandbox.snapshot();
+    manager.revoke_managed_config().await.unwrap();
+    assert_eq!(sandbox.snapshot(), before);
+    sandbox.assert_no_key_on_disk();
+
+    // 全新环境：什么都不创建
+    let fresh = Sandbox::new().await;
+    let before = fresh.snapshot();
+    fresh.manager().revoke_managed_config().await.unwrap();
+    assert_eq!(fresh.snapshot(), before);
+}
+
+/// 撤销中途 `.env` 块移除失败：返回原错误，配置照常还原；`.env` 块仍在，代理被重新拉起，
+/// Codex 不会指向无人监听的端口。
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_failure_restarts_proxy_when_env_block_remains() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.unwrap();
+    let env_before = read(&sandbox.env());
+
+    let immutable = Immutable::set(&sandbox.env());
+    let error = manager
+        .revoke_managed_config()
+        .await
+        .expect_err(".env 不可替换时撤销应失败");
+    assert_eq!(error.code(), "io", "{error}");
+    assert!(error.to_string().contains(".env"), "{error}");
+    assert_eq!(read(&sandbox.env()), env_before, ".env 未被改动");
+    assert_eq!(
+        read(&sandbox.config()),
+        Some(USER_CONFIG.as_bytes().to_vec()),
+        "cleanup 继续完成配置还原"
+    );
+    assert!(
+        proxy::probe_existing(sandbox.port).await,
+        "代理应被重新拉起"
+    );
+    let status = manager.status().await;
+    assert_eq!(status.proxy.state, ProxyState::Running);
+    // 现有 cleanup 语义：配置还原成功即置为停用，`.env` 块仍在 → 残留
+    assert!(!sandbox.state().unwrap().enabled);
+    assert!(status.residue);
+
+    drop(immutable);
+    let status = manager.revoke_managed_config().await.unwrap();
+    assert_eq!(read(&sandbox.env()), Some(USER_ENV.as_bytes().to_vec()));
+    assert!(!status.residue);
+    assert!(port_is_free(sandbox.port).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_failure_without_env_block_leaves_proxy_stopped() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.unwrap();
+    sandbox.write_config("model = [\n");
+
+    let error = manager
+        .revoke_managed_config()
+        .await
+        .expect_err("配置无法解析时撤销应失败");
+    assert_eq!(error.code(), "configInvalid", "{error}");
+    assert_eq!(
+        read(&sandbox.env()),
+        Some(USER_ENV.as_bytes().to_vec()),
+        "块已移除"
+    );
+    assert!(sandbox.state().unwrap().enabled, "配置未还原：状态保持启用");
+    assert!(port_is_free(sandbox.port).await);
+    assert_eq!(manager.status().await.proxy.state, ProxyState::Stopped);
 }
