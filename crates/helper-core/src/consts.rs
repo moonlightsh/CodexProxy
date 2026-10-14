@@ -67,7 +67,13 @@ pub const PLATFORM: &str = if cfg!(windows) {
 };
 
 /// 退出前需要检测的 Codex 引擎进程名（Windows 不区分大小写）。
+#[cfg(windows)]
 pub const CODEX_PROCESS_NAME: &str = "codex.exe";
+
+/// 退出前需要检测的 Codex 引擎进程名。macOS 为实测值；Linux 是开发模式，不检测，
+/// 这个值只为能编译。
+#[cfg(not(windows))]
+pub const CODEX_PROCESS_NAME: &str = "codex";
 
 /// 网关与 SOCKS5 可达性的定时重测间隔（秒）。
 pub const HEALTH_PROBE_INTERVAL_SECS: u64 = 30;
