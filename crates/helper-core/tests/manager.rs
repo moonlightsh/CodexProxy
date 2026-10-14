@@ -649,6 +649,62 @@ async fn save_key_validates_and_leaves_files_alone() {
     sandbox.assert_no_key_on_disk();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_key_chars_are_rejected_before_gateway_and_writes() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let manager = sandbox.manager();
+    let before = sandbox.snapshot();
+    for key in ["hk 1", "hk-中文", "hk-a\nb", "hk-\u{7f}", "\u{e9}"] {
+        let error = assert_code(manager.enable(with_key(key)).await, "invalidKeyChars");
+        assert_eq!(error.to_string(), "Key 只能包含英文字母、数字和符号");
+        assert!(!error.to_string().contains(key), "{error}");
+        let error = assert_code(
+            manager
+                .save_key(SaveKeyRequest {
+                    key: key.into(),
+                    force_save: true,
+                })
+                .await,
+            "invalidKeyChars",
+        );
+        assert_eq!(error.to_string(), "Key 只能包含英文字母、数字和符号");
+        assert!(!error.to_string().contains(key), "{error}");
+    }
+    // 空值判定在字符校验之前
+    assert_code(manager.enable(with_key("   \n")).await, "emptyKey");
+    assert_code(
+        manager
+            .save_key(SaveKeyRequest {
+                key: "   \n".into(),
+                force_save: true,
+            })
+            .await,
+        "emptyKey",
+    );
+    assert_eq!(sandbox.snapshot(), before);
+    assert_eq!(sandbox.gateway_hits().await, 0, "字符校验应在访问网关之前");
+    assert_eq!(sandbox.credential(), None);
+    assert!(port_is_free(sandbox.port).await);
+}
+
+#[tokio::test]
+async fn printable_symbols_in_key_are_accepted() {
+    let sandbox = Sandbox::new().await;
+    let manager = sandbox.manager();
+    let key = r#"hk-A\B"C'D$E;F#G!`{}|~"#;
+    let status = manager
+        .save_key(SaveKeyRequest {
+            key: format!("\n{key}\n"),
+            force_save: false,
+        })
+        .await
+        .unwrap();
+    assert!(status.key_configured);
+    assert_eq!(sandbox.credential().as_deref(), Some(key));
+}
+
 // ---- 4. model_catalog_json ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

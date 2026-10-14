@@ -17,6 +17,14 @@ use crate::consts;
 
 mod keychain;
 
+/// Key 字符规则的唯一出处：非空且每个字节都在 0x21–0x7E（可打印 ASCII，不含空格）。
+///
+/// 编排层（`save_key` / `enable`）与 macOS 钥匙串后端都用它：`security -i` 逐行解析命令，
+/// 换行等字符会变成注入；`security -w` 对非 ASCII 内容输出十六进制，无法还原（macOS 设计 §2、§3.2）。
+pub fn is_allowed_token(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
 /// 凭据明文的包装：`Debug` 不输出内容，也不实现 `Display`，防止误写进日志或错误。
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
@@ -331,6 +339,28 @@ mod tests {
         let secret = Secret::new("sk-very-secret");
         assert_eq!(format!("{secret:?}"), "Secret(***)");
         assert_eq!(secret.expose(), "sk-very-secret");
+    }
+
+    #[test]
+    fn allowed_token_is_printable_ascii_only() {
+        let all: String = (0x21u8..=0x7e).map(char::from).collect();
+        assert!(is_allowed_token(&all));
+        assert!(is_allowed_token("hk-ABC_123"));
+        for bad in [
+            "",
+            " ",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "a\rb",
+            "a\0b",
+            "a\u{7f}",
+            "sk-中文",
+            "é",
+            "a\u{3000}b",
+        ] {
+            assert!(!is_allowed_token(bad), "{bad:?}");
+        }
     }
 
     #[test]

@@ -60,7 +60,7 @@ pub(crate) fn validate_token(token: &str) -> anyhow::Result<()> {
     if token.is_empty() {
         anyhow::bail!("凭据不能为空");
     }
-    if !token.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+    if !crate::credential::is_allowed_token(token) {
         anyhow::bail!("凭据只能包含可打印 ASCII 字符");
     }
     Ok(())
@@ -291,6 +291,32 @@ mod tests {
             if bad.trim().len() >= 2 {
                 assert!(!err.contains(bad), "{err}");
             }
+        }
+    }
+
+    #[test]
+    fn validate_token_agrees_with_is_allowed_token() {
+        let all: String = (0x21u8..=0x7e).map(char::from).collect();
+        for sample in [
+            all.as_str(),
+            "hk-ABC_123",
+            "",
+            " ",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "a\rb",
+            "a\0b",
+            "a\u{7f}",
+            "sk-中文",
+            "é",
+            "a\u{3000}b",
+        ] {
+            assert_eq!(
+                validate_token(sample).is_ok(),
+                crate::credential::is_allowed_token(sample),
+                "{sample:?}"
+            );
         }
     }
 

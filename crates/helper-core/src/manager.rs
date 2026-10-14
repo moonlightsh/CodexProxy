@@ -35,7 +35,7 @@ use tokio::sync::Mutex;
 use crate::codex_config::{self, ApplyOutcome, ConfigError, ConfigInspection, PreviousConfig};
 use crate::codex_env;
 use crate::consts;
-use crate::credential::{CredentialStore, Secret};
+use crate::credential::{self, CredentialStore, Secret};
 use crate::fsutil;
 use crate::gateway;
 use crate::log;
@@ -507,6 +507,10 @@ impl Manager {
         let key = raw.trim();
         if key.is_empty() {
             return Err(ManagerError::EmptyKey);
+        }
+        // 字符校验在访问网关之前：被拒时不发请求、不写任何东西
+        if !credential::is_allowed_token(key) {
+            return Err(ManagerError::InvalidKeyChars);
         }
         let check = gateway::verify_key_at(
             &self.options.gateway_base_url,
