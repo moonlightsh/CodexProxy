@@ -92,3 +92,10 @@ pub const NPM_MIRROR_HOST: &str = "registry.npmmirror.com";
 pub const NPM_MIRROR_REGISTRY: &str = "https://registry.npmmirror.com/";
 /// 检测时单个子进程的超时（秒）。
 pub const DEVENV_PROBE_TIMEOUT_SECS: u64 = 15;
+
+/// macOS 开发环境检测：用登录 shell 取用户终端里的 PATH 时的超时（秒）。
+pub const LOGIN_SHELL_TIMEOUT_SECS: u64 = 5;
+/// `SHELL` 缺失或不可用时的登录 shell（macOS 默认 shell）。
+pub const LOGIN_SHELL_FALLBACK: &str = "/bin/zsh";
+/// macOS 上总是参与查找的常见安装目录（Homebrew：Apple Silicon / Intel）。
+pub const MACOS_EXTRA_PATH_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];

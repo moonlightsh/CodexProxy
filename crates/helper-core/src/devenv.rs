@@ -450,7 +450,8 @@ impl SearchEnv {
     /// 当前系统的查找环境。
     ///
     /// Windows 从注册表重新读取“系统 Path + 用户 Path”：工具常驻托盘，进程启动时继承的 PATH
-    /// 看不到之后安装的 Python / Node.js；读取失败时退回进程 PATH。其他平台用进程 PATH。
+    /// 看不到之后安装的 Python / Node.js；读取失败时退回进程 PATH。其他平台用进程 PATH
+    /// （macOS 在 [`detect`] 里再经 [`with_login_shell_path`] 补上登录 shell 的 PATH）。
     pub fn system() -> Self {
         let process_path = std::env::var_os("PATH").unwrap_or_default();
         #[cfg(windows)]
@@ -467,6 +468,114 @@ impl SearchEnv {
     fn find(&self, name: &str) -> Option<PathBuf> {
         find_in_path(name, &self.path, &self.exts)
     }
+}
+
+// ---------------------------------------------------------------------------
+// macOS：登录 shell 的 PATH
+// ---------------------------------------------------------------------------
+//
+// 从 Finder / 程序坞 / LaunchAgent 启动的程序继承 launchd 的精简 PATH（`/usr/bin:/bin:/usr/sbin:/sbin`），
+// 看不到 Homebrew、nvm、pyenv 等在 shell profile 里加的目录，只会找到系统自带的旧 python3。
+// 这里用用户的登录 shell 跑一次 `printenv PATH` 取到终端里的 PATH，再补上进程 PATH 与常见安装目录。
+
+/// 包住 PATH 的标记：profile 可能打印欢迎语等内容，只取两个标记之间的部分。
+#[cfg_attr(not(unix), allow(dead_code))]
+const PATH_BEGIN_MARKER: &str = "__CODEX_HELPER_PATH_BEGIN__";
+#[cfg_attr(not(unix), allow(dead_code))]
+const PATH_END_MARKER: &str = "__CODEX_HELPER_PATH_END__";
+
+/// 从登录 shell 的 stdout 中取出标记之间的 PATH（去掉首尾空白）；标记不全或内容为空返回 `None`。
+#[cfg_attr(not(unix), allow(dead_code))]
+fn extract_marked_path(stdout: &str) -> Option<String> {
+    let start = stdout.find(PATH_BEGIN_MARKER)? + PATH_BEGIN_MARKER.len();
+    let len = stdout[start..].find(PATH_END_MARKER)?;
+    let path = stdout[start..start + len].trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+/// 合并查找用的 PATH：去重、跳过空条目。
+///
+/// - 拿到登录 shell 的 PATH：登录 PATH 在前（与用户终端一致），再补进程 PATH、常见目录。
+/// - 没拿到：常见目录在前（Homebrew 的 `brew shellenv` 也是把自己放在最前），再补进程 PATH。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn merge_search_path(login: Option<&OsString>, process: &OsStr, extras: &[&str]) -> OsString {
+    let login = login.filter(|path| !path.is_empty());
+    let extras: Vec<PathBuf> = extras.iter().map(PathBuf::from).collect();
+    let mut groups: Vec<Vec<PathBuf>> = Vec::new();
+    match login {
+        Some(login) => {
+            groups.push(std::env::split_paths(login).collect());
+            groups.push(std::env::split_paths(process).collect());
+            groups.push(extras);
+        }
+        None => {
+            groups.push(extras);
+            groups.push(std::env::split_paths(process).collect());
+        }
+    }
+    let mut merged: Vec<PathBuf> = Vec::new();
+    for dir in groups.into_iter().flatten() {
+        if !dir.as_os_str().is_empty() && !merged.contains(&dir) {
+            merged.push(dir);
+        }
+    }
+    // 条目都来自已有 PATH 或常量，不含分隔符；万一拼接失败就退回进程 PATH。
+    std::env::join_paths(merged).unwrap_or_else(|_| process.to_os_string())
+}
+
+/// 取登录 shell：`SHELL` 是存在的绝对路径就用它，否则用 `/bin/zsh`。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn pick_login_shell(shell: Option<&OsStr>) -> PathBuf {
+    shell
+        .map(Path::new)
+        .filter(|path| path.is_absolute() && path.is_file())
+        .map_or_else(
+            || PathBuf::from(consts::LOGIN_SHELL_FALLBACK),
+            Path::to_path_buf,
+        )
+}
+
+/// 用登录 + 交互 shell（`<shell> -l -i -c <脚本>`）取用户终端里的 PATH。
+///
+/// 交互模式才会加载 `.zshrc` / `.bashrc`（nvm 等常写在这里），与用户打开终端时一致；stdin 为空，
+/// 读取输入的配置会立即读到 EOF。脚本只用 `printf` 与 `/usr/bin/printenv`，sh / bash / zsh / fish 通用。不看退出码（profile 里
+/// 某条命令失败不影响 PATH），只认标记；启动失败、超时、没有标记都返回 `None`。
+/// 超时时结束 shell 进程。
+#[cfg(unix)]
+pub async fn login_shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
+    let script = format!(
+        "printf '%s' '{PATH_BEGIN_MARKER}'; /usr/bin/printenv PATH; printf '%s' '{PATH_END_MARKER}'"
+    );
+    let child = tokio::process::Command::new(shell)
+        .args(["-l", "-i", "-c", &script])
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    extract_marked_path(&String::from_utf8_lossy(&output.stdout)).map(OsString::from)
+}
+
+/// 把登录 shell 的 PATH 合并进查找环境（规则见 [`merge_search_path`]）。
+#[cfg(unix)]
+pub async fn with_login_shell_path(
+    process: SearchEnv,
+    shell: &Path,
+    timeout: Duration,
+) -> SearchEnv {
+    let login = login_shell_path(shell, timeout).await;
+    let path = merge_search_path(
+        login.as_ref(),
+        &process.path,
+        &consts::MACOS_EXTRA_PATH_DIRS,
+    );
+    SearchEnv::new(path, process.exts)
 }
 
 struct CommandOutput {
@@ -661,6 +770,13 @@ pub async fn detect_in(env: &SearchEnv, timeout: Duration) -> DevEnvReport {
 /// 检测当前系统。日志只记录各项状态与版本号，不记录路径与地址。
 pub async fn detect() -> DevEnvReport {
     let env = SearchEnv::system();
+    #[cfg(target_os = "macos")]
+    let env = with_login_shell_path(
+        env,
+        &pick_login_shell(std::env::var_os("SHELL").as_deref()),
+        Duration::from_secs(consts::LOGIN_SHELL_TIMEOUT_SECS),
+    )
+    .await;
     let timeout = Duration::from_secs(consts::DEVENV_PROBE_TIMEOUT_SECS);
     let report = detect_in(&env, timeout).await;
     log::event(
@@ -851,6 +967,94 @@ mod windows_job {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 登录 shell PATH 的纯函数（只在类 Unix 上有意义，PATH 分隔符是 `:`）。
+    #[cfg(unix)]
+    mod login_path {
+        use super::*;
+
+        fn os(text: &str) -> OsString {
+            OsString::from(text)
+        }
+
+        #[test]
+        fn marked_path_ignores_profile_output_around_markers() {
+            let stdout = format!(
+                "Welcome banner\n{PATH_BEGIN_MARKER}/opt/homebrew/bin:/usr/bin\n{PATH_END_MARKER}trailing"
+            );
+            assert_eq!(
+                extract_marked_path(&stdout).as_deref(),
+                Some("/opt/homebrew/bin:/usr/bin")
+            );
+        }
+
+        #[test]
+        fn marked_path_requires_both_markers_and_content() {
+            assert_eq!(extract_marked_path(""), None);
+            assert_eq!(extract_marked_path("/usr/bin:/bin"), None);
+            assert_eq!(
+                extract_marked_path(&format!("{PATH_BEGIN_MARKER}/usr/bin")),
+                None
+            );
+            assert_eq!(
+                extract_marked_path(&format!("{PATH_END_MARKER}/usr/bin{PATH_BEGIN_MARKER}")),
+                None
+            );
+            assert_eq!(
+                extract_marked_path(&format!("{PATH_BEGIN_MARKER} \n {PATH_END_MARKER}")),
+                None
+            );
+        }
+
+        #[test]
+        fn merge_prefers_login_shell_order_then_process_then_extras() {
+            let merged = merge_search_path(
+                Some(&os("/Users/u/.nvm/bin:/opt/homebrew/bin:/usr/bin")),
+                &os("/usr/bin:/bin"),
+                &["/opt/homebrew/bin", "/usr/local/bin"],
+            );
+            assert_eq!(
+                merged,
+                os("/Users/u/.nvm/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/local/bin")
+            );
+        }
+
+        #[test]
+        fn merge_without_login_puts_extras_before_process() {
+            let extras = ["/opt/homebrew/bin", "/usr/local/bin"];
+            let expected = os("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+            let process = os("/usr/bin:/bin:/usr/sbin:/sbin");
+            assert_eq!(merge_search_path(None, &process, &extras), expected);
+            // 登录 shell 拿到空串与没拿到等价。
+            assert_eq!(
+                merge_search_path(Some(&os("")), &process, &extras),
+                expected
+            );
+        }
+
+        #[test]
+        fn merge_dedupes_and_skips_empty_entries() {
+            let merged =
+                merge_search_path(Some(&os("/a::/b:/a")), &os(":/b:/c:"), &["/c", "", "/d"]);
+            assert_eq!(merged, os("/a:/b:/c:/d"));
+        }
+
+        #[test]
+        fn pick_login_shell_uses_absolute_existing_shell_else_zsh() {
+            let fallback = PathBuf::from(consts::LOGIN_SHELL_FALLBACK);
+            assert_eq!(
+                pick_login_shell(Some(&os("/bin/sh"))),
+                PathBuf::from("/bin/sh")
+            );
+            assert_eq!(pick_login_shell(None), fallback);
+            assert_eq!(pick_login_shell(Some(&os(""))), fallback);
+            assert_eq!(pick_login_shell(Some(&os("fish"))), fallback);
+            assert_eq!(
+                pick_login_shell(Some(&os("/nonexistent/codex-helper-no-such-shell"))),
+                fallback
+            );
+        }
+    }
 
     fn config(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs

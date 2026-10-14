@@ -109,6 +109,12 @@
 - `Status.platform_supported` 与 `DevEnvReport.platform_supported` 改为 `cfg!(any(windows, target_os = "macos"))`。
   macOS 不再显示“开发模式”横幅；Linux 继续显示。开发环境检测在 macOS 上继续用 `python3`，
   Store 别名等 Windows 专属逻辑不变。
+- 开发环境检测的 PATH（实机验收时发现）：从 Finder / 程序坞 / LaunchAgent 启动的应用只继承 launchd 的
+  `/usr/bin:/bin:/usr/sbin:/sbin`，只能找到系统自带的 Python 3.9，找不到 Homebrew 的 Python / Node.js。
+  macOS 上改为用用户 shell（`$SHELL`，不可用时 `/bin/zsh`）以 `-l -i -c` 执行一次 `printenv PATH`
+  （登录 + 交互，加载 `.zprofile` 与 `.zshrc`，与用户终端一致；标记包裹、忽略配置文件的输出、5 秒超时），
+  按“shell PATH → 进程 PATH → `/opt/homebrew/bin`、`/usr/local/bin`”去重合并；取不到时按
+  “常见目录 → 进程 PATH”。
 - 新增“是否支持内部升级”标识（仅 Windows 为 true）。为 false 时前端隐藏“检查更新”入口，
   `check_update` / `install_update` 命令直接返回 `code = "update"` 的错误，不请求检测地址。
   放在 `Status` 里还是单独的命令里由实现者决定。
