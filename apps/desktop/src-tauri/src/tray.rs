@@ -44,6 +44,11 @@ fn menu_layout(with_revoke: bool) -> Vec<MenuEntry> {
     entries
 }
 
+/// 当前平台的菜单布局：仅 macOS 带“撤销配置并退出”（macOS 设计 §6）。
+fn platform_menu_layout() -> Vec<MenuEntry> {
+    menu_layout(cfg!(target_os = "macos"))
+}
+
 /// 菜单项文案；分隔线没有文案。
 fn menu_label(entry: MenuEntry) -> &'static str {
     match entry {
@@ -88,7 +93,7 @@ pub fn build(app: &App) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let mut items: Vec<Box<dyn IsMenuItem<Wry>>> = Vec::new();
-    for entry in menu_layout(cfg!(target_os = "macos")) {
+    for entry in platform_menu_layout() {
         let label = menu_label(entry);
         let item: Box<dyn IsMenuItem<Wry>> = match entry {
             MenuEntry::Show => Box::new(MenuItem::with_id(
@@ -241,6 +246,17 @@ mod tests {
     #[test]
     fn tray_menu_with_revoke_puts_it_after_separator_before_quit() {
         assert_eq!(menu_layout(true), [Show, Managed, Separator, Revoke, Quit]);
+    }
+
+    /// 当前平台实际使用的布局：仅 macOS 有“撤销配置并退出”，Windows 菜单保持不变。
+    #[test]
+    fn platform_menu_layout_matches_target() {
+        let expected: &[MenuEntry] = if cfg!(target_os = "macos") {
+            &[Show, Managed, Separator, Revoke, Quit]
+        } else {
+            &[Show, Managed, Separator, Quit]
+        };
+        assert_eq!(platform_menu_layout(), expected);
     }
 
     #[test]
