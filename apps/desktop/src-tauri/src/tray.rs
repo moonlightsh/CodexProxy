@@ -1,23 +1,64 @@
-//! 托盘（设计 §8）：显示窗口 / 受管模式开关 / 退出；左键单击显示窗口。
+//! 托盘（设计 §8）：左键单击显示窗口。菜单：
+//!
+//! - Windows：显示窗口 / 受管模式开关 / 分隔线 / 退出；
+//! - macOS：显示窗口 / 受管模式开关 / 分隔线 / 撤销配置并退出（设计 §6，见 [`crate::revoke`]）/ 退出。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use helper_core::log;
 use helper_core::types::{EnableRequest, ErrorPayload};
 use serde_json::json;
-use tauri::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{App, AppHandle, Manager as _, Wry};
 
 use crate::commands::AppState;
 use crate::events;
 use crate::lifecycle;
+use crate::revoke;
 
 const TRAY_ID: &str = "main";
 const TOOLTIP: &str = "CodexHelper";
 const MENU_SHOW: &str = "show";
 const MENU_MANAGED: &str = "managed";
+const MENU_REVOKE: &str = "revoke";
 const MENU_QUIT: &str = "quit";
+
+/// 托盘菜单项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuEntry {
+    Show,
+    Managed,
+    Separator,
+    Revoke,
+    Quit,
+}
+
+/// 菜单布局：“撤销配置并退出”位于分隔线之后、“退出”之前。
+fn menu_layout(with_revoke: bool) -> Vec<MenuEntry> {
+    let mut entries = vec![MenuEntry::Show, MenuEntry::Managed, MenuEntry::Separator];
+    if with_revoke {
+        entries.push(MenuEntry::Revoke);
+    }
+    entries.push(MenuEntry::Quit);
+    entries
+}
+
+/// 当前平台的菜单布局：仅 macOS 带“撤销配置并退出”（macOS 设计 §6）。
+fn platform_menu_layout() -> Vec<MenuEntry> {
+    menu_layout(cfg!(target_os = "macos"))
+}
+
+/// 菜单项文案；分隔线没有文案。
+fn menu_label(entry: MenuEntry) -> &'static str {
+    match entry {
+        MenuEntry::Show => "显示窗口",
+        MenuEntry::Managed => "受管模式",
+        MenuEntry::Separator => "",
+        MenuEntry::Revoke => revoke::REVOKE_TITLE,
+        MenuEntry::Quit => "退出",
+    }
+}
 
 /// 托盘的共享状态。
 pub struct TrayState {
@@ -43,11 +84,46 @@ impl ToggleAction {
 
 /// 创建托盘图标与菜单。勾选初始为未启用，启动对账完成后由状态推送同步。
 pub fn build(app: &App) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, MENU_SHOW, "显示窗口", true, None::<&str>)?;
-    let managed = CheckMenuItem::with_id(app, MENU_MANAGED, "受管模式", true, false, None::<&str>)?;
-    let separator = PredefinedMenuItem::separator(app)?;
-    let quit = MenuItem::with_id(app, MENU_QUIT, "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &managed, &separator, &quit])?;
+    let managed = CheckMenuItem::with_id(
+        app,
+        MENU_MANAGED,
+        menu_label(MenuEntry::Managed),
+        true,
+        false,
+        None::<&str>,
+    )?;
+    let mut items: Vec<Box<dyn IsMenuItem<Wry>>> = Vec::new();
+    for entry in platform_menu_layout() {
+        let label = menu_label(entry);
+        let item: Box<dyn IsMenuItem<Wry>> = match entry {
+            MenuEntry::Show => Box::new(MenuItem::with_id(
+                app,
+                MENU_SHOW,
+                label,
+                true,
+                None::<&str>,
+            )?),
+            MenuEntry::Managed => Box::new(managed.clone()),
+            MenuEntry::Separator => Box::new(PredefinedMenuItem::separator(app)?),
+            MenuEntry::Revoke => Box::new(MenuItem::with_id(
+                app,
+                MENU_REVOKE,
+                label,
+                true,
+                None::<&str>,
+            )?),
+            MenuEntry::Quit => Box::new(MenuItem::with_id(
+                app,
+                MENU_QUIT,
+                label,
+                true,
+                None::<&str>,
+            )?),
+        };
+        items.push(item);
+    }
+    let refs: Vec<&dyn IsMenuItem<Wry>> = items.iter().map(|item| item.as_ref()).collect();
+    let menu = Menu::with_items(app, &refs)?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip(TOOLTIP)
@@ -78,6 +154,7 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
         MENU_SHOW => events::show_main_window(app),
         MENU_MANAGED => toggle_managed(app),
+        MENU_REVOKE => revoke::request_revoke(app),
         MENU_QUIT => lifecycle::request_quit(app),
         _ => {}
     }
@@ -157,5 +234,34 @@ mod tests {
     fn toggle_disables_when_enabled_and_enables_otherwise() {
         assert_eq!(ToggleAction::for_enabled(true), ToggleAction::Disable);
         assert_eq!(ToggleAction::for_enabled(false), ToggleAction::Enable);
+    }
+
+    use MenuEntry::*;
+
+    #[test]
+    fn tray_menu_without_revoke_is_unchanged() {
+        assert_eq!(menu_layout(false), [Show, Managed, Separator, Quit]);
+    }
+
+    #[test]
+    fn tray_menu_with_revoke_puts_it_after_separator_before_quit() {
+        assert_eq!(menu_layout(true), [Show, Managed, Separator, Revoke, Quit]);
+    }
+
+    /// 当前平台实际使用的布局：仅 macOS 有“撤销配置并退出”，Windows 菜单保持不变。
+    #[test]
+    fn platform_menu_layout_matches_target() {
+        let expected: &[MenuEntry] = if cfg!(target_os = "macos") {
+            &[Show, Managed, Separator, Revoke, Quit]
+        } else {
+            &[Show, Managed, Separator, Quit]
+        };
+        assert_eq!(platform_menu_layout(), expected);
+    }
+
+    #[test]
+    fn tray_menu_labels() {
+        let labels: Vec<_> = [Show, Managed, Revoke, Quit].map(menu_label).into();
+        assert_eq!(labels, ["显示窗口", "受管模式", "撤销配置并退出", "退出"]);
     }
 }

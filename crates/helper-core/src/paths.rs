@@ -96,6 +96,17 @@ pub fn credential_command_in(dir: &Path) -> String {
     dunce::simplified(&normalized).to_string_lossy().to_string()
 }
 
+/// 是否为 macOS 的临时安装位置（macOS 设计 §4.2）：路径以 `/Volumes/` 开头（直接在 dmg 里运行），
+/// 或包含 `/AppTranslocation/`（带隔离属性运行时被系统挪到的随机路径）。这类路径之后会失效，
+/// 不能写进 `auth.command`。
+///
+/// 纯字符串判定：区分大小写（`current_exe` 给出的是真实大小写），不访问文件系统；
+/// Windows 路径恒为 `false`。
+pub fn is_transient_install_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    text.starts_with("/Volumes/") || text.contains("/AppTranslocation/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +122,47 @@ mod tests {
         assert_eq!(paths.env_file(), Path::new("/codex/.env"));
         assert_eq!(paths.state_file(), Path::new("/data/state.json"));
         assert_eq!(paths.log_dir(), Path::new("/data/logs"));
+    }
+
+    #[test]
+    fn transient_install_path_detection() {
+        for (path, expected) in [
+            (
+                "/Volumes/CodexHelper/CodexHelper.app/Contents/MacOS/codex-helper-credential",
+                true,
+            ),
+            (
+                "/private/var/folders/zz/abc/T/AppTranslocation/8E1A-44F2/d/CodexHelper.app/Contents/MacOS/codex-helper-credential",
+                true,
+            ),
+            (
+                "/Applications/CodexHelper.app/Contents/MacOS/codex-helper-credential",
+                false,
+            ),
+            (
+                "/Users/sxk/Applications/CodexHelper.app/Contents/MacOS/codex-helper-credential",
+                false,
+            ),
+            (
+                "/Users/sxk/Downloads/CodexHelper.app/Contents/MacOS/codex-helper-credential",
+                false,
+            ),
+            ("/Volumes", false),
+            ("/VolumesX/a", false),
+            ("/Users/sxk/Volumes/a", false),
+            ("/volumes/a", false),
+            ("/Users/sxk/AppTranslocationX/a", false),
+            (
+                r"C:\Program Files\CodexHelper\codex-helper-credential.exe",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                is_transient_install_path(Path::new(path)),
+                expected,
+                "{path}"
+            );
+        }
     }
 
     #[test]

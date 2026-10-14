@@ -63,6 +63,19 @@ fn validate_endpoint(raw: &str) -> Result<Url, String> {
     Ok(url)
 }
 
+/// 内部升级只在 Windows 上提供（与 `Status::update_supported` 同一判断）。其他平台直接拒绝，
+/// 不读环境变量、不请求检测地址。
+fn ensure_update_supported() -> Result<(), ErrorPayload> {
+    if cfg!(windows) {
+        Ok(())
+    } else {
+        Err(ErrorPayload {
+            code: "update".to_string(),
+            message: "当前平台不支持内部升级，请到 GitHub Release 下载新版本".to_string(),
+        })
+    }
+}
+
 /// 构建 updater：存在环境变量覆盖时替换 endpoints，否则沿用 `tauri.conf.json` 的配置。
 fn build_updater(app: &AppHandle) -> Result<Updater, ErrorPayload> {
     let mut builder = app.updater_builder();
@@ -89,8 +102,10 @@ fn map_error(context: &str, error: tauri_plugin_updater::Error) -> ErrorPayload 
 }
 
 /// 检测是否有可用更新（只检测、不下载）。前端“检查更新”按钮与启动自动检测都调用它。
+/// 非 Windows 平台直接返回 `update` 错误。
 #[tauri::command]
 pub async fn check_update(app: AppHandle) -> Result<UpdateCheck, ErrorPayload> {
+    ensure_update_supported()?;
     let current_version = app.package_info().version.to_string();
     let updater = build_updater(&app)?;
     match updater.check().await {
@@ -131,11 +146,13 @@ pub fn app_version(app: AppHandle) -> Result<String, ErrorPayload> {
 }
 
 /// 下载并安装可用更新，成功后重启应用；无可用更新时返回错误由前端提示刷新。
+/// 非 Windows 平台直接返回 `update` 错误。
 ///
 /// `expected_version` 是前端在确认框里向用户展示并确认的版本。安装前重新检查一次，若
 /// 服务器此刻返回的版本与用户确认的不一致，则拒绝安装，避免“确认 A 却装了 B”的竞态。
 #[tauri::command]
 pub async fn install_update(app: AppHandle, expected_version: String) -> Result<(), ErrorPayload> {
+    ensure_update_supported()?;
     let updater = build_updater(&app)?;
     let update = match updater.check().await {
         Ok(Some(update)) => update,
@@ -173,6 +190,19 @@ pub async fn install_update(app: AppHandle, expected_version: String) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_commands_only_supported_on_windows() {
+        let result = ensure_update_supported();
+        assert_eq!(result.is_ok(), cfg!(windows));
+        if let Err(e) = result {
+            assert_eq!(e.code, "update");
+            assert_eq!(
+                e.message,
+                "当前平台不支持内部升级，请到 GitHub Release 下载新版本"
+            );
+        }
+    }
 
     #[test]
     fn validate_endpoint_accepts_http_and_https() {

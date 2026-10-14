@@ -107,3 +107,67 @@ jobs:
             target/release/bundle/nsis/*-setup.exe.sig
             target/release/bundle/nsis/latest.json
           fail_on_unmatched_files: true
+
+  # macOS universal dmg（设计 §7）。needs windows-release 让两个 job 串行，
+  # 避免同时为同一 tag 创建 Release；本 job 只上传 dmg 并补写 Release 正文。
+  macos-release:
+    runs-on: macos-latest
+    needs: windows-release
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      # 与 windows-release 同名步骤逐字相同：dmg 文件名与 Info.plist 版本也取自 tauri.conf.json。
+      - name: 校验 tag 版本与 tauri.conf.json 一致
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CONF_VERSION=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")
+          echo "tag=$TAG_VERSION conf=$CONF_VERSION"
+          if [ "$TAG_VERSION" != "$CONF_VERSION" ]; then
+            echo "::error::标签版本 v$TAG_VERSION 与 tauri.conf.json 中的 version=$CONF_VERSION 不一致"
+            exit 1
+          fi
+
+      # universal 构建要分别编译 arm64 与 x86_64，两个标准库都要装。
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: 缓存 cargo 构建产物
+        uses: Swatinem/rust-cache@v2
+
+      - name: 安装前端依赖
+        run: npm ci --prefix apps/desktop
+
+      # 脚本负责凭据程序 lipo 合成、tauri build 与产物自检，并把 dmg 路径写进 GITHUB_OUTPUT。
+      # macOS 不生成升级产物（createUpdaterArtifacts=false），因此不需要签名私钥，
+      # 也不调用 publish-update.sh：latest.json 仍只含 windows-x86_64。
+      - name: 构建 universal dmg
+        id: build
+        run: bash scripts/build-macos.sh
+
+      # windows-release 不写 Release 正文，由这里补上 macOS 安装说明（设计 §7.3）。
+      - name: 上传 dmg 到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.build.outputs.dmg }}
+          fail_on_unmatched_files: true
+          body: |
+            ## macOS 安装说明（内部试用）
+
+            1. 打开 dmg，把 CodexHelper 拖到「应用程序」。
+            2. 首次打开被拦截时：系统设置 → 隐私与安全性 → “仍要打开”；或执行
+               `xattr -dr com.apple.quarantine /Applications/CodexHelper.app`。
+            3. 卸载：先在菜单栏图标选“撤销配置并退出”，再把应用拖进废纸篓。如果已经先删了应用、Codex 打不开对话：重新安装后执行一次撤销。
+            4. 删除 Key（可选）：`security delete-generic-password -s codex-helper/managed-gateway -a codex-helper`。

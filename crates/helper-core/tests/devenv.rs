@@ -99,6 +99,7 @@ async fn detects_runtimes_and_configured_mirrors() {
     assert_eq!(report.node.state, RuntimeState::Ok);
     assert_eq!(report.node.version.as_deref(), Some("24.16.0"));
     assert_eq!(report.npm_mirror.state, MirrorState::Configured);
+    assert_eq!(report.platform_supported, cfg!(target_os = "macos"));
 }
 
 #[tokio::test]

@@ -1,7 +1,8 @@
 //! CodexHelper 桌面应用入口（设计 §8）。
 //!
 //! 只做组装：业务全部委托 `helper_core::manager::Manager`；命令见 [`commands`]，托盘见 [`tray`]，
-//! 启动对账与定时重测见 [`startup`]，关闭隐藏与退出确认见 [`lifecycle`]。
+//! 启动对账与定时重测见 [`startup`]，关闭隐藏与退出确认见 [`lifecycle`]，
+//! macOS 托盘“撤销配置并退出”见 [`revoke`]。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -9,6 +10,7 @@ mod commands;
 mod events;
 mod lifecycle;
 mod process;
+mod revoke;
 mod startup;
 mod tray;
 mod update;

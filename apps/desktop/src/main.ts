@@ -13,7 +13,7 @@ import { createDevEnvPanel } from "./devenvpanel";
 import { el } from "./dom";
 import { classifyKeyError } from "./errors";
 import { createFooterRegion } from "./footer";
-import { isFirstRun, keySubmitAction } from "./format";
+import { isFirstRun, keySubmitAction, showUpdatePanel, uninstallHint } from "./format";
 import { createKeyPanel } from "./keypanel";
 import { createMessageRegion } from "./message";
 import { confirmModal } from "./modal";
@@ -165,10 +165,27 @@ async function main(): Promise<void> {
   );
   tabs.select("gateway");
 
-  appRoot.append(title, tabs.root, messageRegion.root, gatewayPage, devEnvPage, updatePanel.root);
+  // 平台提示（macOS：卸载前先撤销配置），放在最底部，两个标签页与首次运行都可见。
+  const platformHint = el("p", { class: "footer-hint platform-hint" });
+  platformHint.hidden = true;
+
+  appRoot.append(
+    title,
+    tabs.root,
+    messageRegion.root,
+    gatewayPage,
+    devEnvPage,
+    updatePanel.root,
+    platformHint,
+  );
 
   function render(): void {
     renderGateway();
+    const hint = status ? uninstallHint(status) : null;
+    platformHint.textContent = hint ?? "";
+    platformHint.hidden = hint === null;
+    // 只有支持内部升级（Windows）时显示升级区；状态未加载时也隐藏。
+    updatePanel.root.hidden = !showUpdatePanel(status);
     devEnvPanel.update({
       detecting: busy.has("detectDevEnv"),
       report: devEnvReport,
@@ -366,6 +383,7 @@ async function main(): Promise<void> {
 
   /** 检查更新：manual=true 为用户点击（无更新时提示“已是最新”），false 为启动时静默自检。 */
   async function runCheckUpdate(manual: boolean): Promise<void> {
+    if (!showUpdatePanel(status)) return;
     if (busy.has("checkUpdate") || busy.has("installUpdate")) return;
     busy.add("checkUpdate");
     render();
@@ -477,6 +495,7 @@ async function main(): Promise<void> {
     updateCurrentVersion = null;
   }
 
+  let statusLoaded = false;
   try {
     const [initialStatus, initialConnections, reconcileReport] = await Promise.all([
       api.getStatus(),
@@ -484,6 +503,7 @@ async function main(): Promise<void> {
       api.getReconcileReport(),
     ]);
     status = initialStatus;
+    statusLoaded = true;
     connections = truncateConnections(initialConnections);
     if (reconcileReport) {
       showReconcileFailure(reconcileReport);
@@ -499,7 +519,8 @@ async function main(): Promise<void> {
   }
 
   // 启动时静默自检更新（不阻塞初始加载，失败不打扰）；发现新版本时在更新区提示，由用户确认安装。
-  void runCheckUpdate(false);
+  // 只在初始状态加载成功且支持内部升级时执行，macOS 上完全不调 check_update。
+  if (statusLoaded && showUpdatePanel(status)) void runCheckUpdate(false);
 }
 
 void main();

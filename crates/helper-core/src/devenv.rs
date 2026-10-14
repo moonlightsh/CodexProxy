@@ -82,7 +82,8 @@ pub struct MirrorReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DevEnvReport {
-    /// Windows 为 true；其他平台为开发模式（按 `python3` 检测，仅供调试）
+    /// Windows 与 macOS 为 true（macOS 按 `python3` 检测，为正式支持）；其他平台为开发模式
+    /// （同样按 `python3` 检测，仅供调试）
     pub platform_supported: bool,
     pub python: RuntimeReport,
     pub pip_mirror: MirrorReport,
@@ -649,7 +650,7 @@ pub async fn detect_in(env: &SearchEnv, timeout: Duration) -> DevEnvReport {
     let ((python, pip_mirror), (node, npm_mirror)) =
         tokio::join!(detect_python(env, timeout), detect_node(env, timeout));
     DevEnvReport {
-        platform_supported: cfg!(windows),
+        platform_supported: cfg!(any(windows, target_os = "macos")),
         python,
         pip_mirror,
         node,
