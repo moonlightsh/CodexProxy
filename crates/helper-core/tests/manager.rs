@@ -31,6 +31,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const KEY: &str = "hk-TEST-7f3a9c2e5b1d4a60";
 const OLD_KEY: &str = "hk-OLD-0c4e8a2f6b9d1e37";
 const COMMAND: &str = "C:\\Program Files\\CodexHelper\\codex-helper-credential.exe";
+/// macOS App Translocation 下的凭据程序路径（临时安装位置）。
+const TRANSIENT_COMMAND: &str = "/private/var/folders/zz/abc/T/AppTranslocation/8E1A-44F2/d/CodexHelper.app/Contents/MacOS/codex-helper-credential";
+/// 直接在 dmg 里运行时的凭据程序路径（临时安装位置）。
+const VOLUME_COMMAND: &str =
+    "/Volumes/CodexHelper/CodexHelper.app/Contents/MacOS/codex-helper-credential";
 
 /// 真实感夹具：注释、行尾注释、其他 provider、projects、plugins。
 const USER_CONFIG: &str = r#"# 用户的 Codex 配置
@@ -2071,4 +2076,142 @@ async fn enable_rechecks_preflight_after_key_check() {
     assert_eq!(sandbox.snapshot(), before);
     assert_eq!(sandbox.credential(), None);
     assert!(port_is_free(sandbox.port).await);
+}
+
+// ---- 19. 安装位置 ----
+
+#[cfg(target_os = "macos")]
+const INSTALL_LOCATION_MESSAGE: &str = "请先把 CodexHelper 拖到「应用程序」文件夹，再从那里打开";
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn status_flags_transient_install_location() {
+    let sandbox = Sandbox::new().await;
+    for command in [TRANSIENT_COMMAND, VOLUME_COMMAND] {
+        let manager = Manager::new(sandbox.options_with(command));
+        assert!(!manager.status().await.install_location_ok, "{command}");
+    }
+    assert!(sandbox.manager().status().await.install_location_ok);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enable_from_transient_location_is_rejected_without_writes() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let before = sandbox.snapshot();
+
+    let manager = Manager::new(sandbox.options_with(TRANSIENT_COMMAND));
+    let error = assert_code(manager.enable(with_key(KEY)).await, "installLocation");
+    assert_eq!(error.to_string(), INSTALL_LOCATION_MESSAGE);
+
+    sandbox.credentials.write(OLD_KEY).unwrap();
+    assert_code(
+        manager.enable(EnableRequest::default()).await,
+        "installLocation",
+    );
+    let volume = Manager::new(sandbox.options_with(VOLUME_COMMAND));
+    assert_code(volume.enable(with_key(KEY)).await, "installLocation");
+
+    assert_eq!(sandbox.snapshot(), before);
+    assert_eq!(sandbox.gateway_hits().await, 0);
+    assert_eq!(sandbox.credential().as_deref(), Some(OLD_KEY));
+    assert!(port_is_free(sandbox.port).await);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn autostart_on_from_transient_location_is_rejected() {
+    let sandbox = Sandbox::new().await;
+    let manager = Manager::new(sandbox.options_with(TRANSIENT_COMMAND));
+    let error = assert_code(manager.set_autostart_flag(true).await, "installLocation");
+    assert_eq!(error.to_string(), INSTALL_LOCATION_MESSAGE);
+    assert!(!sandbox.state_file().exists());
+    let status = manager.set_autostart_flag(false).await.unwrap();
+    assert!(!status.autostart);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_from_transient_location_keeps_previous_command() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let first = sandbox.manager();
+    first.enable(with_key(KEY)).await.unwrap();
+    first.shutdown().await;
+    let state_before = sandbox.state();
+
+    let manager = Manager::new(sandbox.options_with(TRANSIENT_COMMAND));
+    let status = manager.status().await;
+    assert!(!status.install_location_ok);
+    assert!(status.config_managed, "按旧的 auth.command 判定受管");
+
+    // 制造漂移：base_url 被改、.env 被删
+    let drifted = sandbox
+        .read_config()
+        .replace(consts::GATEWAY_BASE_URL, "http://evil.invalid:1");
+    sandbox.write_config(&drifted);
+    std::fs::remove_file(sandbox.env()).unwrap();
+
+    let report = manager.reconcile_on_startup().await;
+    assert_eq!(report.outcome, ReconcileOutcome::Applied);
+    assert_eq!(report.error, None);
+    assert!(report.status.config_managed && report.status.env_managed);
+    assert!(!report.status.install_location_ok);
+    assert_eq!(report.status.proxy.state, ProxyState::Running);
+    let text = sandbox.read_config();
+    let doc: toml_edit::DocumentMut = text.parse().unwrap();
+    assert_eq!(
+        doc["model_providers"]["managed_gateway"]["auth"]["command"].as_str(),
+        Some(COMMAND)
+    );
+    assert!(!text.contains(TRANSIENT_COMMAND) && !text.contains("evil.invalid"));
+    assert_eq!(sandbox.state(), state_before);
+
+    manager.disable().await.unwrap();
+    assert_eq!(sandbox.read_config(), USER_CONFIG);
+    sandbox.assert_no_key_on_disk();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_from_transient_location_without_managed_command_fails_untouched() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    sandbox.write_state(&HelperState {
+        enabled: true,
+        ..Default::default()
+    });
+    sandbox.credentials.write(KEY).unwrap();
+    let before = sandbox.snapshot();
+
+    let manager = Manager::new(sandbox.options_with(TRANSIENT_COMMAND));
+    let report = manager.reconcile_on_startup().await;
+    assert_eq!(report.outcome, ReconcileOutcome::Failed);
+    assert_eq!(report.error.unwrap().code, "installLocation");
+    assert_eq!(report.status.proxy.state, ProxyState::Stopped);
+    assert_eq!(sandbox.snapshot(), before);
+    assert!(port_is_free(sandbox.port).await);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_location_is_ignored_off_macos() {
+    let sandbox = Sandbox::new().await;
+    for command in [TRANSIENT_COMMAND, VOLUME_COMMAND] {
+        let manager = Manager::new(sandbox.options_with(command));
+        assert!(manager.status().await.install_location_ok, "{command}");
+    }
+    let manager = Manager::new(sandbox.options_with(TRANSIENT_COMMAND));
+    manager.set_autostart_flag(true).await.unwrap();
+    manager.enable(with_key(KEY)).await.unwrap();
+    let doc: toml_edit::DocumentMut = sandbox.read_config().parse().unwrap();
+    assert_eq!(
+        doc["model_providers"]["managed_gateway"]["auth"]["command"].as_str(),
+        Some(TRANSIENT_COMMAND)
+    );
+    manager.shutdown().await;
 }

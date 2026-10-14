@@ -253,9 +253,14 @@ impl Manager {
         Ok(self.build_status())
     }
 
-    /// 记录开机自启开关到状态文件（注册表项由桌面应用负责）。
+    /// 记录开机自启开关到状态文件（注册表项 / LaunchAgent 由桌面应用负责）。
+    ///
+    /// macOS 上从临时安装位置运行时拒绝打开（`InstallLocation`），不读写状态文件；关闭照常执行。
     pub async fn set_autostart_flag(&self, enabled: bool) -> Result<Status, ManagerError> {
         let _ops = self.ops.lock().await;
+        if enabled && self.transient_install() {
+            return Err(ManagerError::InstallLocation);
+        }
         let paths = &self.options.paths;
         let mut snapshot = read_state(&paths.state_file())?;
         quarantine_corrupt_state(paths, &mut snapshot);
@@ -319,6 +324,13 @@ impl Manager {
         } = request;
         let preflight = StepError::at("preflight");
         let verify = StepError::at("verify_key");
+
+        // 临时安装位置（仅 macOS）：最先拒绝，不访问网关、不写任何东西
+        if self.transient_install() {
+            return Err(StepError::at("install_location")(
+                ManagerError::InstallLocation,
+            ));
+        }
 
         // 0. 预检（锁外、只读）：配置无法处理或需要确认 catalog 时不做 Key 校验
         self.enable_preflight(confirm_remove_catalog)
@@ -611,14 +623,23 @@ impl Manager {
             Err(error) => return Err(credential_error(error)),
         }
 
-        // 幂等重做第 4–6 步，不记录原值
+        // 选定写入 auth.command 的路径：临时安装位置（仅 macOS）下不能写入这个之后会失效的路径，
+        // 保留受管节里的旧值；没有旧值时不改任何文件、不启动代理
         let config_path = paths.config_toml();
-        codex_config::apply_managed(
-            &config_path,
-            &paths.config_backup(),
-            &self.options.credential_command,
-        )
-        .map_err(|error| config_error(error, &config_path))?;
+        let command = if self.transient_install() {
+            match codex_config::managed_command(&config_path)
+                .map_err(|error| config_error(error, &config_path))?
+            {
+                Some(previous) => previous,
+                None => return Err(ManagerError::InstallLocation),
+            }
+        } else {
+            self.options.credential_command.clone()
+        };
+
+        // 幂等重做第 4–6 步，不记录原值
+        codex_config::apply_managed(&config_path, &paths.config_backup(), &command)
+            .map_err(|error| config_error(error, &config_path))?;
         // 端口被他人占用时在这里失败，已存在的 .env 不被改动
         self.ensure_proxy(ops).await?;
         let env_path = paths.env_file();
@@ -716,6 +737,24 @@ impl Manager {
             .map_err(|error| config_error(error, &config_path))
     }
 
+    /// 是否从临时安装位置运行（仅 macOS；其他平台恒为 false，行为不变）。
+    fn transient_install(&self) -> bool {
+        cfg!(target_os = "macos")
+            && paths::is_transient_install_path(Path::new(&self.options.credential_command))
+    }
+
+    /// 判定“配置已受管”所用的 `auth.command`：正常位置为自身凭据程序路径；临时安装位置下
+    /// 按受管节里的旧值判定（对账会保留它），读不到时回退自身路径。
+    fn effective_command(&self) -> String {
+        if self.transient_install()
+            && let Ok(Some(previous)) =
+                codex_config::managed_command(&self.options.paths.config_toml())
+        {
+            return previous;
+        }
+        self.options.credential_command.clone()
+    }
+
     /// 状态快照：读文件 + 运行时短锁快照，不获取操作锁。
     fn build_status(&self) -> Status {
         let options = &self.options;
@@ -728,7 +767,7 @@ impl Manager {
 
         let config_path = paths.config_toml();
         let (inspection, config_error_message) =
-            match codex_config::inspect(&config_path, &options.credential_command) {
+            match codex_config::inspect(&config_path, &self.effective_command()) {
                 Ok(inspection) => (inspection, None),
                 Err(error) => (
                     ConfigInspection::default(),
@@ -749,7 +788,7 @@ impl Manager {
             platform_supported: cfg!(any(windows, target_os = "macos")),
             platform: consts::PLATFORM.to_string(),
             update_supported: cfg!(windows),
-            install_location_ok: true,
+            install_location_ok: !self.transient_install(),
             enabled: state.enabled,
             key_configured,
             needs_key: state.enabled && !key_configured,
