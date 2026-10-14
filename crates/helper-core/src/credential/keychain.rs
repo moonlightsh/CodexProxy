@@ -398,14 +398,35 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_with_timeout_kills_hanging_child() {
+        // 子进程先把自己的 pid 写进文件再 exec 成 sleep，超时返回后用 `kill -0` 确认它已被结束。
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!("echo $$ > '{}'; exec /bin/sleep 30", pid_file.display());
         let start = std::time::Instant::now();
         let r = run_with_timeout(
-            Path::new("/bin/sleep"),
-            &["30"],
+            Path::new("/bin/sh"),
+            &["-c", &script],
             None,
-            Duration::from_millis(300),
+            Duration::from_millis(500),
         );
-        assert!(matches!(r, Err(RunError::Timeout)) && start.elapsed() < Duration::from_secs(5));
+        let elapsed = start.elapsed();
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        let alive = Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if alive {
+            // 测试失败时也不留下 30 秒的 sleep 进程。
+            let _ = Command::new("/bin/kill").args(["-9", &pid]).status();
+        }
+        assert!(matches!(r, Err(RunError::Timeout)), "应返回 Timeout");
+        assert!(elapsed < Duration::from_secs(5), "超时后应立即返回");
+        assert!(!alive, "超时后子进程 {pid} 应已被结束");
     }
 
     #[test]
