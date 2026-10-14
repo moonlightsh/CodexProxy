@@ -18,7 +18,18 @@ import type {
   SaveKeyRequest,
   Status,
 } from "./types";
+import { INVALID_KEY_CHARS_MESSAGE } from "./errors";
+import { INSTALL_LOCATION_MESSAGE } from "./format";
 import { EVENT_CONNECTION_RECORDED, EVENT_STATUS_CHANGED } from "./types";
+
+/** Key 只允许可打印 ASCII（0x21–0x7E，与 Rust 侧一致）。 */
+const KEY_CHARS = /^[\x21-\x7e]+$/;
+
+/** 非 Windows 平台拒绝升级命令时的错误（与 Rust 侧 update.rs 一致）。 */
+const UPDATE_UNSUPPORTED: ErrorPayload = {
+  code: "update",
+  message: "当前平台不支持内部升级，请到 GitHub Release 下载新版本",
+};
 
 /** 仅用于验证生产构建未打包本文件的特征字符串。 */
 export const DEV_MOCK_MARKER = "__CODEX_HELPER_DEV_MOCK__";
@@ -26,6 +37,9 @@ export const DEV_MOCK_MARKER = "__CODEX_HELPER_DEV_MOCK__";
 function baseStatus(): Status {
   return {
     platformSupported: true,
+    platform: "windows",
+    updateSupported: true,
+    installLocationOk: true,
     enabled: false,
     keyConfigured: false,
     needsKey: false,
@@ -48,7 +62,8 @@ function baseStatus(): Status {
 /**
  * 用 `?scenario=` 选择预览的状态，例如：
  * `?scenario=needsKey`、`?scenario=residue`、`?scenario=legacy`、
- * `?scenario=configError`、`?scenario=dev`、`?scenario=catalog`、`?scenario=running`（默认）。
+ * `?scenario=configError`、`?scenario=dev`、`?scenario=catalog`、`?scenario=running`（默认）、
+ * `?scenario=macos`（macOS：隐藏升级区、显示卸载前提示）、`?scenario=transient`（macOS 从临时位置运行）。
  * Key 录入区里输入 `bad` 模拟 keyRejected，输入 `slow` 模拟 gatewayUnavailable。
  */
 function applyScenario(status: Status, scenario: string): Status {
@@ -73,6 +88,10 @@ function applyScenario(status: Status, scenario: string): Status {
         proxy: { state: "running", port: status.proxy.port },
         modelCatalogJson: "/dev/fake-codex-home/model_catalog.json",
       };
+    case "macos":
+      return { ...applyScenario(status, "running"), platform: "macos", updateSupported: false };
+    case "transient":
+      return { ...applyScenario(status, "macos"), installLocationOk: false };
     case "running":
     default:
       return {
@@ -203,9 +222,15 @@ export function installDevMock(): void {
 
         case "enable": {
           const request = args.request as EnableRequest;
+          if (!status.installLocationOk) {
+            return reject({ code: "installLocation", message: INSTALL_LOCATION_MESSAGE });
+          }
           if (request.key !== undefined) {
             const trimmed = request.key.trim();
             if (!trimmed) return reject({ code: "emptyKey", message: "Key 不能为空。" });
+            if (!KEY_CHARS.test(trimmed)) {
+              return reject({ code: "invalidKeyChars", message: INVALID_KEY_CHARS_MESSAGE });
+            }
             if (trimmed === "bad") {
               return reject({ code: "keyRejected", message: "网关拒绝了该 Key（401）。" });
             }
@@ -252,6 +277,9 @@ export function installDevMock(): void {
           const request = args.request as SaveKeyRequest;
           const trimmed = request.key.trim();
           if (!trimmed) return reject({ code: "emptyKey", message: "Key 不能为空。" });
+          if (!KEY_CHARS.test(trimmed)) {
+            return reject({ code: "invalidKeyChars", message: INVALID_KEY_CHARS_MESSAGE });
+          }
           if (trimmed === "bad") {
             return reject({ code: "keyRejected", message: "网关拒绝了该 Key（401）。" });
           }
@@ -278,11 +306,15 @@ export function installDevMock(): void {
         }
 
         case "set_autostart": {
+          if (args.enabled && !status.installLocationOk) {
+            return reject({ code: "installLocation", message: INSTALL_LOCATION_MESSAGE });
+          }
           setStatus({ ...status, autostart: Boolean(args.enabled) });
           return status;
         }
 
         case "check_update":
+          if (!status.updateSupported) return reject(UPDATE_UNSUPPORTED);
           // 预览可用更新：`?scenario=updateAvailable`；其余场景返回“已是最新”。
           return scenario === "updateAvailable"
             ? {
@@ -295,6 +327,7 @@ export function installDevMock(): void {
             : { available: false, currentVersion: "0.1.1", version: null, notes: null, date: null };
 
         case "install_update":
+          if (!status.updateSupported) return reject(UPDATE_UNSUPPORTED);
           // 忽略 expectedVersion 参数；开发预览不支持真实安装。
           return reject({ code: "update", message: "开发预览不支持真实安装更新。" });
 

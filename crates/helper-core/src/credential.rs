@@ -1,11 +1,12 @@
-//! 凭据存储（设计 §4.4）。
+//! 凭据存储（设计 §4.4；macOS 见 macOS 设计 §3）。
 //!
 //! - Windows：Credential Manager，`CRED_TYPE_GENERIC`，当前用户作用域。
+//! - macOS：登录钥匙串的 generic password（service 为 target，account 为
+//!   `consts::KEYCHAIN_ACCOUNT`），读写删全部经 `/usr/bin/security` 子进程完成，见 `keychain` 子模块。
 //! - 其他平台：进程内内存实现（“开发模式”）：所有 `SystemCredentialStore` 实例按 target
 //!   共享同一张全局表，但这张表只存在于当前进程的内存中——换一个进程（例如独立编译
-//!   运行的 `credential` 读取程序）在非 Windows 上执行时看到的是它自己进程里的空表，
-//!   读不到本进程写入的任何内容。仅用于本机开发与非 Windows 测试，不做跨进程 / 跨
-//!   重启持久化，也不落盘。
+//!   运行的 `credential` 读取程序）执行时看到的是它自己进程里的空表，读不到本进程写入的
+//!   任何内容。仅用于本机开发与测试，不做跨进程 / 跨重启持久化，也不落盘。
 //!
 //! 只做读写删除，不日志化凭据内容；错误对象绝不携带 Token。
 
@@ -13,6 +14,16 @@ use std::fmt;
 use std::sync::Mutex;
 
 use crate::consts;
+
+mod keychain;
+
+/// Key 字符规则的唯一出处：非空且每个字节都在 0x21–0x7E（可打印 ASCII，不含空格）。
+///
+/// 编排层（`save_key` / `enable`）与 macOS 钥匙串后端都用它：`security -i` 逐行解析命令，
+/// 换行等字符会变成注入；`security -w` 对非 ASCII 内容输出十六进制，无法还原（macOS 设计 §2、§3.2）。
+pub fn is_allowed_token(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
 
 /// 凭据明文的包装：`Debug` 不输出内容，也不实现 `Display`，防止误写进日志或错误。
 #[derive(Clone, PartialEq, Eq)]
@@ -96,8 +107,8 @@ impl CredentialStore for MemoryCredentialStore {
     }
 }
 
-/// 系统凭据存储：Windows 为 Credential Manager，其他平台为进程内内存实现（开发模式，
-/// 见模块文档）。
+/// 系统凭据存储：Windows 为 Credential Manager，macOS 为登录钥匙串，其他平台为进程内
+/// 内存实现（开发模式，见模块文档）。
 #[derive(Debug, Clone)]
 pub struct SystemCredentialStore {
     target: String,
@@ -136,7 +147,22 @@ impl CredentialStore for SystemCredentialStore {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+impl CredentialStore for SystemCredentialStore {
+    fn read(&self) -> anyhow::Result<Option<Secret>> {
+        Ok(keychain::read(&self.target)?.map(Secret::new))
+    }
+
+    fn write(&self, token: &str) -> anyhow::Result<()> {
+        keychain::write(&self.target, token)
+    }
+
+    fn delete(&self) -> anyhow::Result<()> {
+        keychain::delete(&self.target)
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 impl CredentialStore for SystemCredentialStore {
     fn read(&self) -> anyhow::Result<Option<Secret>> {
         Ok(dev_store::read(&self.target)?.map(Secret::new))
@@ -269,8 +295,8 @@ mod windows_backend {
     }
 }
 
-/// 非 Windows 平台的“开发模式”实现：进程内全局表，按 target 共享（见模块文档）。
-#[cfg(not(windows))]
+/// Windows 与 macOS 以外平台的“开发模式”实现：进程内全局表，按 target 共享（见模块文档）。
+#[cfg(not(any(windows, target_os = "macos")))]
 mod dev_store {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -316,6 +342,28 @@ mod tests {
     }
 
     #[test]
+    fn allowed_token_is_printable_ascii_only() {
+        let all: String = (0x21u8..=0x7e).map(char::from).collect();
+        assert!(is_allowed_token(&all));
+        assert!(is_allowed_token("hk-ABC_123"));
+        for bad in [
+            "",
+            " ",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "a\rb",
+            "a\0b",
+            "a\u{7f}",
+            "sk-中文",
+            "é",
+            "a\u{3000}b",
+        ] {
+            assert!(!is_allowed_token(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn memory_store_round_trip() {
         let store = MemoryCredentialStore::new();
         assert!(!store.exists());
@@ -327,8 +375,10 @@ mod tests {
     }
 }
 
-/// 非 Windows 下 `SystemCredentialStore`（开发模式）的行为测试。
-#[cfg(all(test, not(windows)))]
+/// Windows 与 macOS 以外平台下 `SystemCredentialStore`（开发模式）的行为测试。
+///
+/// macOS 上不编译：这里固定名字的 target 会写进真实钥匙串。
+#[cfg(all(test, not(any(windows, target_os = "macos"))))]
 mod dev_mode_tests {
     use super::*;
 
@@ -473,5 +523,127 @@ mod windows_mode_tests {
         store.write("").unwrap();
         assert_eq!(store.read().unwrap(), None);
         assert!(!store.exists());
+    }
+}
+
+/// macOS 下 `SystemCredentialStore`（登录钥匙串，经 `/usr/bin/security`）的行为测试。
+///
+/// 只使用 `codex-helper/test-<pid>-<纳秒>-<计数>` 形式的临时 service，绝不触碰生产条目
+/// `codex-helper/managed-gateway`（设计 §3.3 硬性规则）；结束（含 panic）时由守卫删除。
+#[cfg(all(test, target_os = "macos"))]
+mod keychain_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    /// 生成形如 `codex-helper/test-<pid>-<纳秒>-<计数>` 的临时 service，避免与真实凭据
+    /// 及并行测试互相冲突。
+    fn unique_test_target() -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let target = format!("codex-helper/test-{pid}-{nanos}-{seq}");
+        assert_ne!(target, consts::CREDENTIAL_TARGET);
+        target
+    }
+
+    /// 测试结束（含 panic 时）务必删除临时条目，避免残留在开发机的钥匙串中。
+    struct TempTargetGuard(SystemCredentialStore);
+
+    impl Drop for TempTargetGuard {
+        fn drop(&mut self) {
+            let _ = self.0.delete();
+        }
+    }
+
+    fn temp_store() -> (SystemCredentialStore, TempTargetGuard) {
+        let store = SystemCredentialStore::new(unique_test_target());
+        let guard = TempTargetGuard(store.clone());
+        (store, guard)
+    }
+
+    #[test]
+    fn keychain_write_read_overwrite_delete_round_trip() {
+        let (store, _guard) = temp_store();
+
+        assert_eq!(store.read().unwrap(), None);
+        store.write("hk-first").unwrap();
+        assert_eq!(store.read().unwrap().unwrap().expose(), "hk-first");
+        // `-U` 覆盖
+        store.write("hk-second").unwrap();
+        assert_eq!(store.read().unwrap().unwrap().expose(), "hk-second");
+        // 删除；重复删除幂等
+        store.delete().unwrap();
+        store.delete().unwrap();
+        assert_eq!(store.read().unwrap(), None);
+        assert!(!store.exists());
+    }
+
+    #[test]
+    fn keychain_missing_entry_reads_none_and_delete_succeeds() {
+        let (store, _guard) = temp_store();
+        assert_eq!(store.read().unwrap(), None);
+        store.delete().unwrap();
+    }
+
+    #[test]
+    fn keychain_special_characters_round_trip() {
+        let (store, _guard) = temp_store();
+        let token = r#"hk-A\B"C'D$E;F#G!`{}|~"#;
+        store.write(token).unwrap();
+        assert_eq!(store.read().unwrap().unwrap().expose(), token);
+    }
+
+    /// 超长或转义后超长的 Key 在启动 `security` 前被拒绝，原 Key 保持不变；尾部带命令名的
+    /// 注入载荷也不会被执行。上限以内的最长 Key 能完整写入并读回。
+    #[test]
+    fn keychain_rejects_overlong_token_and_keeps_previous() {
+        let (store, _guard) = temp_store();
+        store.write("hk-old").unwrap();
+        for token in [
+            "a".repeat(5000),
+            format!("{}list-keychains", "a".repeat(4000)),
+            "\\".repeat(1100),
+            "a".repeat(20_000),
+        ] {
+            let err = store.write(&token).unwrap_err().to_string();
+            assert!(err.starts_with("凭据过长"), "{err}");
+            assert!(!err.contains("aaaa") && !err.contains("\\\\"), "{err}");
+            assert_eq!(store.read().unwrap().unwrap().expose(), "hk-old");
+        }
+    }
+
+    #[test]
+    fn keychain_longest_allowed_token_round_trip() {
+        let (store, _guard) = temp_store();
+        let service = store.target.clone();
+        let overhead = keychain::add_command_line(&service, consts::KEYCHAIN_ACCOUNT, "").len();
+        let token = "k".repeat(keychain::MAX_COMMAND_LINE_BYTES - overhead);
+        store.write(&token).unwrap();
+        assert_eq!(store.read().unwrap().unwrap().expose(), token);
+    }
+
+    #[test]
+    fn keychain_rejects_unsafe_token_without_writing() {
+        let (store, _guard) = temp_store();
+        for token in [
+            "hk-a\nadd-generic-password -a x -s y -w z",
+            "hk 1",
+            "hk-中文",
+        ] {
+            let err = store.write(token).unwrap_err().to_string();
+            if token.trim().len() >= 2 {
+                assert!(!err.contains(token), "{err}");
+            }
+            assert_eq!(store.read().unwrap(), None, "{token:?}");
+        }
+        let err = store.write("").unwrap_err().to_string();
+        assert_eq!(err, "凭据不能为空");
+        assert_eq!(store.read().unwrap(), None);
     }
 }

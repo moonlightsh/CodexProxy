@@ -99,6 +99,7 @@ async fn detects_runtimes_and_configured_mirrors() {
     assert_eq!(report.node.state, RuntimeState::Ok);
     assert_eq!(report.node.version.as_deref(), Some("24.16.0"));
     assert_eq!(report.npm_mirror.state, MirrorState::Configured);
+    assert_eq!(report.platform_supported, cfg!(target_os = "macos"));
 }
 
 #[tokio::test]
@@ -186,6 +187,72 @@ async fn node_without_npm_reports_failed_mirror() {
         report.npm_mirror.detail.as_deref(),
         Some("PATH 上找不到 npm")
     );
+}
+
+#[tokio::test]
+async fn login_shell_path_reads_marked_path_and_ignores_banner() {
+    let dir = tempfile::tempdir().unwrap();
+    // 模拟登录 shell：必须以 `-l -i -c <脚本>` 调用；profile 打印欢迎语、改写 PATH，退出码非零也不影响结果。
+    let shell = script(
+        dir.path(),
+        "fake-shell",
+        "[ \"$1\" = -l ] && [ \"$2\" = -i ] && [ \"$3\" = -c ] || exit 9\n\
+         echo 'Last login: banner'\n\
+         PATH=/fake/login/bin:/usr/bin; export PATH\n\
+         eval \"$4\"\n\
+         exit 3",
+    );
+
+    let path = devenv::login_shell_path(&shell, TIMEOUT).await;
+
+    assert_eq!(path, Some(OsString::from("/fake/login/bin:/usr/bin")));
+}
+
+#[tokio::test]
+async fn login_shell_path_is_none_when_shell_is_silent_missing_or_hangs() {
+    let dir = tempfile::tempdir().unwrap();
+    let silent = script(dir.path(), "silent-shell", "exit 0");
+    assert_eq!(devenv::login_shell_path(&silent, TIMEOUT).await, None);
+
+    let missing = dir.path().join("no-such-shell");
+    assert_eq!(devenv::login_shell_path(&missing, TIMEOUT).await, None);
+
+    let hanging = script(dir.path(), "hanging-shell", "exec /bin/sleep 30");
+    let start = std::time::Instant::now();
+    let path = devenv::login_shell_path(&hanging, Duration::from_millis(500)).await;
+    assert_eq!(path, None);
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn login_shell_path_finds_runtime_hidden_from_launchd_path() {
+    // 从 Finder / 程序坞启动时进程 PATH 只有系统目录（这里用 old 代表系统自带的旧 python3），
+    // 登录 shell 的 PATH 里才有用户安装的新版本（new）。
+    let old = tempfile::tempdir().unwrap();
+    let new = tempfile::tempdir().unwrap();
+    let shells = tempfile::tempdir().unwrap();
+    fake_python(old.path(), "3.9.6", "");
+    fake_python(new.path(), "3.13.14", "");
+    let login_path = path_of(&[new.path(), old.path()]);
+    let shell = script(
+        shells.path(),
+        "fake-shell",
+        &format!(
+            "PATH='{}'; export PATH\neval \"$4\"",
+            login_path.to_string_lossy()
+        ),
+    );
+    let process = SearchEnv::new(path_of(&[old.path()]), Vec::new());
+
+    let env = devenv::with_login_shell_path(process, &shell, TIMEOUT).await;
+    let report = devenv::detect_in(&env, TIMEOUT).await;
+
+    assert_eq!(report.python.state, RuntimeState::Ok, "{:?}", report.python);
+    assert_eq!(report.python.version.as_deref(), Some("3.13.14"));
 }
 
 #[tokio::test]

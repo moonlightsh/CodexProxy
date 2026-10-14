@@ -167,19 +167,32 @@ pub async fn remove_legacy_env_block(
     state.finish(result).await
 }
 
-/// 开关开机自启（写当前用户 Run 注册表项，带 `--minimized`），并记录到状态文件。
+/// 开关开机自启（Windows 写当前用户 Run 注册表项，macOS 写 LaunchAgent，都带 `--minimized`），
+/// 并记录到状态文件。
+///
+/// 打开前先检查安装位置：从临时位置（dmg、App Translocation）运行时直接拒绝，不调用系统
+/// 自启插件，避免把临时路径写进 LaunchAgent。core 的门控作为第二道防线保留。
 #[tauri::command]
 pub async fn set_autostart(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<Status, ErrorPayload> {
-    if let Err(message) = apply_system_autostart(&app, enabled) {
-        log::event(
-            "desktop.set_autostart",
-            json!({ "enabled": enabled, "ok": false }),
-        );
-        return Err(autostart_error(&message));
+    let install_location_ok = if enabled {
+        state.manager.status().await.install_location_ok
+    } else {
+        true
+    };
+    if let Err(error) = apply_autostart_checked(enabled, install_location_ok, |on| {
+        apply_system_autostart(&app, on)
+    }) {
+        let fields = if error.code == "installLocation" {
+            json!({ "enabled": enabled, "ok": false, "code": error.code })
+        } else {
+            json!({ "enabled": enabled, "ok": false })
+        };
+        log::event("desktop.set_autostart", fields);
+        return Err(error);
     }
     let result = state.manager.set_autostart_flag(enabled).await;
     state.finish(result).await
@@ -204,7 +217,7 @@ pub async fn detect_dev_env() -> DevEnvReport {
 }
 
 /// 让系统自启项与期望一致。已一致时不动（Windows 删除不存在的注册表值会报错）。
-fn apply_system_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
+pub(crate) fn apply_system_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let autolaunch = app.autolaunch();
     if autolaunch.is_enabled().ok() == Some(enabled) {
         return Ok(());
@@ -215,6 +228,25 @@ fn apply_system_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> 
         autolaunch.disable()
     };
     result.map_err(|error| error.to_string())
+}
+
+/// 开机自启的安装位置预检：只有打开且安装位置不对时拒绝；关闭总是放行（撤销流程要用）。
+fn autostart_precheck(enabled: bool, install_location_ok: bool) -> Result<(), ErrorPayload> {
+    if enabled && !install_location_ok {
+        return Err(ManagerError::InstallLocation.into());
+    }
+    Ok(())
+}
+
+/// 先做安装位置预检，通过后才调用系统自启插件（`apply_system`）。预检失败时不调用插件；
+/// 插件的错误映射为 `internal`。
+pub(crate) fn apply_autostart_checked(
+    enabled: bool,
+    install_location_ok: bool,
+    apply_system: impl FnOnce(bool) -> Result<(), String>,
+) -> Result<(), ErrorPayload> {
+    autostart_precheck(enabled, install_location_ok)?;
+    apply_system(enabled).map_err(|message| autostart_error(&message))
 }
 
 /// 自启插件失败统一映射为 `internal`。
@@ -234,5 +266,48 @@ mod tests {
         let payload = autostart_error("拒绝访问");
         assert_eq!(payload.code, "internal");
         assert_eq!(payload.message, "开机自启设置失败：拒绝访问");
+    }
+
+    #[test]
+    fn autostart_on_rejected_from_transient_location() {
+        let e = autostart_precheck(true, false).unwrap_err();
+        assert_eq!(e.code, "installLocation");
+        assert_eq!(
+            e.message,
+            "请先把 CodexHelper 拖到「应用程序」文件夹，再从那里打开"
+        );
+        for (on, ok) in [(true, true), (false, false), (false, true)] {
+            assert!(autostart_precheck(on, ok).is_ok(), "{on} {ok}");
+        }
+    }
+
+    #[test]
+    fn checked_autostart_skips_plugin_when_precheck_fails() {
+        let mut calls = Vec::new();
+        let e = apply_autostart_checked(true, false, |on| {
+            calls.push(on);
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(e.code, "installLocation");
+        assert!(calls.is_empty(), "预检失败时不得调用自启插件");
+    }
+
+    #[test]
+    fn checked_autostart_calls_plugin_and_maps_its_error() {
+        for (on, ok) in [(true, true), (false, false), (false, true)] {
+            let mut calls = Vec::new();
+            apply_autostart_checked(on, ok, |v| {
+                calls.push(v);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls, [on]);
+        }
+        let e = apply_autostart_checked(false, true, |_| Err("拒绝访问".into())).unwrap_err();
+        assert_eq!(
+            (e.code.as_str(), e.message.as_str()),
+            ("internal", "开机自启设置失败：拒绝访问")
+        );
     }
 }

@@ -41,4 +41,5 @@ async fn cmd_shims_in_dir_with_spaces_are_detected() {
         "{:?}",
         report.npm_mirror
     );
+    assert!(report.platform_supported);
 }

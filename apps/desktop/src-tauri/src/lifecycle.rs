@@ -3,6 +3,8 @@
 //! - 关闭按钮只隐藏到托盘；托盘“退出”才真正结束进程。
 //! - 退出前若受管模式已启用且 Codex 引擎在运行，弹窗确认：退出后 Codex 请求将失败（fail-closed）。
 //! - 任何退出路径都尽力停止本进程的代理（不改配置）。
+//! - 托盘“退出”与“撤销配置并退出”（见 [`crate::revoke`]）共用一把互斥，任一流程进行中时，
+//!   另一个点击直接忽略。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -22,10 +24,22 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// 退出流程的共享状态。
 #[derive(Default)]
 pub struct Lifecycle {
-    /// 托盘“退出”流程进行中（含确认对话框），防止重复弹窗
+    /// 托盘“退出”或“撤销配置并退出”流程进行中（含确认对话框），防止重复弹窗
     quitting: AtomicBool,
     /// 已执行过代理停止
     shut_down: AtomicBool,
+}
+
+impl Lifecycle {
+    /// 开始一次退出类流程；已有流程进行中时返回 `false`，调用方应直接忽略本次点击。
+    pub fn try_begin_exit(&self) -> bool {
+        !self.quitting.swap(true, Ordering::SeqCst)
+    }
+
+    /// 退出类流程未退出而结束（取消或失败），释放互斥。
+    pub fn end_exit_attempt(&self) {
+        self.quitting.store(false, Ordering::SeqCst);
+    }
 }
 
 /// 是否需要退出确认：只有受管模式已启用且 Codex 在运行时，退出才会让 Codex 请求失败。
@@ -62,22 +76,27 @@ pub fn request_quit(app: &AppHandle) {
     let Some(lifecycle) = app.try_state::<Lifecycle>() else {
         return;
     };
-    if lifecycle.quitting.swap(true, Ordering::SeqCst) {
+    if !lifecycle.try_begin_exit() {
         return;
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         if confirm_quit_if_needed(&app).await {
             log::event("desktop.quit", json!({ "confirmed": true }));
-            shutdown_once(&app).await;
-            app.exit(0);
+            exit_after_shutdown(&app).await;
         } else {
             log::event("desktop.quit", json!({ "confirmed": false }));
             if let Some(lifecycle) = app.try_state::<Lifecycle>() {
-                lifecycle.quitting.store(false, Ordering::SeqCst);
+                lifecycle.end_exit_attempt();
             }
         }
     });
+}
+
+/// 停止代理后结束进程。不弹 Codex 运行确认（调用方已确认过）。
+pub async fn exit_after_shutdown(app: &AppHandle) {
+    shutdown_once(app).await;
+    app.exit(0);
 }
 
 /// 返回是否继续退出。
@@ -143,5 +162,14 @@ mod tests {
         assert!(!should_confirm_quit(true, false));
         assert!(!should_confirm_quit(false, true));
         assert!(!should_confirm_quit(false, false));
+    }
+
+    #[test]
+    fn exit_attempt_is_exclusive_until_ended() {
+        let l = Lifecycle::default();
+        assert!(l.try_begin_exit());
+        assert!(!l.try_begin_exit());
+        l.end_exit_attempt();
+        assert!(l.try_begin_exit());
     }
 }

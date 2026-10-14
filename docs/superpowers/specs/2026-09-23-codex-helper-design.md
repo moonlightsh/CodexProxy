@@ -36,7 +36,8 @@ CodexHelper 只保留其中最小可用的部分，做成一个独立的单窗�
 
 - 不做 PAC，不接管 Codex 启动，不注入 `--proxy-pac-url` / `--proxy-server`。
 - 不处理 Codex 界面层（`ChatGPT.exe` Chromium）的流量入口，见 §9。
-- 不支持 macOS / Linux 正式使用（macOS 仅作开发调试）。
+- 不支持 macOS / Linux 正式使用（macOS 仅作开发调试）。第二阶段已将 macOS 纳入支持，见
+  `2026-10-14-codex-helper-macos-design.md`。
 - 不支持修改网关、SOCKS5、端口或规则；不在运行时下载规则。
 - 不修改 Windows 系统代理。
 - 不做诊断包导出、多语言（界面仅中文）。内部升级渠道见 §15（第一阶段之后新增，可选启用）。

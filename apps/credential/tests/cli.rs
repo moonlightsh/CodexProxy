@@ -3,12 +3,13 @@
 //!
 //! 刻意不在这里测试两类会真实读写凭据存储的路径：
 //! - `get` 的合法路径（合法 target 会真的读取凭据存储；Windows 上即真实 Credential
-//!   Manager）——只验证非法 target 在到达凭据存储之前就被拒绝，这一点不涉及平台差异，
-//!   在任何系统上跑都是安全的；
+//!   Manager，macOS 上即登录钥匙串）——只验证非法 target 在到达凭据存储之前就被拒绝，
+//!   这一点不涉及平台差异，在任何系统上跑都是安全的；
 //! - `cleanup --purge-key`（带删除语义的合法路径）——`SystemCredentialStore::managed()`
 //!   固定使用 `consts::CREDENTIAL_TARGET`，没有任何环境变量能重定向它（`CODEX_HOME` /
-//!   `CODEX_HELPER_DATA_DIR` 只重定向文件路径），因此在 Windows 上执行它会真的删除当前
-//!   用户 Credential Manager 里 `codex-helper/managed-gateway` 这个受管条目；这一点与
+//!   `CODEX_HELPER_DATA_DIR` 只重定向文件路径），因此在 Windows 与 macOS 上执行它会真的
+//!   删除当前用户系统凭据存储（Credential Manager / 钥匙串）里
+//!   `codex-helper/managed-gateway` 这个受管条目；这一点与
 //!   `get` 禁止二进制级测试的理由完全对称，而且删除比读取破坏性更大。`--purge-key` 的
 //!   删除语义改由 `src/main.rs` 中基于 `MemoryCredentialStore` 的单元测试覆盖
 //!   （`cleanup_with_purge_key_deletes_credential` 等）。
@@ -137,14 +138,13 @@ fn cleanup_reconciles_real_files_in_subprocess() {
     );
 }
 
-// `cleanup --purge-key` 的合法（删除）路径刻意不在二进制级测试中执行：`SystemCredentialStore::
-// managed()` 固定使用 `consts::CREDENTIAL_TARGET`，没有环境变量能重定向凭据 target；在 Windows
-// 上这会真的删除当前用户 Credential Manager 里的受管条目。非 Windows 平台的 `SystemCredentialStore`
-// 是仅存在于子进程内存中的开发态实现（见 `credential` 模块文档：“这张表只存在于当前进程的内存
-// 中……读不到本进程写入的任何内容”），换一个进程（这里的子进程）看到的是空表，因此在非 Windows
-// 上执行是安全的；但为了让本测试套件在任何平台上的行为都一致、不依赖这一平台差异细节，仍然
-// 用 `#[cfg(not(windows))]` 显式限定，避免将来有人在 Windows CI 上启用了真实凭据后误删。
-#[cfg(not(windows))]
+// `cleanup --purge-key` 的合法（删除）路径刻意不在 Windows 与 macOS 上的二进制级测试中执行：
+// `SystemCredentialStore::managed()` 固定使用 `consts::CREDENTIAL_TARGET`，没有环境变量能重定向
+// 凭据 target；Windows 与 macOS 上都是真实系统存储（Credential Manager / 登录钥匙串），执行它会
+// 真的读取并删除当前用户的受管条目（设计 §3.3 硬性规则）。其他平台的 `SystemCredentialStore`
+// 是仅存在于子进程内存中的开发态实现（见 `credential` 模块文档），换一个进程（这里的子进程）
+// 看到的是空表，执行是安全的，因此只在这些平台上运行。
+#[cfg(not(any(windows, target_os = "macos")))]
 #[test]
 fn cleanup_with_purge_key_succeeds_when_nothing_exists() {
     let codex_home = tempfile::tempdir().unwrap();

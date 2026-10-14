@@ -146,6 +146,27 @@ pub fn has_residue(config_path: &Path) -> Result<bool, ConfigError> {
         || doc.get(MODEL_PROVIDER_KEY).and_then(Item::as_str) == Some(consts::PROVIDER_ID))
 }
 
+/// 只读取出受管节当前的 `auth.command`（`model_providers.managed_gateway.auth.command`）。
+///
+/// 文件不存在，或 `model_providers`、受管节、`auth` 缺失 / 不是 table-like，或 `command` 缺失、
+/// 不是字符串、为空串时返回 `Ok(None)`；无法解析时返回 `ConfigError::Parse`（同 [`load`]）。
+/// 与 [`has_residue`] 一样对结构宽松，只读不写；结构是否可校正仍由随后的 [`apply_managed`] 判定。
+pub fn managed_command(config_path: &Path) -> Result<Option<String>, ConfigError> {
+    let LoadedConfig { doc, .. } = load(config_path)?;
+    let command = doc
+        .get(MODEL_PROVIDERS_KEY)
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(consts::PROVIDER_ID))
+        .and_then(Item::as_table_like)
+        .and_then(|provider| provider.get(AUTH_KEY))
+        .and_then(Item::as_table_like)
+        .and_then(|auth| auth.get("command"))
+        .and_then(Item::as_str)
+        .filter(|command| !command.is_empty())
+        .map(str::to_string);
+    Ok(command)
+}
+
 /// 校正受管内容（幂等）：
 ///
 /// - `model_provider = "managed_gateway"`；
@@ -1083,6 +1104,60 @@ mod tests {
         assert!(outcome.changed);
         assert!(config.exists());
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn managed_command_reads_current_auth_command() {
+        let fixture = Fixture::new();
+        assert_eq!(managed_command(&fixture.config).unwrap(), None);
+        fixture.apply(COMMAND).unwrap();
+        assert_eq!(
+            managed_command(&fixture.config).unwrap().as_deref(),
+            Some(COMMAND)
+        );
+        let windows =
+            "C:\\Users\\张三\\AppData\\Local\\Programs\\CodexHelper\\codex-helper-credential.exe";
+        fixture.apply(windows).unwrap();
+        assert_eq!(
+            managed_command(&fixture.config).unwrap().as_deref(),
+            Some(windows)
+        );
+    }
+
+    #[test]
+    fn managed_command_is_none_without_usable_command() {
+        for text in [
+            "model = \"x\"\n",
+            "[model_providers.managed_gateway]\nname = \"x\"\n",
+            "[model_providers.managed_gateway.auth]\nargs = []\n",
+            "[model_providers.managed_gateway.auth]\ncommand = 1\n",
+            "[model_providers.managed_gateway.auth]\ncommand = \"\"\n",
+            "model_providers = 1\n",
+        ] {
+            let fixture = Fixture::with(text);
+            assert_eq!(managed_command(&fixture.config).unwrap(), None, "{text}");
+        }
+        let fixture =
+            Fixture::with("[model_providers.managed_gateway]\nauth = { command = \"x\" }\n");
+        assert_eq!(
+            managed_command(&fixture.config).unwrap().as_deref(),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn managed_command_rejects_unparsable_config() {
+        for text in ["model = [\n", "model_provider = 1\n"] {
+            let fixture = Fixture::with(text);
+            assert!(
+                matches!(
+                    managed_command(&fixture.config),
+                    Err(ConfigError::Parse { .. })
+                ),
+                "{text}"
+            );
+            assert_eq!(fixture.read(), text, "只读不写");
+        }
     }
 
     #[test]
