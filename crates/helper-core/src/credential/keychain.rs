@@ -88,6 +88,28 @@ pub(crate) fn add_command_line(service: &str, account: &str, token: &str) -> Str
     )
 }
 
+/// 经 stdin 送给 `security -i` 的单行命令长度上限（字节，含引号、转义与末尾换行）。
+///
+/// `security -i` 每读约 4095 字节就把输入切成一行，超出部分会被当成下一条命令执行
+/// （而且被截断的第一条 `add-generic-password -U` 仍会生效，覆盖原 Key）。上限取 2048，
+/// 远低于切分长度；Key 实际只有几十字节。
+pub(crate) const MAX_COMMAND_LINE_BYTES: usize = 2048;
+
+/// 写入命令行：先做字符校验，再按转义后的整行长度做上限校验，通过才返回 [`add_command_line`]。
+/// 必须在启动子进程前调用；错误信息不含 Token。
+pub(crate) fn write_command_line(
+    service: &str,
+    account: &str,
+    token: &str,
+) -> anyhow::Result<String> {
+    validate_token(token)?;
+    let line = add_command_line(service, account, token);
+    if line.len() > MAX_COMMAND_LINE_BYTES {
+        anyhow::bail!("凭据过长：超过钥匙串单条上限（{MAX_COMMAND_LINE_BYTES} 字节）");
+    }
+    Ok(line)
+}
+
 fn op_error(op: KeychainOp, code: Option<i32>) -> anyhow::Error {
     match code {
         Some(code) => anyhow::anyhow!("钥匙串{}失败（security 退出码 {code}）", op.name()),
@@ -239,8 +261,7 @@ pub(super) fn read(service: &str) -> anyhow::Result<Option<String>> {
 /// 写入（覆盖）service 对应条目。Token 经 stdin 送给 `security -i`，不出现在 argv。
 #[cfg(target_os = "macos")]
 pub(super) fn write(service: &str, token: &str) -> anyhow::Result<()> {
-    validate_token(token)?;
-    let line = add_command_line(service, consts::KEYCHAIN_ACCOUNT, token);
+    let line = write_command_line(service, consts::KEYCHAIN_ACCOUNT, token)?;
     let output = run_security(KeychainOp::Write, &["-i"], Some(line.as_bytes()))?;
     map_write_exit(output.code)
 }
@@ -331,6 +352,67 @@ mod tests {
         assert_eq!(
             add_command_line("svc/x", "acct", r#"k"\1"#),
             "add-generic-password -U -a \"acct\" -s \"svc/x\" -w \"k\\\"\\\\1\"\n"
+        );
+    }
+
+    /// 整行（含引号、转义与换行）恰好到上限时放行，多 1 字节即拒绝；错误信息不含 Token。
+    #[test]
+    fn write_command_line_enforces_length_limit() {
+        let overhead = add_command_line("svc/x", "acct", "").len();
+        let fits = "a".repeat(MAX_COMMAND_LINE_BYTES - overhead);
+        let line = write_command_line("svc/x", "acct", &fits).unwrap();
+        assert_eq!(line.len(), MAX_COMMAND_LINE_BYTES);
+        assert_eq!(line, add_command_line("svc/x", "acct", &fits));
+
+        let over = "a".repeat(MAX_COMMAND_LINE_BYTES - overhead + 1);
+        let err = write_command_line("svc/x", "acct", &over)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!("凭据过长：超过钥匙串单条上限（{MAX_COMMAND_LINE_BYTES} 字节）")
+        );
+        assert!(!err.contains("aaaa"), "{err}");
+    }
+
+    /// 上限按转义后的长度计算：反斜杠、双引号会翻倍。
+    #[test]
+    fn write_command_line_counts_escaped_length() {
+        let overhead = add_command_line("svc/x", "acct", "").len();
+        let half = (MAX_COMMAND_LINE_BYTES - overhead) / 2;
+        assert!(write_command_line("svc/x", "acct", &"\\".repeat(half)).is_ok());
+        assert!(write_command_line("svc/x", "acct", &"\\".repeat(half + 1)).is_err());
+        assert!(write_command_line("svc/x", "acct", &"\"".repeat(half + 1)).is_err());
+        // 原始长度远低于上限，但转义后超限
+        assert!(write_command_line("svc/x", "acct", &"\\".repeat(1100)).is_err());
+    }
+
+    /// `security -i` 约每 4095 字节切一行：超长 Key 的尾部会被当成下一条命令执行，必须在
+    /// 启动子进程前拒绝。上限要明显低于这个切分长度。
+    #[test]
+    fn write_command_line_rejects_split_injection_payload() {
+        const SECURITY_LINE_SPLIT: usize = 4095;
+        const { assert!(MAX_COMMAND_LINE_BYTES < SECURITY_LINE_SPLIT) };
+        for n in [4000, 4095 - 60, 5000, 20_000] {
+            let token = format!("{}list-keychains", "a".repeat(n));
+            assert!(write_command_line("svc/x", "acct", &token).is_err(), "{n}");
+        }
+    }
+
+    /// 字符校验仍先于长度校验。
+    #[test]
+    fn write_command_line_validates_token_first() {
+        assert_eq!(
+            write_command_line("svc/x", "acct", "a\nb")
+                .unwrap_err()
+                .to_string(),
+            "凭据只能包含可打印 ASCII 字符"
+        );
+        assert_eq!(
+            write_command_line("svc/x", "acct", "")
+                .unwrap_err()
+                .to_string(),
+            "凭据不能为空"
         );
     }
 

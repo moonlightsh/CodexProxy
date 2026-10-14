@@ -599,6 +599,35 @@ mod keychain_tests {
         assert_eq!(store.read().unwrap().unwrap().expose(), token);
     }
 
+    /// 超长或转义后超长的 Key 在启动 `security` 前被拒绝，原 Key 保持不变；尾部带命令名的
+    /// 注入载荷也不会被执行。上限以内的最长 Key 能完整写入并读回。
+    #[test]
+    fn keychain_rejects_overlong_token_and_keeps_previous() {
+        let (store, _guard) = temp_store();
+        store.write("hk-old").unwrap();
+        for token in [
+            "a".repeat(5000),
+            format!("{}list-keychains", "a".repeat(4000)),
+            "\\".repeat(1100),
+            "a".repeat(20_000),
+        ] {
+            let err = store.write(&token).unwrap_err().to_string();
+            assert!(err.starts_with("凭据过长"), "{err}");
+            assert!(!err.contains("aaaa") && !err.contains("\\\\"), "{err}");
+            assert_eq!(store.read().unwrap().unwrap().expose(), "hk-old");
+        }
+    }
+
+    #[test]
+    fn keychain_longest_allowed_token_round_trip() {
+        let (store, _guard) = temp_store();
+        let service = store.target.clone();
+        let overhead = keychain::add_command_line(&service, consts::KEYCHAIN_ACCOUNT, "").len();
+        let token = "k".repeat(keychain::MAX_COMMAND_LINE_BYTES - overhead);
+        store.write(&token).unwrap();
+        assert_eq!(store.read().unwrap().unwrap().expose(), token);
+    }
+
     #[test]
     fn keychain_rejects_unsafe_token_without_writing() {
         let (store, _guard) = temp_store();
