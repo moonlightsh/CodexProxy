@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { classifyKeyError } from "./errors.ts";
+import { classifyKeyError, INVALID_KEY_CHARS_MESSAGE } from "./errors.ts";
 import type { ErrorCode } from "./types.ts";
 
-const INLINE: ErrorCode[] = ["emptyKey", "keyRejected"];
+const INLINE: ErrorCode[] = ["emptyKey", "keyRejected", "invalidKeyChars"];
 const MESSAGE_ONLY: ErrorCode[] = [
   "credentialMissing",
   "portUnavailable",
@@ -12,9 +12,10 @@ const MESSAGE_ONLY: ErrorCode[] = [
   "credential",
   "io",
   "internal",
+  "installLocation",
 ];
 
-test("emptyKey / keyRejected 就地提示", () => {
+test("emptyKey / keyRejected / invalidKeyChars 就地提示", () => {
   for (const code of INLINE) {
     assert.equal(classifyKeyError({ code, message: "x" }), "inline");
   }
@@ -35,4 +36,8 @@ test("其余错误码只展示 message", () => {
   for (const code of MESSAGE_ONLY) {
     assert.equal(classifyKeyError({ code, message: "x" }), "message");
   }
+});
+
+test("invalidKeyChars 文案与 Rust 侧一致", () => {
+  assert.equal(INVALID_KEY_CHARS_MESSAGE, "Key 只能包含英文字母、数字和符号");
 });

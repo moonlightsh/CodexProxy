@@ -75,8 +75,15 @@ pub struct ConnectionRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
-    /// Windows 为 true；其他平台为开发模式（界面顶部横幅）
+    /// Windows 与 macOS 为 true；其他平台为开发模式（界面顶部横幅）
     pub platform_supported: bool,
+    /// 平台标识：`"windows"` / `"macos"` / `"other"`
+    pub platform: String,
+    /// 是否支持内部升级（仅 Windows 为 true；为 false 时界面隐藏升级区域）
+    pub update_supported: bool,
+    /// 安装位置是否正常；macOS 上从 dmg 或 App Translocation 临时路径运行时为 false，
+    /// 其他平台恒为 true
+    pub install_location_ok: bool,
     /// 受管模式开关（状态文件 `enabled`）
     pub enabled: bool,
     /// 凭据是否已保存（不回显 Key）
@@ -208,6 +215,10 @@ pub enum ManagerError {
     Io { message: String },
     #[error("{message}")]
     Internal { message: String },
+    #[error("Key 只能包含英文字母、数字和符号")]
+    InvalidKeyChars,
+    #[error("请先把 CodexHelper 拖到「应用程序」文件夹，再从那里打开")]
+    InstallLocation,
 }
 
 impl ManagerError {
@@ -224,6 +235,8 @@ impl ManagerError {
             Self::Credential { .. } => "credential",
             Self::Io { .. } => "io",
             Self::Internal { .. } => "internal",
+            Self::InvalidKeyChars => "invalidKeyChars",
+            Self::InstallLocation => "installLocation",
         }
     }
 
@@ -272,11 +285,36 @@ mod tests {
     fn dto_fields_serialize_as_camel_case() {
         let json = serde_json::to_value(Status::default()).unwrap();
         assert!(json.get("platformSupported").is_some());
+        assert!(json.get("platform").is_some());
+        assert!(json.get("updateSupported").is_some());
+        assert!(json.get("installLocationOk").is_some());
         assert!(json.get("modelCatalogJson").is_some());
         let request: EnableRequest =
             serde_json::from_str(r#"{"key":"k","forceSave":true,"confirmRemoveCatalog":true}"#)
                 .unwrap();
         assert!(request.force_save && request.confirm_remove_catalog);
+    }
+
+    #[test]
+    fn new_error_variants_have_stable_codes_and_fixed_copy() {
+        for (error, code, message) in [
+            (
+                ManagerError::InvalidKeyChars,
+                "invalidKeyChars",
+                "Key 只能包含英文字母、数字和符号",
+            ),
+            (
+                ManagerError::InstallLocation,
+                "installLocation",
+                "请先把 CodexHelper 拖到「应用程序」文件夹，再从那里打开",
+            ),
+        ] {
+            assert_eq!(error.code(), code);
+            assert_eq!(error.to_string(), message);
+            let payload = error.payload();
+            assert_eq!(payload.code, code);
+            assert_eq!(payload.message, message);
+        }
     }
 
     #[test]

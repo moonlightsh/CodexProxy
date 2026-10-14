@@ -11,10 +11,14 @@ import {
   formatProxyStateLabel,
   formatReachabilityLabel,
   formatRouteLabel,
+  INSTALL_LOCATION_MESSAGE,
+  installLocationBanner,
   isFirstRun,
   keySubmitAction,
   proxyStateLevel,
   reachabilityLevel,
+  showUpdatePanel,
+  uninstallHint,
 } from "./format.ts";
 
 test("formatProxyStateLabel 覆盖三种代理状态", () => {
@@ -81,4 +85,25 @@ test("keySubmitAction 覆盖首次运行 / needsKey / 已配置已启用 / 已�
   assert.equal(keySubmitAction({ keyConfigured: true }), "saveKey");
   // 已配置但未启用：同样是“重新录入” → saveKey
   assert.equal(keySubmitAction({ keyConfigured: true }), "saveKey");
+});
+
+test("安装位置不对时显示横幅，文案与 Rust 侧一致", () => {
+  assert.equal(
+    installLocationBanner({ installLocationOk: false }),
+    "请先把 CodexHelper 拖到「应用程序」文件夹，再从那里打开",
+  );
+  assert.equal(installLocationBanner({ installLocationOk: true }), null);
+  assert.equal(INSTALL_LOCATION_MESSAGE, "请先把 CodexHelper 拖到「应用程序」文件夹，再从那里打开");
+});
+
+test("只有 macOS 显示卸载前提示", () => {
+  assert.equal(uninstallHint({ platform: "macos" }), "卸载前请先在菜单栏选择「撤销配置并退出」");
+  assert.equal(uninstallHint({ platform: "windows" }), null);
+  assert.equal(uninstallHint({ platform: "other" }), null);
+});
+
+test("只有支持内部升级时显示升级区", () => {
+  assert.equal(showUpdatePanel(null), false);
+  assert.equal(showUpdatePanel({ updateSupported: false }), false);
+  assert.equal(showUpdatePanel({ updateSupported: true }), true);
 });

@@ -31,6 +31,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const KEY: &str = "hk-TEST-7f3a9c2e5b1d4a60";
 const OLD_KEY: &str = "hk-OLD-0c4e8a2f6b9d1e37";
 const COMMAND: &str = "C:\\Program Files\\CodexHelper\\codex-helper-credential.exe";
+/// macOS App Translocation 下的凭据程序路径（临时安装位置）。
+const TRANSIENT_COMMAND: &str = "/private/var/folders/zz/abc/T/AppTranslocation/8E1A-44F2/d/CodexHelper.app/Contents/MacOS/codex-helper-credential";
+/// 直接在 dmg 里运行时的凭据程序路径（临时安装位置）。
+const VOLUME_COMMAND: &str =
+    "/Volumes/CodexHelper/CodexHelper.app/Contents/MacOS/codex-helper-credential";
 
 /// 真实感夹具：注释、行尾注释、其他 provider、projects、plugins。
 const USER_CONFIG: &str = r#"# 用户的 Codex 配置
@@ -647,6 +652,62 @@ async fn save_key_validates_and_leaves_files_alone() {
     assert_eq!(sandbox.snapshot(), before, "save_key 不改任何文件");
     assert_eq!(status.proxy.state, ProxyState::Stopped);
     sandbox.assert_no_key_on_disk();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_key_chars_are_rejected_before_gateway_and_writes() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let manager = sandbox.manager();
+    let before = sandbox.snapshot();
+    for key in ["hk 1", "hk-中文", "hk-a\nb", "hk-\u{7f}", "\u{e9}"] {
+        let error = assert_code(manager.enable(with_key(key)).await, "invalidKeyChars");
+        assert_eq!(error.to_string(), "Key 只能包含英文字母、数字和符号");
+        assert!(!error.to_string().contains(key), "{error}");
+        let error = assert_code(
+            manager
+                .save_key(SaveKeyRequest {
+                    key: key.into(),
+                    force_save: true,
+                })
+                .await,
+            "invalidKeyChars",
+        );
+        assert_eq!(error.to_string(), "Key 只能包含英文字母、数字和符号");
+        assert!(!error.to_string().contains(key), "{error}");
+    }
+    // 空值判定在字符校验之前
+    assert_code(manager.enable(with_key("   \n")).await, "emptyKey");
+    assert_code(
+        manager
+            .save_key(SaveKeyRequest {
+                key: "   \n".into(),
+                force_save: true,
+            })
+            .await,
+        "emptyKey",
+    );
+    assert_eq!(sandbox.snapshot(), before);
+    assert_eq!(sandbox.gateway_hits().await, 0, "字符校验应在访问网关之前");
+    assert_eq!(sandbox.credential(), None);
+    assert!(port_is_free(sandbox.port).await);
+}
+
+#[tokio::test]
+async fn printable_symbols_in_key_are_accepted() {
+    let sandbox = Sandbox::new().await;
+    let manager = sandbox.manager();
+    let key = r#"hk-A\B"C'D$E;F#G!`{}|~"#;
+    let status = manager
+        .save_key(SaveKeyRequest {
+            key: format!("\n{key}\n"),
+            force_save: false,
+        })
+        .await
+        .unwrap();
+    assert!(status.key_configured);
+    assert_eq!(sandbox.credential().as_deref(), Some(key));
 }
 
 // ---- 4. model_catalog_json ----
@@ -1634,7 +1695,24 @@ async fn status_reports_static_fields_and_file_inspection() {
     sandbox.write_config(CATALOG_CONFIG);
     let manager = sandbox.manager();
     let status = manager.status().await;
-    assert_eq!(status.platform_supported, cfg!(windows));
+    let expected = if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "other"
+    };
+    assert_eq!(status.platform, expected);
+    assert_eq!(status.platform, consts::PLATFORM);
+    assert_eq!(
+        status.platform_supported,
+        cfg!(any(windows, target_os = "macos"))
+    );
+    assert_eq!(status.update_supported, cfg!(windows));
+    assert!(
+        status.install_location_ok,
+        "测试用 COMMAND 不是临时安装位置"
+    );
     assert!(!status.enabled && !status.key_configured && !status.needs_key);
     assert_eq!(
         status.proxy,
@@ -1714,6 +1792,7 @@ fn manager_futures_are_send() {
     assert_send(&manager.set_autostart_flag(true));
     assert_send(&manager.probe_reachability());
     assert_send(&manager.shutdown());
+    assert_send(&manager.revoke_managed_config());
 }
 
 #[test]
@@ -1998,4 +2077,251 @@ async fn enable_rechecks_preflight_after_key_check() {
     assert_eq!(sandbox.snapshot(), before);
     assert_eq!(sandbox.credential(), None);
     assert!(port_is_free(sandbox.port).await);
+}
+
+// ---- 19. 安装位置 ----
+
+#[cfg(target_os = "macos")]
+const INSTALL_LOCATION_MESSAGE: &str = "请先把 CodexHelper 拖到「应用程序」文件夹，再从那里打开";
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn status_flags_transient_install_location() {
+    let sandbox = Sandbox::new().await;
+    for command in [TRANSIENT_COMMAND, VOLUME_COMMAND] {
+        let manager = Manager::new(sandbox.options_with(command));
+        assert!(!manager.status().await.install_location_ok, "{command}");
+    }
+    assert!(sandbox.manager().status().await.install_location_ok);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enable_from_transient_location_is_rejected_without_writes() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let before = sandbox.snapshot();
+
+    let manager = Manager::new(sandbox.options_with(TRANSIENT_COMMAND));
+    let error = assert_code(manager.enable(with_key(KEY)).await, "installLocation");
+    assert_eq!(error.to_string(), INSTALL_LOCATION_MESSAGE);
+
+    sandbox.credentials.write(OLD_KEY).unwrap();
+    assert_code(
+        manager.enable(EnableRequest::default()).await,
+        "installLocation",
+    );
+    let volume = Manager::new(sandbox.options_with(VOLUME_COMMAND));
+    assert_code(volume.enable(with_key(KEY)).await, "installLocation");
+
+    assert_eq!(sandbox.snapshot(), before);
+    assert_eq!(sandbox.gateway_hits().await, 0);
+    assert_eq!(sandbox.credential().as_deref(), Some(OLD_KEY));
+    assert!(port_is_free(sandbox.port).await);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn autostart_on_from_transient_location_is_rejected() {
+    let sandbox = Sandbox::new().await;
+    let manager = Manager::new(sandbox.options_with(TRANSIENT_COMMAND));
+    let error = assert_code(manager.set_autostart_flag(true).await, "installLocation");
+    assert_eq!(error.to_string(), INSTALL_LOCATION_MESSAGE);
+    assert!(!sandbox.state_file().exists());
+    let status = manager.set_autostart_flag(false).await.unwrap();
+    assert!(!status.autostart);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_from_transient_location_keeps_previous_command() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let first = sandbox.manager();
+    first.enable(with_key(KEY)).await.unwrap();
+    first.shutdown().await;
+    let state_before = sandbox.state();
+
+    let manager = Manager::new(sandbox.options_with(TRANSIENT_COMMAND));
+    let status = manager.status().await;
+    assert!(!status.install_location_ok);
+    assert!(status.config_managed, "按旧的 auth.command 判定受管");
+
+    // 制造漂移：base_url 被改、.env 被删
+    let drifted = sandbox
+        .read_config()
+        .replace(consts::GATEWAY_BASE_URL, "http://evil.invalid:1");
+    sandbox.write_config(&drifted);
+    std::fs::remove_file(sandbox.env()).unwrap();
+
+    let report = manager.reconcile_on_startup().await;
+    assert_eq!(report.outcome, ReconcileOutcome::Applied);
+    assert_eq!(report.error, None);
+    assert!(report.status.config_managed && report.status.env_managed);
+    assert!(!report.status.install_location_ok);
+    assert_eq!(report.status.proxy.state, ProxyState::Running);
+    let text = sandbox.read_config();
+    let doc: toml_edit::DocumentMut = text.parse().unwrap();
+    assert_eq!(
+        doc["model_providers"]["managed_gateway"]["auth"]["command"].as_str(),
+        Some(COMMAND)
+    );
+    assert!(!text.contains(TRANSIENT_COMMAND) && !text.contains("evil.invalid"));
+    assert_eq!(sandbox.state(), state_before);
+
+    manager.disable().await.unwrap();
+    assert_eq!(sandbox.read_config(), USER_CONFIG);
+    sandbox.assert_no_key_on_disk();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_from_transient_location_without_managed_command_fails_untouched() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    sandbox.write_state(&HelperState {
+        enabled: true,
+        ..Default::default()
+    });
+    sandbox.credentials.write(KEY).unwrap();
+    let before = sandbox.snapshot();
+
+    let manager = Manager::new(sandbox.options_with(TRANSIENT_COMMAND));
+    let report = manager.reconcile_on_startup().await;
+    assert_eq!(report.outcome, ReconcileOutcome::Failed);
+    assert_eq!(report.error.unwrap().code, "installLocation");
+    assert_eq!(report.status.proxy.state, ProxyState::Stopped);
+    assert_eq!(sandbox.snapshot(), before);
+    assert!(port_is_free(sandbox.port).await);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_location_is_ignored_off_macos() {
+    let sandbox = Sandbox::new().await;
+    for command in [TRANSIENT_COMMAND, VOLUME_COMMAND] {
+        let manager = Manager::new(sandbox.options_with(command));
+        assert!(manager.status().await.install_location_ok, "{command}");
+    }
+    let manager = Manager::new(sandbox.options_with(TRANSIENT_COMMAND));
+    manager.set_autostart_flag(true).await.unwrap();
+    manager.enable(with_key(KEY)).await.unwrap();
+    let doc: toml_edit::DocumentMut = sandbox.read_config().parse().unwrap();
+    assert_eq!(
+        doc["model_providers"]["managed_gateway"]["auth"]["command"].as_str(),
+        Some(TRANSIENT_COMMAND)
+    );
+    manager.shutdown().await;
+}
+
+// ---- 20. 撤销受管配置 ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_restores_config_keeps_key_and_stops_proxy() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.unwrap();
+    manager.set_autostart_flag(true).await.unwrap();
+
+    let status = manager.revoke_managed_config().await.unwrap();
+    assert!(!status.enabled && !status.residue && status.key_configured && status.autostart);
+    assert_eq!(status.proxy.state, ProxyState::Stopped);
+    assert_eq!(
+        read(&sandbox.config()),
+        Some(USER_CONFIG.as_bytes().to_vec())
+    );
+    assert_eq!(read(&sandbox.env()), Some(USER_ENV.as_bytes().to_vec()));
+    assert_eq!(sandbox.credential().as_deref(), Some(KEY), "不删 Key");
+    assert_eq!(
+        sandbox.state(),
+        Some(HelperState {
+            autostart: true,
+            ..Default::default()
+        }),
+        "不改 autostart"
+    );
+    assert!(port_is_free(sandbox.port).await);
+
+    // 幂等
+    let before = sandbox.snapshot();
+    manager.revoke_managed_config().await.unwrap();
+    assert_eq!(sandbox.snapshot(), before);
+    sandbox.assert_no_key_on_disk();
+
+    // 全新环境：什么都不创建
+    let fresh = Sandbox::new().await;
+    let before = fresh.snapshot();
+    fresh.manager().revoke_managed_config().await.unwrap();
+    assert_eq!(fresh.snapshot(), before);
+}
+
+/// 撤销中途 `.env` 块移除失败：返回原错误，配置照常还原；`.env` 块仍在，代理被重新拉起，
+/// Codex 不会指向无人监听的端口。
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_failure_restarts_proxy_when_env_block_remains() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.unwrap();
+    let env_before = read(&sandbox.env());
+
+    let immutable = Immutable::set(&sandbox.env());
+    let error = manager
+        .revoke_managed_config()
+        .await
+        .expect_err(".env 不可替换时撤销应失败");
+    assert_eq!(error.code(), "io", "{error}");
+    assert!(error.to_string().contains(".env"), "{error}");
+    assert_eq!(read(&sandbox.env()), env_before, ".env 未被改动");
+    assert_eq!(
+        read(&sandbox.config()),
+        Some(USER_CONFIG.as_bytes().to_vec()),
+        "cleanup 继续完成配置还原"
+    );
+    assert!(
+        proxy::probe_existing(sandbox.port).await,
+        "代理应被重新拉起"
+    );
+    let status = manager.status().await;
+    assert_eq!(status.proxy.state, ProxyState::Running);
+    // 现有 cleanup 语义：配置还原成功即置为停用，`.env` 块仍在 → 残留
+    assert!(!sandbox.state().unwrap().enabled);
+    assert!(status.residue);
+
+    drop(immutable);
+    let status = manager.revoke_managed_config().await.unwrap();
+    assert_eq!(read(&sandbox.env()), Some(USER_ENV.as_bytes().to_vec()));
+    assert!(!status.residue);
+    assert!(port_is_free(sandbox.port).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_failure_without_env_block_leaves_proxy_stopped() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.unwrap();
+    sandbox.write_config("model = [\n");
+
+    let error = manager
+        .revoke_managed_config()
+        .await
+        .expect_err("配置无法解析时撤销应失败");
+    assert_eq!(error.code(), "configInvalid", "{error}");
+    assert_eq!(
+        read(&sandbox.env()),
+        Some(USER_ENV.as_bytes().to_vec()),
+        "块已移除"
+    );
+    assert!(sandbox.state().unwrap().enabled, "配置未还原：状态保持启用");
+    assert!(port_is_free(sandbox.port).await);
+    assert_eq!(manager.status().await.proxy.state, ProxyState::Stopped);
 }

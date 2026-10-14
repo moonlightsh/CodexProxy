@@ -17,10 +17,16 @@ pub const DEFAULT_PROXY_PORT: u16 = 17891;
 /// 仅供应急覆盖本地代理端口的环境变量；界面不暴露。
 pub const PROXY_PORT_ENV: &str = "CODEX_HELPER_PROXY_PORT";
 
-/// Windows Credential Manager 中的固定凭据 target。
+/// 固定凭据 target：Windows Credential Manager 的 target，macOS 钥匙串条目的 service。
 pub const CREDENTIAL_TARGET: &str = "codex-helper/managed-gateway";
 /// 写入凭据时使用的 UserName 字段。
 pub const CREDENTIAL_USER_NAME: &str = "CodexHelper";
+/// macOS 钥匙串条目的 account（`security -a`）；service 即 [`CREDENTIAL_TARGET`]。
+pub const KEYCHAIN_ACCOUNT: &str = "codex-helper";
+/// macOS 上读写钥匙串使用的系统工具（绝对路径，不查 PATH；设计 §3.1）。
+pub const SECURITY_TOOL: &str = "/usr/bin/security";
+/// 每次调用 `security` 子进程的超时（秒）。
+pub const SECURITY_TIMEOUT_SECS: u64 = 10;
 
 /// `config.toml` 中受管 provider 的 id。
 pub const PROVIDER_ID: &str = "managed_gateway";
@@ -51,8 +57,23 @@ pub const DATA_DIR_NAME: &str = "CodexHelper";
 /// 仅供测试与开发调试覆盖数据目录的环境变量。
 pub const DATA_DIR_ENV: &str = "CODEX_HELPER_DATA_DIR";
 
+/// 当前平台标识（core 内部使用；桌面层与前端一律读 `Status::platform`）。
+pub const PLATFORM: &str = if cfg!(windows) {
+    "windows"
+} else if cfg!(target_os = "macos") {
+    "macos"
+} else {
+    "other"
+};
+
 /// 退出前需要检测的 Codex 引擎进程名（Windows 不区分大小写）。
+#[cfg(windows)]
 pub const CODEX_PROCESS_NAME: &str = "codex.exe";
+
+/// 退出前需要检测的 Codex 引擎进程名。macOS 为实测值；Linux 是开发模式，不检测，
+/// 这个值只为能编译。
+#[cfg(not(windows))]
+pub const CODEX_PROCESS_NAME: &str = "codex";
 
 /// 网关与 SOCKS5 可达性的定时重测间隔（秒）。
 pub const HEALTH_PROBE_INTERVAL_SECS: u64 = 30;
