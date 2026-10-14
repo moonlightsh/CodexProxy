@@ -649,9 +649,9 @@ git commit -F /tmp/codex-helper-p1-msg.txt   # 标题：chore: 版本号升至 0
 | 平台 | `uname -s` 不是 `Darwin` → stderr 中文提示，退出 1 |
 | 工具链 | 与 `check-windows.sh` 相同：`TC="${RUSTUP_HOME:-$HOME/.rustup}/toolchains/stable-aarch64-apple-darwin/bin"` 存在时 `export PATH="$TC:$PATH" RUSTC="$TC/rustc"`（避开只有 aarch64 标准库的 Homebrew rustc；CI 上 dtolnay 装的就是这个工具链） |
 | 预检 | `cargo`、`rustc`、`lipo` 任一不在 PATH → 中文提示，退出 1；`aarch64-apple-darwin`、`x86_64-apple-darwin` 任一不在 `"$(rustc --print sysroot)/lib/rustlib/"` 下 → 提示 `rustup target add --toolchain stable-aarch64-apple-darwin <target>`，退出 1；`apps/desktop/node_modules/.bin/tauri` 不存在 → 提示先 `npm --prefix apps/desktop ci`，退出 1。脚本自己不安装任何东西 |
-| 凭据程序 | 两个 target 各 `cargo build --release -p codex-helper-credential --target <t>`；`lipo -create` 合成到 `apps/desktop/src-tauri/binaries/codex-helper-credential-<后缀>`（后缀按步骤 1 实验结果，设计预期 `universal-apple-darwin`）；`lipo -verify_arch arm64 x86_64` 校验 |
+| 凭据程序 | 两个 target 各 `cargo build --release -p codex-helper-credential --target <t>`；`lipo -create` 合成到 `apps/desktop/src-tauri/binaries/codex-helper-credential-<后缀>`（后缀按步骤 1 实验结果，设计预期 `universal-apple-darwin`）；逐个架构执行 `lipo <文件> -verify_arch arm64` 与 `-verify_arch x86_64` 校验（本机 lipo 一次只接受一个架构） |
 | 打包 | 先删除 `target/universal-apple-darwin/release/bundle/{dmg,macos}` 旧产物（避免旧版本 dmg 被误认）；`cd apps/desktop && npx tauri build --target universal-apple-darwin --config src-tauri/tauri.bundle.conf.json` |
-| 自检 | 定位 `bundle/dmg/*.dmg`，必须恰好 1 个，否则退出 1；对 `.app` 内 `codex-helper` 与 `codex-helper-credential` 执行 `lipo -verify_arch arm64 x86_64`；`codesign --verify --deep --strict` 该 `.app` |
+| 自检 | 定位 `bundle/dmg/*.dmg`，必须恰好 1 个，否则退出 1；对 `.app` 内 `codex-helper` 与 `codex-helper-credential` 逐个架构执行 `lipo <文件> -verify_arch arm64` / `x86_64`；`codesign --verify --deep --strict` 该 `.app` |
 | 输出 | 最后打印 `产物：<dmg 路径>`；若设置了 `GITHUB_OUTPUT`，追加一行 `dmg=<dmg 路径>`（P3 用） |
 
 不在脚本里设置或要求 `TAURI_SIGNING_PRIVATE_KEY`（`createUpdaterArtifacts=false`），不调用 `publish-update.sh`。`binaries/` 与 `target/` 已在 `.gitignore`，脚本跑完 `git status --short` 应为空。
@@ -793,7 +793,7 @@ git diff -U0 pi/macos-mvp -- "$F" | grep -c '^-[^-]'
 
 - [ ] **步骤 2：按 job 约定在 `release.yml` 末尾追加 `macos-release`**，步骤名与注释用中文，风格与 `windows-release` 一致（每步上方一两行说明“为什么”）。
 
-- [ ] **步骤 3：重跑步骤 1 的核验命令确认通过**；另用 P2 留下的产物模拟 CI 输出约定：`GITHUB_OUTPUT=$(mktemp) && CI=true bash scripts/build-macos.sh && cat "$GITHUB_OUTPUT"; rm -f "$GITHUB_OUTPUT"`，期望最后输出 `dmg=` 开头、指向存在的 `CodexHelper_0.2.0_universal.dmg`（增量构建，较快）。CI 实跑在打 tag 后由人工确认，本计划不 push、不打 tag。
+- [ ] **步骤 3：重跑步骤 1 的核验命令确认通过**；另用 P2 留下的产物模拟 CI 输出约定：`export GITHUB_OUTPUT=$(mktemp) && CI=true bash scripts/build-macos.sh && cat "$GITHUB_OUTPUT"; rm -f "$GITHUB_OUTPUT"`，期望最后输出 `dmg=` 开头、指向存在的 `CodexHelper_0.2.0_universal.dmg`（增量构建，较快）。CI 实跑在打 tag 后由人工确认，本计划不 push、不打 tag。
 
 - [ ] **步骤 4：门禁**（见全局约束）
 
