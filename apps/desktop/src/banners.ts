@@ -1,5 +1,6 @@
 // 横幅区：按需显示（设计 §8，任务 3.2 要求 1）。
 import { clear, el } from "./dom";
+import { installLocationBanner } from "./format";
 import type { Status } from "./types";
 
 export interface BannerHandlers {
@@ -18,6 +19,12 @@ export function createBannerRegion(handlers: BannerHandlers): BannerRegion {
   const update = (status: Status, busy: ReadonlySet<string>) => {
     clear(root);
     const banners: HTMLElement[] = [];
+
+    // 从临时位置（dmg、App Translocation）运行：放在最前，首次运行时也显示。
+    const installLocation = installLocationBanner(status);
+    if (installLocation) {
+      banners.push(el("div", { class: "banner banner-error" }, [installLocation]));
+    }
 
     if (!status.platformSupported) {
       banners.push(

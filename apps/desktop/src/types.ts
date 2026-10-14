@@ -4,6 +4,7 @@ export type Route = "socks5" | "direct";
 export type KeyCheck = "ok" | "unauthorized" | "serverError" | "timeoutOrNetwork";
 export type Reachability = "unknown" | "reachable" | "unreachable";
 export type ProxyState = "stopped" | "running" | "external";
+export type Platform = "windows" | "macos" | "other";
 
 export interface ProxyStatus {
   state: ProxyState;
@@ -22,6 +23,12 @@ export interface ConnectionRecord {
 
 export interface Status {
   platformSupported: boolean;
+  /** 运行平台 */
+  platform: Platform;
+  /** 是否支持内部升级（仅 Windows） */
+  updateSupported: boolean;
+  /** 安装位置是否正常；macOS 上从 dmg 或 App Translocation 临时位置运行时为 false */
+  installLocationOk: boolean;
   enabled: boolean;
   keyConfigured: boolean;
   needsKey: boolean;
@@ -54,6 +61,7 @@ export interface SaveKeyRequest {
 
 export type ErrorCode =
   | "emptyKey"
+  | "invalidKeyChars"
   | "keyRejected"
   | "gatewayUnavailable"
   | "credentialMissing"
@@ -63,6 +71,7 @@ export type ErrorCode =
   | "credential"
   | "io"
   | "update"
+  | "installLocation"
   | "internal";
 
 export interface ErrorPayload {

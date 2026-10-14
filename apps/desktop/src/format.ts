@@ -96,3 +96,24 @@ export function formatMs(ms: number): string {
 export function formatHostPort(host: string, port: number): string {
   return `${host}:${port}`;
 }
+
+/** 安装位置不对时的提示（与 Rust 侧 ManagerError::InstallLocation 一致）。 */
+export const INSTALL_LOCATION_MESSAGE = "请先把 CodexHelper 拖到「应用程序」文件夹，再从那里打开";
+
+/** macOS 主窗口底部的卸载前提示。 */
+export const UNINSTALL_HINT = "卸载前请先在菜单栏选择「撤销配置并退出」";
+
+/** 安装位置横幅：从临时位置（dmg、App Translocation）运行时显示。 */
+export function installLocationBanner(status: Pick<Status, "installLocationOk">): string | null {
+  return status.installLocationOk ? null : INSTALL_LOCATION_MESSAGE;
+}
+
+/** 主窗口底部提示：只有 macOS 显示卸载前需先撤销配置。 */
+export function uninstallHint(status: Pick<Status, "platform">): string | null {
+  return status.platform === "macos" ? UNINSTALL_HINT : null;
+}
+
+/** 是否显示升级区：只有支持内部升级时显示；状态未加载时也隐藏，避免 macOS 上闪现。 */
+export function showUpdatePanel(status: Pick<Status, "updateSupported"> | null): boolean {
+  return status?.updateSupported === true;
+}
