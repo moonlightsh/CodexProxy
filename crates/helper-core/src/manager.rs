@@ -742,7 +742,10 @@ impl Manager {
         let runtime = *self.runtime();
 
         Status {
-            platform_supported: cfg!(windows),
+            platform_supported: cfg!(any(windows, target_os = "macos")),
+            platform: consts::PLATFORM.to_string(),
+            update_supported: cfg!(windows),
+            install_location_ok: true,
             enabled: state.enabled,
             key_configured,
             needs_key: state.enabled && !key_configured,

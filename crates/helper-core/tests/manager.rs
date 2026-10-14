@@ -1634,7 +1634,24 @@ async fn status_reports_static_fields_and_file_inspection() {
     sandbox.write_config(CATALOG_CONFIG);
     let manager = sandbox.manager();
     let status = manager.status().await;
-    assert_eq!(status.platform_supported, cfg!(windows));
+    let expected = if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "other"
+    };
+    assert_eq!(status.platform, expected);
+    assert_eq!(status.platform, consts::PLATFORM);
+    assert_eq!(
+        status.platform_supported,
+        cfg!(any(windows, target_os = "macos"))
+    );
+    assert_eq!(status.update_supported, cfg!(windows));
+    assert!(
+        status.install_location_ok,
+        "测试用 COMMAND 不是临时安装位置"
+    );
     assert!(!status.enabled && !status.key_configured && !status.needs_key);
     assert_eq!(
         status.proxy,

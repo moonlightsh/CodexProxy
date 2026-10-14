@@ -57,6 +57,15 @@ pub const DATA_DIR_NAME: &str = "CodexHelper";
 /// 仅供测试与开发调试覆盖数据目录的环境变量。
 pub const DATA_DIR_ENV: &str = "CODEX_HELPER_DATA_DIR";
 
+/// 当前平台标识（core 内部使用；桌面层与前端一律读 `Status::platform`）。
+pub const PLATFORM: &str = if cfg!(windows) {
+    "windows"
+} else if cfg!(target_os = "macos") {
+    "macos"
+} else {
+    "other"
+};
+
 /// 退出前需要检测的 Codex 引擎进程名（Windows 不区分大小写）。
 pub const CODEX_PROCESS_NAME: &str = "codex.exe";
 
