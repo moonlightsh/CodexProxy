@@ -217,7 +217,7 @@ pub async fn detect_dev_env() -> DevEnvReport {
 }
 
 /// 让系统自启项与期望一致。已一致时不动（Windows 删除不存在的注册表值会报错）。
-fn apply_system_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
+pub(crate) fn apply_system_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let autolaunch = app.autolaunch();
     if autolaunch.is_enabled().ok() == Some(enabled) {
         return Ok(());
