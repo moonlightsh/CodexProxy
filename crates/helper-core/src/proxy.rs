@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
 use serde_json::json;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
@@ -28,6 +28,14 @@ use tokio::task::JoinSet;
 use crate::consts;
 use crate::rules::{self, Route};
 use crate::types::ConnectionRecord;
+
+/// 上游传输抽象：直连 TCP 与（后续任务的）TLS 上游统一装箱，转发路径不感知具体类型。
+/// TCP 特有选项（`set_nodelay`）在装箱前设置。
+pub type BoxedTransport = Box<dyn AsyncTransport + Unpin + Send>;
+
+/// 装箱传输的统一接口：合并 `AsyncRead + AsyncWrite`，供 trait object 使用。
+pub trait AsyncTransport: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncTransport for T {}
 
 /// 自识端点路径。
 pub const PROXY_ID_PATH: &str = "/__codex_helper_proxy_id";
@@ -321,7 +329,7 @@ pub async fn connect_via_socks5_at(
     upstream_port: u16,
     host: &str,
     port: u16,
-) -> anyhow::Result<tokio::net::TcpStream> {
+) -> anyhow::Result<BoxedTransport> {
     // 先构造请求：主机名为空或过长时不必连接上游
     let request = build_socks5_connect_request(host, port)?;
     let mut stream = tokio::time::timeout(
@@ -331,13 +339,17 @@ pub async fn connect_via_socks5_at(
     .await
     .map_err(|_| anyhow!("SOCKS5 上游连接超时"))?
     .context("SOCKS5 上游连接失败")?;
+    let _ = stream.set_nodelay(true);
     tokio::time::timeout(SOCKS5_TIMEOUT, socks5_handshake(&mut stream, &request))
         .await
         .map_err(|_| anyhow!("SOCKS5 握手超时"))??;
-    Ok(stream)
+    Ok(Box::new(stream))
 }
 
-async fn socks5_handshake(stream: &mut TcpStream, connect_request: &[u8]) -> anyhow::Result<()> {
+async fn socks5_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    connect_request: &[u8],
+) -> anyhow::Result<()> {
     stream.write_all(&build_socks5_greeting()).await?;
     let mut method_reply = [0u8; 2];
     stream.read_exact(&mut method_reply).await?;
@@ -799,7 +811,6 @@ async fn handle_connection(mut client: TcpStream, shared: Arc<Shared>) {
         pending.finish();
         return respond_and_close(client, BAD_GATEWAY).await;
     };
-    let _ = upstream.set_nodelay(true);
 
     match plain_head {
         None => {
@@ -820,7 +831,7 @@ async fn connect_upstream(
     config: &ProxyConfig,
     target: &ProxyTarget,
     decision: Route,
-) -> anyhow::Result<TcpStream> {
+) -> anyhow::Result<BoxedTransport> {
     match decision {
         Route::Socks5 => {
             connect_via_socks5_at(
@@ -835,7 +846,10 @@ async fn connect_upstream(
     }
 }
 
-async fn connect_direct(config: &ProxyConfig, target: &ProxyTarget) -> anyhow::Result<TcpStream> {
+async fn connect_direct(
+    config: &ProxyConfig,
+    target: &ProxyTarget,
+) -> anyhow::Result<BoxedTransport> {
     let override_addr = config
         .direct_overrides
         .as_ref()
@@ -847,14 +861,16 @@ async fn connect_direct(config: &ProxyConfig, target: &ProxyTarget) -> anyhow::R
             None => TcpStream::connect((target.host.as_str(), target.port)).await,
         }
     };
-    tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, connect)
+    let stream = tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, connect)
         .await
         .map_err(|_| anyhow!("直连目标超时"))?
-        .context("直连目标失败")
+        .context("直连目标失败")?;
+    let _ = stream.set_nodelay(true);
+    Ok(Box::new(stream))
 }
 
 /// CONNECT：回 200 后双向透传，不解密；请求头之后已读入的字节先交给上游。
-async fn tunnel(client: &mut TcpStream, mut upstream: TcpStream, extra: &[u8]) {
+async fn tunnel(client: &mut TcpStream, mut upstream: BoxedTransport, extra: &[u8]) {
     if client.write_all(CONNECTION_ESTABLISHED).await.is_err() {
         return;
     }
@@ -865,7 +881,12 @@ async fn tunnel(client: &mut TcpStream, mut upstream: TcpStream, extra: &[u8]) {
 }
 
 /// 明文转发：发送改写后的请求头与已读入的请求体开头，随后透传，直到上游响应结束（上游关闭）。
-async fn forward_plain(client: &mut TcpStream, mut upstream: TcpStream, head: &[u8], extra: &[u8]) {
+async fn forward_plain(
+    client: &mut TcpStream,
+    mut upstream: BoxedTransport,
+    head: &[u8],
+    extra: &[u8],
+) {
     if upstream.write_all(head).await.is_err() {
         return;
     }
@@ -873,7 +894,7 @@ async fn forward_plain(client: &mut TcpStream, mut upstream: TcpStream, head: &[
         return;
     }
     let (mut client_read, mut client_write) = client.split();
-    let (mut upstream_read, mut upstream_write) = upstream.split();
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream.as_mut());
     let request = async {
         let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
         let _ = upstream_write.shutdown().await;
