@@ -20,3 +20,4 @@ pub mod proxy;
 pub mod rules;
 pub mod state;
 pub mod types;
+pub mod upstream;
