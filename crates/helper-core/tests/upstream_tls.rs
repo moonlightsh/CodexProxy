@@ -196,3 +196,27 @@ async fn missing_client_cert_is_rejected_by_mtls_server() {
     let result = tls.read_exact(&mut buf).await;
     assert!(result.is_err(), "无客户端证书必须被 mTLS 服务端拒绝");
 }
+
+/// 设计 §4.2：首版禁用客户端会话恢复（不作为吊销旁路）。
+/// 复用同一个 connector 连续两次握手，第二次必须仍是完整握手（Full），不得 Resumed；
+/// 第一次握手后读回显，确保服务端下发的 TLS1.3 会话票据已被客户端接收。
+#[tokio::test]
+async fn session_resumption_is_disabled() {
+    let fixture = test_ca();
+    let addr = spawn_mtls_echo_server(&fixture).await.expect("server");
+    let cfg = fixture.client_config("localhost");
+    let connector = cfg.build_connector().expect("connector");
+    for round in 0..2 {
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp");
+        let name = ServerName::try_from("localhost").expect("name");
+        let mut tls = connector.connect(name, tcp).await.expect("handshake");
+        tls.write_all(b"x").await.expect("write");
+        let mut buf = [0u8; 1];
+        tls.read_exact(&mut buf).await.expect("echo");
+        assert_eq!(
+            tls.get_ref().1.handshake_kind(),
+            Some(rustls::HandshakeKind::Full),
+            "第 {round} 次握手必须是完整握手，会话恢复必须禁用"
+        );
+    }
+}

@@ -34,11 +34,11 @@ impl TlsUpstreamConfig {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
 
         let mut roots = rustls::RootCertStore::empty();
-        let ca_count = load_certs(&self.ca_pem, "服务端 CA")?.len();
-        if ca_count == 0 {
+        let ca_certs = load_certs(&self.ca_pem, "服务端 CA")?;
+        if ca_certs.is_empty() {
             anyhow::bail!("服务端 CA 为空：拒绝建立无信任锚的 TLS 连接");
         }
-        for cert in load_certs(&self.ca_pem, "服务端 CA")? {
+        for cert in ca_certs {
             roots
                 .add(cert)
                 .map_err(|_| anyhow::anyhow!("服务端 CA 证书无法加入信任锚"))?;
@@ -50,12 +50,16 @@ impl TlsUpstreamConfig {
         }
         let client_key = load_key(&self.client_key_pem)?;
 
-        let config = rustls::ClientConfig::builder_with_provider(provider)
+        let mut config = rustls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(TLS_VERSIONS)
             .map_err(|_| anyhow::anyhow!("TLS 协议版本配置不受支持"))?
             .with_root_certificates(roots)
             .with_client_auth_cert(client_certs, client_key)
             .map_err(|_| anyhow::anyhow!("客户端证书或私钥无法用于 mTLS"))?;
+        // 设计 §4.2：首版禁用客户端会话恢复（TLS1.2 session id/ticket 与 TLS1.3 票据均不存储），
+        // 不让会话恢复成为证书吊销的旁路；每次连接都做完整握手并重新校验证书。
+        // 0-RTT（enable_early_data）rustls 默认关闭，且依赖会话恢复，此处一并失效。
+        config.resumption = rustls::client::Resumption::disabled();
 
         Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
     }
