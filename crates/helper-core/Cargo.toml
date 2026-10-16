@@ -18,6 +18,9 @@ toml_edit.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+# 进程策略（设计 §6.2）：ed25519 管理签名验证与映像 SHA-256 哈希。
+ed25519-dalek.workspace = true
+sha2.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # 对端进程身份解析（设计 §6.4）：按四元组枚举进程 socket，取映像路径、启动时间与 uid。
