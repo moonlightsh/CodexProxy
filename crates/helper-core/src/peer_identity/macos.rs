@@ -1,6 +1,6 @@
 //! macOS 实现：libproc 枚举全部进程的 TCP socket，按四元组定位连接方。
 //!
-//! 流程：`proc_listallpids` → 每个进程 `PROC_PIDLISTFDS` → socket fd 取
+//! 流程：`proc_listpids(PROC_ALL_PIDS)`（`pids_by_type(All)`）→ 每个进程 `PROC_PIDLISTFDS` → socket fd 取
 //! `PROC_PIDFDSOCKETINFO` → 只认方向相反的对端 socket（见 [`super::is_peer_socket`]）→
 //! 唯一 PID → `proc_pidinfo(PROC_PIDTBSDINFO)` 取 uid/启动时间、`proc_pidpath` 取映像路径 →
 //! 复核该 PID 仍持有连接且启动时间不变（防查询期间进程退出、PID 复用）。

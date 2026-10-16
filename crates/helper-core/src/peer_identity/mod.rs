@@ -7,6 +7,14 @@
 //!
 //! fail-closed：查不到、多候选、权限不足、进程中途退出或 PID 被复用，一律返回 `Err`，
 //! 调用方必须拒绝该连接，不得放行或回退。
+//!
+//! 平台局限（“唯一所有者”只是在当前用户可见范围内唯一，不是强保证）：
+//! - macOS：无权查看的进程（其他用户 / root）被跳过。连接若同时被一个可见进程和一个
+//!   不可见进程持有，结果是那个可见进程，不会判为多候选；
+//! - Windows：TCP 表每行只记录一个 owning PID，经继承或 `DuplicateHandle` 进入其他进程的
+//!   socket 句柄完全不可见；
+//! - 两个平台都会遇到：建连时同进程 fork/spawn 子进程，子进程短暂继承 socket，
+//!   出现瞬时多候选而被拒绝（fail-closed 的可用性代价）。
 
 use std::net::IpAddr;
 
@@ -23,7 +31,11 @@ use self::windows as platform;
 ///
 /// - `user_scope`：macOS 为有效 uid 的十进制字符串；Windows 为进程 token 的用户 SID 字符串；
 /// - `start_time_ms`：进程启动时间（Unix 毫秒），与 `pid` 组合标识进程实例，防 PID 复用；
-/// - `image_path`：内核报告的进程映像路径（运行中的映像，不是磁盘上同名新文件）。
+/// - `image_path`：内核记录的进程映像**路径字符串**（macOS `proc_pidpath`，Windows
+///   `QueryFullProcessImageNameW`）。运行中的可执行文件被 unlink/rename 并在原路径放入新文件后，
+///   这里仍返回原路径，而磁盘上该路径已是另一个文件。**不能**仅凭对该路径文件的哈希/签名校验
+///   认定运行中的映像；映像校验应基于按 PID 取得的内核证据（macOS 按 pid/audit token 做
+///   SecCode 动态校验，Windows 经已打开的进程句柄取证），否则须作为已知残余风险显式记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
     pub pid: i32,

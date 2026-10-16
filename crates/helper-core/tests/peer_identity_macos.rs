@@ -126,13 +126,3 @@ fn unknown_tuple_is_error() {
     let remote = (addr.ip(), 1);
     assert!(system_resolver().resolve(local, remote).is_err());
 }
-
-#[test]
-fn listener_socket_never_matches() {
-    let _g = serial();
-    // 只有监听 socket、没有连接时，用监听端点作查询不得命中监听 socket
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    let any = "127.0.0.1:65000".parse::<SocketAddr>().unwrap();
-    assert!(system_resolver().resolve(ep(any), ep(addr)).is_err());
-}

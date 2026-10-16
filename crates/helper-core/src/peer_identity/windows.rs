@@ -27,6 +27,9 @@ use super::{Endpoint, PeerInfo, PeerResolver, is_peer_socket, unique_owner, vali
 /// `ws2def.h`：地址族常量（避免为两个整数引入 WinSock feature）。
 const AF_INET: u32 = 2;
 const AF_INET6: u32 = 23;
+/// TIME_WAIT 等已无所属进程的行，owning PID 记为 0（System Idle）。这类行不算候选；
+/// 若只剩这类行，结果是“未找到”而不是“打开进程 0 失败”。
+const IDLE_PID: u32 = 0;
 /// FILETIME（1601-01-01 起 100ns）与 Unix 纪元之差。
 const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 
@@ -95,7 +98,7 @@ fn owner_pids(local: Endpoint, remote: Endpoint) -> anyhow::Result<Vec<i32>> {
             IpAddr::V4(Ipv4Addr::from(row.dwRemoteAddr.to_ne_bytes())),
             port(row.dwRemotePort),
         );
-        if is_peer_socket(l, r, local, remote) {
+        if row.dwOwningPid != IDLE_PID && is_peer_socket(l, r, local, remote) {
             pids.push(pid_i32(row.dwOwningPid)?);
         }
     }
@@ -110,7 +113,7 @@ fn owner_pids(local: Endpoint, remote: Endpoint) -> anyhow::Result<Vec<i32>> {
             IpAddr::V6(Ipv6Addr::from(row.ucRemoteAddr)),
             port(row.dwRemotePort),
         );
-        if is_peer_socket(l, r, local, remote) {
+        if row.dwOwningPid != IDLE_PID && is_peer_socket(l, r, local, remote) {
             pids.push(pid_i32(row.dwOwningPid)?);
         }
     }
@@ -191,7 +194,8 @@ fn creation_time_ms(process: &Handle) -> anyhow::Result<u64> {
     Ok(ms)
 }
 
-/// 进程映像的 Win32 完整路径（运行中的映像）。
+/// 进程映像的 Win32 完整路径字符串（内核记录的路径；磁盘上该路径的文件可能已被替换，
+/// 见 [`super::PeerInfo::image_path`]）。
 fn image_path(process: &Handle) -> anyhow::Result<String> {
     let mut buf = vec![0u16; 32_768];
     let mut len = buf.len() as u32;
