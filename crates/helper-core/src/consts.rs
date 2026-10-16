@@ -11,6 +11,8 @@ pub const GATEWAY_PORT: u16 = 8080;
 pub const SOCKS5_HOST: &str = "10.20.30.61";
 /// 上游 SOCKS5 端口。
 pub const SOCKS5_PORT: u16 = 7891;
+/// 安全上游端口（独立 mihomo-auth 实例：TLS + mTLS + SOCKS5 用户名密码，设计 §4.1）。
+pub const SOCKS5_AUTH_PORT: u16 = 7892;
 
 /// 本地分流代理默认端口。
 pub const DEFAULT_PROXY_PORT: u16 = 17891;

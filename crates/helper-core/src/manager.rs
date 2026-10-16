@@ -756,6 +756,7 @@ impl Manager {
             socks5_port: self.options.socks5_port,
             on_record: Some(sink),
             direct_overrides: None,
+            secure_upstream: None,
         }
     }
 

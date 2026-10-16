@@ -3,13 +3,23 @@
 //! `TlsUpstreamConfig` 携带注册包下发的信任锚（CA PEM）、客户端证书与私钥，
 //! `build_connector` 产出仅信任该 CA、提交客户端证书、最低 TLS1.2 / 优先 TLS1.3 的连接器。
 //! 任何 TLS 失败（证书不可信、SAN 不匹配、私钥不匹配）都是终止性错误：调用方不得回退明文。
+//!
+//! [`connect_secure`] 组合完整序列：TCP → TLS(mTLS) → SOCKS5 用户名密码 → CONNECT → 装箱。
 
+use std::fmt;
 use std::sync::Arc;
+
+use anyhow::{Context, anyhow};
+use tokio::net::TcpStream;
 
 use tokio_rustls::rustls;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 
 use crate::credential::Secret;
+use crate::proxy::{
+    BoxedTransport, SOCKS5_TIMEOUT, build_socks5_auth_request, build_socks5_connect_request,
+    socks5_auth_handshake,
+};
 
 /// 允许的 TLS 协议版本：优先 1.3，最低 1.2（设计 §4.2）。
 const TLS_VERSIONS: &[&rustls::SupportedProtocolVersion] =
@@ -103,6 +113,70 @@ pub async fn wrap_tls(
         .await
         .map_err(|_| anyhow::anyhow!("TLS 握手失败（证书校验或 mTLS 未通过）"))?;
     Ok(stream)
+}
+
+/// 安全上游：地址 + TLS/mTLS 配置 + SOCKS5 用户名密码（设计 §7）。
+///
+/// `host`/`port` 是 TCP 连接地址；服务端身份校验只看 `tls.server_name`。
+/// `Debug` 只输出地址、校验名与用户名，密码与 PEM（含私钥）一律不输出。
+pub struct SecureUpstream {
+    pub host: String,
+    pub port: u16,
+    pub tls: TlsUpstreamConfig,
+    pub username: String,
+    pub password: Secret,
+}
+
+impl fmt::Debug for SecureUpstream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecureUpstream")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("server_name", &self.tls.server_name)
+            .field("username", &self.username)
+            .field("password", &self.password)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 经安全上游建立到目标的隧道：TCP → TLS(mTLS) → SOCKS5 用户名密码 → CONNECT → 装箱。
+///
+/// fail-closed：任何阶段失败都直接返回错误，不重试、不回退明文/旧入口/直连；
+/// TLS 未通过时一个 SOCKS5 字节都不发。
+///
+/// 超时（分两段，与旧无认证路径一致，全程≤ 2×[`SOCKS5_TIMEOUT`]）：
+/// 1. TCP 建连独占一个 `SOCKS5_TIMEOUT`；
+/// 2. TLS 握手 + 认证问候/方法应答 + RFC1929 子协商 + CONNECT 应答**共用**一个 `SOCKS5_TIMEOUT`。
+///
+/// 连接器每次现建、不缓存，且已禁用会话恢复：每条连接都是完整握手。
+pub async fn connect_secure(
+    up: &SecureUpstream,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<BoxedTransport> {
+    // 先校验目标与凭据格式：配置错误时不发起任何出站连接。
+    let connect_request = build_socks5_connect_request(host, port)?;
+    drop(build_socks5_auth_request(&up.username, &up.password)?);
+
+    let tcp = tokio::time::timeout(
+        SOCKS5_TIMEOUT,
+        TcpStream::connect((up.host.as_str(), up.port)),
+    )
+    .await
+    .map_err(|_| anyhow!("安全上游连接超时"))?
+    .context("安全上游连接失败")?;
+    // TCP 特有选项在包 TLS 前设置（设计 §7）
+    let _ = tcp.set_nodelay(true);
+
+    let handshake = async {
+        let mut tls = wrap_tls(tcp, &up.tls).await?;
+        socks5_auth_handshake(&mut tls, &up.username, &up.password, &connect_request).await?;
+        anyhow::Ok(tls)
+    };
+    let tls = tokio::time::timeout(SOCKS5_TIMEOUT, handshake)
+        .await
+        .map_err(|_| anyhow!("安全上游握手超时（TLS/认证/CONNECT）"))??;
+    Ok(Box::new(tls))
 }
 
 #[cfg(test)]
