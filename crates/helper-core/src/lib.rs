@@ -16,6 +16,7 @@ pub mod gateway;
 pub mod log;
 pub mod manager;
 pub mod paths;
+pub mod peer_identity;
 pub mod proxy;
 pub mod rules;
 pub mod state;

@@ -27,5 +27,6 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 rustls-pki-types = "1"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 wiremock = "0.6"
+libproc = "0.14.11"
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 helper-core = { path = "crates/helper-core" }
