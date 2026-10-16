@@ -16,10 +16,13 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use helper_core::credential::Secret;
 use helper_core::proxy::ProxyConfig;
 use helper_core::proxy::ProxyHandle;
 use helper_core::proxy::ProxyStartError;
 use helper_core::proxy::RecordSink;
+use helper_core::proxy::build_socks5_connect_request;
+use helper_core::proxy::socks5_auth_handshake;
 use helper_core::proxy::spawn_with_listener;
 use helper_core::rules::Route;
 use helper_core::types::ConnectionRecord;
@@ -938,4 +941,235 @@ async fn probe_existing_recognizes_only_this_proxy() {
         elapsed >= Duration::from_millis(1900) && elapsed < Duration::from_secs(5),
         "{elapsed:?}"
     );
+}
+
+// ---- Task 2：SOCKS5 RFC1929 用户名密码认证 ----
+
+/// 要求认证的假 SOCKS5：方法协商必须选 0x02，凭据正确才回 CONNECT 成功，否则断开。
+/// 返回 (host:port, CONNECT 目标记录)。
+async fn spawn_auth_socks5(
+    username: &str,
+    password: &str,
+) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind auth socks5");
+    let addr = listener.local_addr().expect("addr");
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_clone = Arc::clone(&seen);
+    let username = username.to_string();
+    let password = password.to_string();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let seen = Arc::clone(&seen_clone);
+            let username = username.clone();
+            let password = password.clone();
+            tokio::spawn(async move {
+                // 认证问候必须声明且仅声明 0x02
+                let mut greeting = [0u8; 3];
+                if stream.read_exact(&mut greeting).await.is_err() {
+                    return;
+                }
+                if greeting != [0x05, 0x01, 0x02] {
+                    return; // 错误问候直接断开
+                }
+                if stream.write_all(&[0x05, 0x02]).await.is_err() {
+                    return;
+                }
+                // RFC1929：01 ULEN USER PLEN PASS
+                let mut version = [0u8; 2];
+                if stream.read_exact(&mut version).await.is_err() {
+                    return;
+                }
+                if version[0] != 0x01 {
+                    return;
+                }
+                let mut user = vec![0u8; usize::from(version[1])];
+                if stream.read_exact(&mut user).await.is_err() {
+                    return;
+                }
+                let mut plen = [0u8; 1];
+                if stream.read_exact(&mut plen).await.is_err() {
+                    return;
+                }
+                let mut pass = vec![0u8; usize::from(plen[0])];
+                if stream.read_exact(&mut pass).await.is_err() {
+                    return;
+                }
+                let ok = user == username.as_bytes() && pass == password.as_bytes();
+                if !ok || stream.write_all(&[0x01, 0x00]).await.is_err() {
+                    // 错误凭据：回失败状态后断开
+                    if !ok {
+                        let _ = stream.write_all(&[0x01, 0x01]).await;
+                    }
+                    return;
+                }
+                // CONNECT 阶段与无认证版一致
+                let mut head = [0u8; 5];
+                if stream.read_exact(&mut head).await.is_err() {
+                    return;
+                }
+                let host_len = usize::from(head[4]);
+                let mut host = vec![0u8; host_len];
+                if stream.read_exact(&mut host).await.is_err() {
+                    return;
+                }
+                let mut port = [0u8; 2];
+                if stream.read_exact(&mut port).await.is_err() {
+                    return;
+                }
+                let target = format!(
+                    "{}:{}",
+                    String::from_utf8_lossy(&host),
+                    u16::from_be_bytes(port)
+                );
+                seen.lock().expect("lock").push(target);
+                let reply = [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80];
+                if stream.write_all(&reply).await.is_err() {
+                    return;
+                }
+                let mut buffer = vec![0u8; 4096];
+                while let Ok(read) = stream.read(&mut buffer).await {
+                    if read == 0 {
+                        break;
+                    }
+                    if stream.write_all(&buffer[..read]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (addr.to_string(), seen)
+}
+
+#[tokio::test]
+async fn auth_handshake_succeeds_with_correct_credentials() {
+    let (socks5, seen) = spawn_auth_socks5("device-test", "secret-pass").await;
+    let (host, port) = socks5.rsplit_once(':').expect("addr");
+    let mut stream = tokio::net::TcpStream::connect((host, port.parse::<u16>().expect("port")))
+        .await
+        .expect("connect auth socks5");
+    let connect = build_socks5_connect_request("chatgpt.com", 443).expect("build");
+    socks5_auth_handshake(
+        &mut stream,
+        "device-test",
+        &Secret::new("secret-pass"),
+        &connect,
+    )
+    .await
+    .expect("auth handshake");
+
+    // 握手后透传回显
+    stream.write_all(b"ping").await.expect("write");
+    let mut echo = vec![0u8; 4];
+    stream.read_exact(&mut echo).await.expect("echo");
+    assert_eq!(&echo, b"ping");
+    let targets = seen.lock().expect("lock").clone();
+    assert_eq!(targets, vec!["chatgpt.com:443".to_string()]);
+}
+
+#[tokio::test]
+async fn wrong_password_fails_and_server_disconnects() {
+    let (socks5, seen) = spawn_auth_socks5("device-test", "secret-pass").await;
+    let (host, port) = socks5.rsplit_once(':').expect("addr");
+    let mut stream = tokio::net::TcpStream::connect((host, port.parse::<u16>().expect("port")))
+        .await
+        .expect("connect auth socks5");
+    let connect = build_socks5_connect_request("chatgpt.com", 443).expect("build");
+    let error = socks5_auth_handshake(
+        &mut stream,
+        "device-test",
+        &Secret::new("wrong-pass"),
+        &connect,
+    )
+    .await
+    .expect_err("wrong password must fail");
+    assert!(error.to_string().contains("认证失败"), "{error}");
+    // 服务端断开：CONNECT 目标绝不能收到
+    assert!(seen.lock().expect("lock").is_empty());
+}
+
+/// 主动选无认证方法的假上游：客户端必须把 0x00 视为降级攻击并失败。
+#[tokio::test]
+async fn no_auth_downgrade_is_rejected_by_client() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind downgrade server");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut greeting = [0u8; 3];
+                let _ = stream.read_exact(&mut greeting).await;
+                // 恶意/配置错误的上游：选择无认证
+                let _ = stream.write_all(&[0x05, 0x00]).await;
+                // 若客户端继续发数据（认证请求/CONNECT），全部读到后记录
+                let mut buffer = vec![0u8; 512];
+                let _ = stream.read(&mut buffer).await;
+            });
+        }
+    });
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let connect = build_socks5_connect_request("chatgpt.com", 443).expect("build");
+    let error = socks5_auth_handshake(
+        &mut stream,
+        "device-test",
+        &Secret::new("secret-pass"),
+        &connect,
+    )
+    .await
+    .expect_err("downgrade must fail");
+    assert!(
+        error.to_string().contains("拒绝认证降级"),
+        "unexpected: {error}"
+    );
+}
+
+/// 上游在认证应答返回非 0x00：必须失败。
+#[tokio::test]
+async fn auth_failure_status_fails_handshake() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind auth-fail server");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut greeting = [0u8; 3];
+                let _ = stream.read_exact(&mut greeting).await;
+                let _ = stream.write_all(&[0x05, 0x02]).await;
+                // 读掉认证请求后回失败状态
+                let mut head = [0u8; 2];
+                let _ = stream.read_exact(&mut head).await;
+                let mut rest = vec![0u8; usize::from(head[1])];
+                let _ = stream.read_exact(&mut rest).await;
+                let mut plen = [0u8; 1];
+                let _ = stream.read_exact(&mut plen).await;
+                let mut pass = vec![0u8; usize::from(plen[0])];
+                let _ = stream.read_exact(&mut pass).await;
+                let _ = stream.write_all(&[0x01, 0x01]).await;
+            });
+        }
+    });
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let connect = build_socks5_connect_request("chatgpt.com", 443).expect("build");
+    let error = socks5_auth_handshake(
+        &mut stream,
+        "device-test",
+        &Secret::new("secret-pass"),
+        &connect,
+    )
+    .await
+    .expect_err("auth failure must fail");
+    assert!(error.to_string().contains("认证失败"), "{error}");
 }

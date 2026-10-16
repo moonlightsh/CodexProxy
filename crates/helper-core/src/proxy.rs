@@ -26,6 +26,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 use crate::consts;
+use crate::credential::Secret;
 use crate::rules::{self, Route};
 use crate::types::ConnectionRecord;
 
@@ -252,6 +253,11 @@ pub fn build_socks5_greeting() -> [u8; 3] {
     [0x05, 0x01, 0x00]
 }
 
+/// SOCKS5 RFC1929 用户名密码认证问候：只提供用户名密码方法（VER=5, NMETHODS=1, METHOD=0x02）。
+pub fn build_socks5_auth_greeting() -> [u8; 3] {
+    [0x05, 0x01, 0x02]
+}
+
 /// SOCKS5 CONNECT 请求，固定域名寻址（ATYP=0x03），不在本地解析 DNS。
 pub fn build_socks5_connect_request(host: &str, port: u16) -> anyhow::Result<Vec<u8>> {
     let host_bytes = host.as_bytes();
@@ -277,6 +283,62 @@ pub fn parse_socks5_method_reply(bytes: &[u8]) -> anyhow::Result<()> {
     }
     if bytes[1] != 0x00 {
         bail!("SOCKS5 上游要求认证方法 0x{:02x}", bytes[1]);
+    }
+    Ok(())
+}
+
+/// 校验认证协商的方法应答：必须选中用户名密码方法（`05 02`）。
+/// 服务端选择 `0x00`（无认证）视为降级攻击，必须失败，绝不继续发送任何后续报文。
+pub fn parse_socks5_method_reply_auth(bytes: &[u8]) -> anyhow::Result<()> {
+    if bytes.len() < 2 {
+        bail!("SOCKS5 方法应答长度不足");
+    }
+    if bytes[0] != 0x05 {
+        bail!("SOCKS5 版本不支持：0x{:02x}", bytes[0]);
+    }
+    match bytes[1] {
+        0x02 => Ok(()),
+        0x00 => bail!("上游拒绝认证降级（选择了无认证方法）"),
+        method => bail!("上游不支持用户名密码认证：方法 0x{method:02x}"),
+    }
+}
+
+/// 构造 RFC1929 用户名密码子协商请求：`01 ULEN USER PLEN PASSWORD`。
+/// 用户名与密码各限 1–255 字节；错误信息不含凭据内容。
+pub fn build_socks5_auth_request(username: &str, password: &Secret) -> anyhow::Result<Vec<u8>> {
+    let user = username.as_bytes();
+    if user.is_empty() {
+        bail!("SOCKS5 认证用户名为空");
+    }
+    if user.len() > 255 {
+        bail!("SOCKS5 认证用户名过长：{} 字节", user.len());
+    }
+    let pass = password.expose().as_bytes();
+    if pass.is_empty() {
+        bail!("SOCKS5 认证密码为空");
+    }
+    if pass.len() > 255 {
+        bail!("SOCKS5 认证密码过长：{} 字节", pass.len());
+    }
+    let mut request = Vec::with_capacity(3 + user.len() + pass.len());
+    request.push(0x01);
+    request.push(u8::try_from(user.len()).expect("已校验 ≤255"));
+    request.extend_from_slice(user);
+    request.push(u8::try_from(pass.len()).expect("已校验 ≤255"));
+    request.extend_from_slice(pass);
+    Ok(request)
+}
+
+/// 校验 RFC1929 认证应答：仅接受成功状态 `01 00`。
+pub fn parse_socks5_auth_reply(bytes: &[u8]) -> anyhow::Result<()> {
+    if bytes.len() < 2 {
+        bail!("SOCKS5 认证应答长度不足");
+    }
+    if bytes[0] != 0x01 {
+        bail!("SOCKS5 认证子协议版本不支持：0x{:02x}", bytes[0]);
+    }
+    if bytes[1] != 0x00 {
+        bail!("SOCKS5 用户名密码认证失败：状态 0x{:02x}", bytes[1]);
     }
     Ok(())
 }
@@ -323,7 +385,7 @@ pub fn socks5_connect_reply_len(bytes: &[u8]) -> Option<usize> {
     Some(4 + addr_len + 2)
 }
 
-/// 经指定上游 SOCKS5 建立到目标的隧道。失败返回错误，**调用方不得回退直连**。
+/// 经指定上游 SOCKS5 建立到目标的隧道（无认证）。失败返回错误，**调用方不得回退直连**。
 pub async fn connect_via_socks5_at(
     upstream_host: &str,
     upstream_port: u16,
@@ -355,6 +417,37 @@ async fn socks5_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream.read_exact(&mut method_reply).await?;
     parse_socks5_method_reply(&method_reply)?;
 
+    socks5_connect_phase(stream, connect_request).await
+}
+
+/// 认证握手：认证问候 → 方法应答（必须 0x02）→ RFC1929 子协商（必须 01 00）→ CONNECT。
+/// 任何阶段失败都不发 CONNECT，也不重试。`stream` 已完成传输层建连（TLS 后续任务在装箱前调用）。
+/// 公开仅供上游组合层（Task 4 `upstream.rs`）与集成测试使用；代理入口不直接调用。
+pub async fn socks5_auth_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    username: &str,
+    password: &Secret,
+    connect_request: &[u8],
+) -> anyhow::Result<()> {
+    let auth_request = build_socks5_auth_request(username, password)?;
+    stream.write_all(&build_socks5_auth_greeting()).await?;
+    let mut method_reply = [0u8; 2];
+    stream.read_exact(&mut method_reply).await?;
+    parse_socks5_method_reply_auth(&method_reply)?;
+
+    stream.write_all(&auth_request).await?;
+    let mut auth_reply = [0u8; 2];
+    stream.read_exact(&mut auth_reply).await?;
+    parse_socks5_auth_reply(&auth_reply)?;
+
+    socks5_connect_phase(stream, connect_request).await
+}
+
+/// CONNECT 阶段：发请求、校验应答并读完整应答尾部（两个握手共用）。
+async fn socks5_connect_phase<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    connect_request: &[u8],
+) -> anyhow::Result<()> {
     stream.write_all(connect_request).await?;
     let mut head = [0u8; 5];
     stream.read_exact(&mut head).await?;
@@ -999,6 +1092,66 @@ mod tests {
     #[test]
     fn builds_no_auth_greeting() {
         assert_eq!(build_socks5_greeting(), [0x05, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn builds_rfc1929_auth_greeting() {
+        // 只声明用户名密码方法；多声明无认证是错误报文
+        assert_eq!(build_socks5_auth_greeting(), [0x05, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn auth_method_reply_accepts_only_username_password() {
+        assert!(parse_socks5_method_reply_auth(&[0x05, 0x02]).is_ok());
+        // 选择无认证是降级攻击，必须失败
+        let downgrade = parse_socks5_method_reply_auth(&[0x05, 0x00]).expect_err("downgrade");
+        assert!(downgrade.to_string().contains("拒绝认证降级"));
+        let other = parse_socks5_method_reply_auth(&[0x05, 0xff]).expect_err("other");
+        assert!(other.to_string().contains("不支持用户名密码认证"));
+        assert!(parse_socks5_method_reply_auth(&[0x04, 0x02]).is_err());
+        assert!(parse_socks5_method_reply_auth(&[0x05]).is_err());
+    }
+
+    #[test]
+    fn auth_request_fixed_vector_roundtrip() {
+        // ("user","pass") → 01 04 "user" 04 "pass"
+        let request = build_socks5_auth_request("user", &Secret::new("pass")).expect("built");
+        assert_eq!(
+            request,
+            vec![
+                0x01, 0x04, b'u', b's', b'e', b'r', 0x04, b'p', b'a', b's', b's'
+            ]
+        );
+    }
+
+    #[test]
+    fn auth_request_validates_lengths_without_leaking_credentials() {
+        // 空用户名/密码与超长用户名/密码均报错，且错误信息不含凭据内容
+        assert!(build_socks5_auth_request("", &Secret::new("pass")).is_err());
+        assert!(build_socks5_auth_request("user", &Secret::new("")).is_err());
+        let long_user = "u".repeat(256);
+        let long_pass = "p".repeat(256);
+        assert!(build_socks5_auth_request(&long_user, &Secret::new("pass")).is_err());
+        let error = build_socks5_auth_request("user", &Secret::new(&long_pass)).expect_err("long");
+        assert!(error.to_string().contains("密码过长"));
+        assert!(!error.to_string().contains(&long_pass));
+        // 边界：恰好 255 字节可用
+        let max_user = "u".repeat(255);
+        let max_pass = "p".repeat(255);
+        let request =
+            build_socks5_auth_request(&max_user, &Secret::new(&max_pass)).expect("boundary");
+        assert_eq!(request.len(), 3 + 255 + 255);
+        assert_eq!(request[1], 255);
+        assert_eq!(request[257], 255);
+    }
+
+    #[test]
+    fn auth_reply_accepts_only_success_status() {
+        assert!(parse_socks5_auth_reply(&[0x01, 0x00]).is_ok());
+        let failed = parse_socks5_auth_reply(&[0x01, 0x01]).expect_err("failed");
+        assert!(failed.to_string().contains("认证失败"));
+        assert!(parse_socks5_auth_reply(&[0x02, 0x00]).is_err());
+        assert!(parse_socks5_auth_reply(&[0x01]).is_err());
     }
 
     #[test]
