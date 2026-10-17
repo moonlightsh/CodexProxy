@@ -20,6 +20,7 @@ pub mod paths;
 pub mod peer_identity;
 pub mod process_policy;
 pub mod proxy;
+pub mod proxy_identity;
 pub mod rules;
 pub mod state;
 pub mod types;
