@@ -382,8 +382,10 @@ pub fn load_secrets(device_id: &str) -> anyhow::Result<ProxySecrets> {
 }
 
 /// 删除某设备的两条秘密条目；不存在视为成功（幂等，供注销/重置流程用）。
-/// 两条都尽力删除，第一条失败不阻断第二条（残留由幂等重删清理），但错误向上传播。
+/// 返回类型为 `()`（简报接口）：删除是尽力而为的清理动作，失败不阻断流程，
+/// 残留由幂等重删清理；需要严格确认删除结果的调用方可用 `load_secrets` 验证。
 pub fn delete_secrets(device_id: &str) {
+    // device_id 非法时拼出的 target 不会命中任何生产条目（前缀不同），删除无害。
     let _ = validate_device_id(device_id);
     let (password_target, key_target) = targets_for(device_id);
     let _ = SystemCredentialStore::new(password_target).delete();
@@ -502,9 +504,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_extra_fields_fails_closed() {
-        // 未知字段不忽略——deny_unknown_fields 未开启时 serde 默认忽略；这里明确验证：
-        // 未知字段不导致失败（前向兼容），但已知字段类型错误必须失败。
+    fn parse_ignores_unknown_fields_but_rejects_wrong_types() {
+        // 未知字段忽略（前向兼容：注册包 schema 演进不破坏旧客户端）；
+        // 已知字段类型错误必须失败。
         let raw = valid_enrollment_json();
         let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         value["extra_field"] = "whatever".into();
