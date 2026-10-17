@@ -77,7 +77,8 @@ const BAD_REQUEST: &[u8] =
 const BAD_GATEWAY: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 /// 门禁拒绝应答：固定最小文案，不区分拒绝原因，不携带对端任何信息。
-const GATE_FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const GATE_FORBIDDEN: &[u8] =
+    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const CONNECTION_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 /// 明文转发前移除的逐跳头；`Connection` 随后统一改写为 `close`。
 const HOP_BY_HOP_HEADERS: &[&str] = &["connection", "proxy-connection", "keep-alive"];
@@ -898,10 +899,7 @@ async fn handle_connection(mut client: TcpStream, shared: Arc<Shared>) {
     // 零出站。解析（含复查）与映像摘要都是阻塞 IO，整体放进 spawn_blocking 并套上门禁
     // 超时（设计 §6.4：单连接总门禁超时 1s，超时拒绝，不自动放行）。
     if let Some(gate) = shared.config.gate.clone() {
-        let remote = client
-            .peer_addr()
-            .map(|addr| (addr.ip(), addr.port()))
-            .ok();
+        let remote = client.peer_addr().map(|addr| (addr.ip(), addr.port())).ok();
         let local = client
             .local_addr()
             .map(|addr| (addr.ip(), addr.port()))

@@ -946,9 +946,7 @@ mod gate {
     use super::*;
     use helper_core::connection_gate::ConnectionGate;
     use helper_core::peer_identity::{PeerInfo, PeerResolver};
-    use helper_core::process_policy::{
-        AllowedRole, CodeImage, ProcessPolicy, ROLE_CODEX_ENGINE,
-    };
+    use helper_core::process_policy::{AllowedRole, CodeImage, ProcessPolicy, ROLE_CODEX_ENGINE};
     use std::net::IpAddr;
 
     /// 2100-01-01：测试运行的任何时间都早于它。
@@ -1132,10 +1130,7 @@ mod gate {
             b"GET http://unmatched.example/x HTTP/1.1\r\n\r\n".as_slice(),
         ] {
             let response = send_and_read(proxy.port(), request).await;
-            assert!(
-                response.starts_with("HTTP/1.1 403"),
-                "got: {response}"
-            );
+            assert!(response.starts_with("HTTP/1.1 403"), "got: {response}");
         }
         assert_eq!(hits.load(Ordering::SeqCst), 0, "必须零出站连接");
         assert!(records.lock().expect("lock").is_empty());
@@ -1183,12 +1178,8 @@ mod gate {
     async fn self_identify_survives_gate() {
         // 自识端点在门禁之前放行：解析器恒失败也不影响。
         let (_dir, image_path, _sha) = temp_image(b"codex-engine-image");
-        let (proxy, records) = spawn_gated_proxy(
-            peer_now(&image_path),
-            Some("未找到连接所有者进程"),
-            None,
-        )
-        .await;
+        let (proxy, records) =
+            spawn_gated_proxy(peer_now(&image_path), Some("未找到连接所有者进程"), None).await;
         let response = send_and_read(
             proxy.port(),
             b"GET /__codex_helper_proxy_id HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
@@ -1209,8 +1200,7 @@ mod gate {
         let (socks5, _seen) = spawn_fake_socks5().await;
         let (target_port, hits) = spawn_fake_target().await;
         let (proxy, _records) = spawn_recording_proxy(proxy_config(&socks5)).await;
-        let request =
-            format!("GET http://127.0.0.1:{target_port}/ping HTTP/1.1\r\n\r\n");
+        let request = format!("GET http://127.0.0.1:{target_port}/ping HTTP/1.1\r\n\r\n");
         let response = send_and_read(proxy.port(), request.as_bytes()).await;
         assert!(response.contains("200 OK"), "got: {response}");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -1221,12 +1211,8 @@ mod gate {
         // 设计 §6.3：门禁在读代理请求（target 解析）之前。解析器恒失败时，
         // 连首行不可解析的请求也回 403（而不是 400）：身份核实先于一切语义处理。
         let (_dir, image_path, _sha) = temp_image(b"codex-engine-image");
-        let (proxy, records) = spawn_gated_proxy(
-            peer_now(&image_path),
-            Some("未找到连接所有者进程"),
-            None,
-        )
-        .await;
+        let (proxy, records) =
+            spawn_gated_proxy(peer_now(&image_path), Some("未找到连接所有者进程"), None).await;
         for request in [
             b"HELLO\r\n\r\n".as_slice(),
             b"GET /models HTTP/1.1\r\n\r\n".as_slice(),
@@ -1277,10 +1263,7 @@ mod gate {
             .expect("隧道应建立")
             .expect("read tunnel");
         let text = String::from_utf8_lossy(&head[..read]).to_string();
-        assert!(
-            text.starts_with("HTTP/1.1 200"),
-            "got: {text}"
-        );
+        assert!(text.starts_with("HTTP/1.1 200"), "got: {text}");
         let targets = seen.lock().expect("lock").clone();
         assert_eq!(targets, vec!["chatgpt.com:443".to_string()]);
         let _ = dir;

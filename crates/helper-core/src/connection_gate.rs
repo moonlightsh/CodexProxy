@@ -213,8 +213,7 @@ mod tests {
     #[test]
     fn persistent_error_fails_closed_after_exactly_two_attempts() {
         let (_dir, _image_path, sha) = temp_image(b"codex-engine-image");
-        let (resolver, calls) =
-            FakeResolver::new(|_n| anyhow::bail!("未找到连接所有者进程"));
+        let (resolver, calls) = FakeResolver::new(|_n| anyhow::bail!("未找到连接所有者进程"));
         let gate = ConnectionGate::new(Box::new(resolver), policy_allowing(&sha));
         let error = gate
             .resolve_with_retry(endpoint(17891), endpoint(50000))
@@ -232,8 +231,7 @@ mod tests {
         });
         let gate = ConnectionGate::new(Box::new(resolver), policy_allowing(&sha));
         assert!(
-            gate
-                .resolve_with_retry(endpoint(17891), endpoint(50000))
+            gate.resolve_with_retry(endpoint(17891), endpoint(50000))
                 .is_err(),
             "多候选复查后仍失败必须拒绝，不得取第一个候选"
         );
@@ -248,8 +246,7 @@ mod tests {
         let (resolver, calls) = FakeResolver::new(move |_n| Ok(peer_for_resolver.clone()));
         let gate = ConnectionGate::new(Box::new(resolver), policy_allowing(&sha));
         assert!(
-            gate
-                .resolve_with_retry(endpoint(17891), endpoint(50000))
+            gate.resolve_with_retry(endpoint(17891), endpoint(50000))
                 .is_ok()
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "成功后不再复查");
@@ -279,10 +276,7 @@ mod tests {
         // 策略批准的是另一个摘要。
         let peer_for_resolver = peer.clone();
         let (resolver, _calls) = FakeResolver::new(move |_n| Ok(peer_for_resolver.clone()));
-        let gate = ConnectionGate::new(
-            Box::new(resolver),
-            policy_allowing(&"ff".repeat(32)),
-        );
+        let gate = ConnectionGate::new(Box::new(resolver), policy_allowing(&"ff".repeat(32)));
         assert_eq!(gate.admit(&peer), Decision::Deny { reason: "image" });
     }
 

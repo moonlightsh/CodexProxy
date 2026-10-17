@@ -140,8 +140,10 @@ fn sort_object_keys(value: &Value) -> Value {
         // 若只靠 BTreeMap 特性下的 collect，一旦 preserve_order 被开启，
         // 这里会退化为插入序 no-op，导致与签发端的规范字节不一致。
         Value::Object(map) => {
-            let mut entries: Vec<(String, Value)> =
-                map.iter().map(|(k, v)| (k.clone(), sort_object_keys(v))).collect();
+            let mut entries: Vec<(String, Value)> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), sort_object_keys(v)))
+                .collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             Value::Object(entries.into_iter().collect())
         }
