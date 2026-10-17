@@ -424,6 +424,7 @@ mod tests {
                 previous_approvals_reviewer: None,
                 previous_sandbox_mode: Some("read-only".to_string()),
                 autostart: true,
+                ..Default::default()
             },
         )
         .unwrap();

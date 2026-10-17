@@ -16,6 +16,10 @@ pub const SOCKS5_AUTH_PORT: u16 = 7892;
 
 /// 本地分流代理默认端口。
 pub const DEFAULT_PROXY_PORT: u16 = 17891;
+
+/// Secure 激活时旧代理句柄的排空上限（设计 §9.1：旧连接最多 5 分钟排空后关闭）。
+/// 超时后强制关闭，避免旧隧道永久绕过进程门禁。
+pub const LEGACY_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// 仅供应急覆盖本地代理端口的环境变量；界面不暴露。
 pub const PROXY_PORT_ENV: &str = "CODEX_HELPER_PROXY_PORT";
 

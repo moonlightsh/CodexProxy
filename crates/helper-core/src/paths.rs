@@ -55,6 +55,17 @@ impl HelperPaths {
     pub fn log_dir(&self) -> PathBuf {
         self.data_dir.join("logs")
     }
+
+    /// 数据目录下的 `enrollment` 子目录：存放已验证的注册包（Task 9 激活流程复制到
+    /// `enrollment/bundle.json`）。非秘密（注册包不含密码/私钥），但仍随数据目录存放。
+    pub fn enrollment_dir(&self) -> PathBuf {
+        self.data_dir.join("enrollment")
+    }
+
+    /// 已激活注册包的存储位置（`enrollment/bundle.json`）。
+    pub fn enrollment_bundle(&self) -> PathBuf {
+        self.enrollment_dir().join("bundle.json")
+    }
 }
 
 /// Codex home：非空的 `CODEX_HOME` 优先，否则 `~/.codex`（与 Codex 自身解析一致）。
@@ -122,6 +133,11 @@ mod tests {
         assert_eq!(paths.env_file(), Path::new("/codex/.env"));
         assert_eq!(paths.state_file(), Path::new("/data/state.json"));
         assert_eq!(paths.log_dir(), Path::new("/data/logs"));
+        assert_eq!(paths.enrollment_dir(), Path::new("/data/enrollment"));
+        assert_eq!(
+            paths.enrollment_bundle(),
+            Path::new("/data/enrollment/bundle.json")
+        );
     }
 
     #[test]

@@ -24,12 +24,35 @@
 //! 不部分写入成功就当作整体成功（密码写成功而私钥写失败时，`save_secrets` 会尽力回滚
 //! 已写入的密码条目再返回错误）。
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
+use ed25519_dalek::VerifyingKey;
 use serde::Deserialize;
-use tokio_rustls::rustls::pki_types::{pem::PemObject, PrivateKeyDer};
+use tokio_rustls::rustls::pki_types::{PrivateKeyDer, pem::PemObject};
 
 use crate::consts;
 use crate::credential::{CredentialStore, Secret, SystemCredentialStore};
+
+/// 从 [`consts::POLICY_VERIFY_KEY_HEX`] 构造管理签名验证公钥。
+/// 常量必须是 64 字节小写 hex 且能构造 ed25519 验证钥；否则返回错误（发布前防误填，
+/// 有单测钉住；运行时这里再检查一次并 fail-closed）。
+pub fn policy_verify_key() -> anyhow::Result<VerifyingKey> {
+    let text = consts::POLICY_VERIFY_KEY_HEX;
+    let mut bytes = [0u8; 32];
+    let raw = text.as_bytes();
+    if raw.len() != 64 {
+        bail!("管理签名公钥常量长度非法");
+    }
+    for i in 0..32 {
+        let hi = (raw[i * 2] as char)
+            .to_digit(16)
+            .context("管理签名公钥含非 hex 字符")? as u8;
+        let lo = (raw[i * 2 + 1] as char)
+            .to_digit(16)
+            .context("管理签名公钥含非 hex 字符")? as u8;
+        bytes[i] = hi << 4 | lo;
+    }
+    VerifyingKey::from_bytes(&bytes).map_err(|_| anyhow!("管理签名公钥不是有效的 ed25519 验证钥"))
+}
 
 /// 注册包 JSON 的原始形态（字段名与签发端一致）。
 #[derive(Debug, Deserialize)]
@@ -590,25 +613,14 @@ mod tests {
     #[test]
     fn policy_verify_key_hex_is_valid_point() {
         // 常量必须是 64 字节 hex 且能构造 ed25519 验证钥（防止发布前误填）。
-        let bytes = hex_to_bytes(consts::POLICY_VERIFY_KEY_HEX).expect("hex 合法");
-        assert_eq!(bytes.len(), 32);
-        assert!(ed25519_dalek::VerifyingKey::from_bytes(&bytes).is_ok());
-    }
-
-    fn hex_to_bytes(hex: &str) -> anyhow::Result<[u8; 32]> {
-        let mut out = [0u8; 32];
-        let bytes = hex.as_bytes();
-        anyhow::ensure!(bytes.len() == 64, "hex 长度非法");
-        for i in 0..32 {
-            let hi = (bytes[i * 2] as char)
-                .to_digit(16)
-                .context("hex 字符非法")? as u8;
-            let lo = (bytes[i * 2 + 1] as char)
-                .to_digit(16)
-                .context("hex 字符非法")? as u8;
-            out[i] = hi << 4 | lo;
-        }
-        Ok(out)
+        assert!(policy_verify_key().is_ok());
+        // 大写 hex 不被接受（fail-closed，不做猜测修复）——间接验证解析严格性。
+        assert_eq!(consts::POLICY_VERIFY_KEY_HEX.len(), 64);
+        assert!(
+            consts::POLICY_VERIFY_KEY_HEX
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
     }
 
     // ---------- 秘密存储（dev-mode 内存表；macOS 真钥匙串见下方单独模块） ----------
