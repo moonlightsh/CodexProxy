@@ -136,11 +136,15 @@ fn canonical_bytes(value: &Value) -> anyhow::Result<Vec<u8>> {
 /// 递归地把所有 JSON 对象的键按字典序重排（数组顺序保持原样，数字/字符串原样保留）。
 fn sort_object_keys(value: &Value) -> Value {
     match value {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(k, v)| (k.clone(), sort_object_keys(v)))
-                .collect::<serde_json::Map<String, Value>>(),
-        ),
+        // 不依赖 serde_json 特性组合：显式按字典序排序后再重建对象。
+        // 若只靠 BTreeMap 特性下的 collect，一旦 preserve_order 被开启，
+        // 这里会退化为插入序 no-op，导致与签发端的规范字节不一致。
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> =
+                map.iter().map(|(k, v)| (k.clone(), sort_object_keys(v))).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(entries.into_iter().collect())
+        }
         Value::Array(items) => Value::Array(items.iter().map(sort_object_keys).collect()),
         other => other.clone(),
     }
