@@ -550,8 +550,14 @@ mod tests {
     #[test]
     fn decide_platform_mismatch_denies() {
         let key = signing_setup();
-        // 摘要正确但 os 写成 windows → 不命中。
-        let value = policy_value(1, FAR_FUTURE, GOOD_SHA, "windows", &current_arch(), &[]);
+        // 摘要正确但 os 写成与当前平台不同的值 → 不命中（避免硬编码 "windows"：
+        // 在 Windows runner 上 current_os() 本就是 windows，硬编码会让用例恒假失败）。
+        let wrong_os = if current_os() == "windows" {
+            "macos"
+        } else {
+            "windows"
+        };
+        let value = policy_value(1, FAR_FUTURE, GOOD_SHA, wrong_os, &current_arch(), &[]);
         let policy = policy_from(&value, &key);
         let peer = peer_now("/anywhere/codex");
         assert_eq!(
