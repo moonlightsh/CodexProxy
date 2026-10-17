@@ -757,6 +757,8 @@ impl Manager {
             on_record: Some(sink),
             direct_overrides: None,
             secure_upstream: None,
+            // Secure 模式的进程门禁由后续任务接入 Manager（当前门禁仅测试可注入）。
+            gate: None,
         }
     }
 

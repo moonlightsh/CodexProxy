@@ -25,8 +25,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
+use crate::connection_gate::ConnectionGate;
 use crate::consts;
 use crate::credential::Secret;
+use crate::process_policy::Decision;
 use crate::rules::{self, Route};
 use crate::types::ConnectionRecord;
 use crate::upstream::SecureUpstream;
@@ -66,11 +68,16 @@ const LINGER_MAX_BYTES: usize = 1024 * 1024;
 /// 成功连接的日志采样：前 N 条全记，之后每 M 条记 1 条；失败全部记录。
 const LOG_SAMPLE_HEAD: u64 = 20;
 const LOG_SAMPLE_EVERY: u64 = 20;
+/// 门禁整体预算（设计 §6.4：单连接总门禁超时 1s，超时拒绝，不自动放行）。
+/// 含连接所有者解析（含一次 150ms 复查间隔）与映像文件摘要计算。
+const GATE_TIMEOUT: Duration = Duration::from_secs(1);
 
 const BAD_REQUEST: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const BAD_GATEWAY: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+/// 门禁拒绝应答：固定最小文案，不区分拒绝原因，不携带对端任何信息。
+const GATE_FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const CONNECTION_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 /// 明文转发前移除的逐跳头；`Connection` 随后统一改写为 `close`。
 const HOP_BY_HOP_HEADERS: &[&str] = &["connection", "proxy-connection", "keep-alive"];
@@ -480,6 +487,10 @@ pub struct ProxyConfig {
     /// 安全上游（TLS + mTLS + SOCKS5 用户名密码）。`Some` 时命中规则的流量只走它，
     /// 失败即 502，绝不回退 `socks5_host:socks5_port` 旧入口；`None` 走旧的无认证路径。
     pub secure_upstream: Option<Arc<SecureUpstream>>,
+    /// 本机进程身份门禁（设计 §6.3）。`Some` 时除自识端点外的每个请求都必须先通过门禁，
+    /// 任何失败（解析失败/超时/作用域不符/映像未批准）都回 403 并关闭，零出站；
+    /// `None` 保持 Legacy 行为（无门禁）。
+    pub gate: Option<Arc<ConnectionGate>>,
 }
 
 impl Default for ProxyConfig {
@@ -490,6 +501,7 @@ impl Default for ProxyConfig {
             on_record: None,
             direct_overrides: None,
             secure_upstream: None,
+            gate: None,
         }
     }
 }
@@ -503,6 +515,7 @@ impl fmt::Debug for ProxyConfig {
             .field("direct_overrides", &self.direct_overrides)
             // SecureUpstream 的 Debug 已脱敏：不含密码与 PEM
             .field("secure_upstream", &self.secure_upstream)
+            .field("gate", &self.gate.as_ref().map(|_| "<ConnectionGate>"))
             .finish()
     }
 }
@@ -880,9 +893,53 @@ async fn handle_connection(mut client: TcpStream, shared: Arc<Shared>) {
         return respond_and_close(client, identify_response().as_bytes()).await;
     }
 
+    // 门禁（设计 §6.3）：自识端点之外，在读代理请求（target 解析）与任何上游/直连出站
+    // 之前，先核实连接所有者进程身份；失败/超时/作用域不符/映像未批准 → 403 并关闭，
+    // 零出站。解析（含复查）与映像摘要都是阻塞 IO，整体放进 spawn_blocking 并套上门禁
+    // 超时（设计 §6.4：单连接总门禁超时 1s，超时拒绝，不自动放行）。
+    if let Some(gate) = shared.config.gate.clone() {
+        let remote = client
+            .peer_addr()
+            .map(|addr| (addr.ip(), addr.port()))
+            .ok();
+        let local = client
+            .local_addr()
+            .map(|addr| (addr.ip(), addr.port()))
+            .ok();
+        let (Some(remote), Some(local)) = (remote, local) else {
+            // 连接端点都拿不到：无法定位所有者，fail-closed。
+            crate::log::event("proxy.gate_denied", json!({ "reason": "endpoints" }));
+            return respond_and_close(client, GATE_FORBIDDEN).await;
+        };
+        // 超时、任务失败（panic/取消）、解析失败（含复查后仍多候选）一样按 fail-closed 拒绝。
+        let checked = tokio::time::timeout(
+            GATE_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                gate.resolve_with_retry(local, remote)
+                    .map(|peer| gate.admit(&peer))
+            }),
+        )
+        .await
+        .ok()
+        .and_then(|joined| joined.ok())
+        .and_then(|decision| decision.ok());
+        match checked {
+            Some(Decision::Allow { .. }) => {}
+            Some(Decision::Deny { reason }) => {
+                crate::log::event("proxy.gate_denied", json!({ "reason": reason }));
+                return respond_and_close(client, GATE_FORBIDDEN).await;
+            }
+            None => {
+                crate::log::event("proxy.gate_denied", json!({ "reason": "resolve" }));
+                return respond_and_close(client, GATE_FORBIDDEN).await;
+            }
+        }
+    }
+
     let Some(target) = parse_proxy_request_line(first_line) else {
         return reject(client, "bad_request_line").await;
     };
+
     if is_self_target(&target, shared.listen_port) {
         return reject(client, "self_loop").await;
     }

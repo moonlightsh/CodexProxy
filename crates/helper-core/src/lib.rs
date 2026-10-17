@@ -8,6 +8,7 @@
 
 pub mod codex_config;
 pub mod codex_env;
+pub mod connection_gate;
 pub mod consts;
 pub mod credential;
 pub mod devenv;
