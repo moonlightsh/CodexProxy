@@ -101,6 +101,8 @@ jobs:
       - name: 上传安装包与更新产物到 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # 预发布标签（v*-*，如 v0.3.0-rc.1）自动标记 prerelease，不出现在 latest。
+          prerelease: ${{ contains(github.ref_name, '-') }}
           # 同时上传：安装器 *-setup.exe（也是 updater 下载目标）、其 .sig 签名、以及 latest.json。
           files: |
             ${{ steps.find_installer.outputs.path }}
@@ -163,6 +165,7 @@ jobs:
         with:
           files: ${{ steps.build.outputs.dmg }}
           fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             ## macOS 安装说明（内部试用）
 
