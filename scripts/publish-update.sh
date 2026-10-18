@@ -107,9 +107,24 @@ generate_manifest() {
   notes="${UPDATE_NOTES:-CodexHelper ${version} 更新。}"
   pub_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+  # 逐个读取签名文件；读取失败（权限/不存在）直接报错退出，绝不生成空 signature 的 manifest。
+  local win_sig_content="" app_sig_content=""
+  if [ -n "$win_sig" ]; then
+    if ! win_sig_content="$(cat "$win_sig")"; then
+      echo "错误：无法读取 Windows 签名文件 $win_sig" >&2
+      return 1
+    fi
+  fi
+  if [ -n "$app_sig" ]; then
+    if ! app_sig_content="$(cat "$app_sig")"; then
+      echo "错误：无法读取 darwin 签名文件 $app_sig" >&2
+      return 1
+    fi
+  fi
+
   # 用 node 生成 JSON，安全转义 signature/notes；darwin 两键复用同一 url/signature（M2）。
-  WIN_SIG="$(cat "$win_sig" 2>/dev/null || true)" \
-  APP_SIG="$(cat "$app_sig" 2>/dev/null || true)" \
+  WIN_SIG="$win_sig_content" \
+  APP_SIG="$app_sig_content" \
   WIN_NAME="$win_name" \
   APP_NAME="$app_name" \
   VER="$version" NOTES="$notes" PUB_DATE="$pub_date" BASE_URL="$DOWNLOAD_BASE" \

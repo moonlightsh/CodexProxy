@@ -35,10 +35,12 @@ jobs:
       - name: 校验 tag 版本与 tauri.conf.json 一致
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          CONF_VERSION=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")
+          CONF_VERSION=$(node -p \
+            "require('./apps/desktop/src-tauri/tauri.conf.json').version")
           echo "tag=$TAG_VERSION conf=$CONF_VERSION"
           if [ "$TAG_VERSION" != "$CONF_VERSION" ]; then
-            echo "::error::标签版本 v$TAG_VERSION 与 tauri.conf.json 中的 version=$CONF_VERSION 不一致"
+            echo "::error::标签版本 v$TAG_VERSION 与"
+            echo "::error::tauri.conf.json 中 version=$CONF_VERSION 不一致"
             exit 1
           fi
 
@@ -59,8 +61,8 @@ jobs:
       - name: 复制 sidecar 到 externalBin 约定路径
         run: |
           mkdir -p apps/desktop/src-tauri/binaries
-          cp target/release/${SIDECAR_NAME}.exe \
-             "apps/desktop/src-tauri/binaries/${SIDECAR_NAME}-${TARGET_TRIPLE}.exe"
+          cp "target/release/${SIDECAR_NAME}.exe" \
+            "apps/desktop/src-tauri/binaries/${SIDECAR_NAME}-${TARGET_TRIPLE}.exe"
           ls -la apps/desktop/src-tauri/binaries
 
       # externalBin 只在发布时通过 --config 与 tauri.bundle.conf.json 合并进主配置，
@@ -110,8 +112,9 @@ jobs:
             target/release/bundle/nsis/latest.json
           fail_on_unmatched_files: true
 
-  # macOS universal dmg（设计 §7）。needs windows-release 让两个 job 串行，
-  # 避免同时为同一 tag 创建 Release；本 job 只上传 dmg 并补写 Release 正文。
+  # macOS universal dmg 与升级产物（设计 §7、§15 macOS 设计 M5/M7）。
+  # needs windows-release 让两个 job 串行，避免同时为同一 tag 创建 Release；
+  # 本 job 上传 dmg、.app.tar.gz 升级产物及其 .sig 并补写 Release 正文。
   macos-release:
     runs-on: macos-latest
     needs: windows-release
@@ -133,10 +136,12 @@ jobs:
       - name: 校验 tag 版本与 tauri.conf.json 一致
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          CONF_VERSION=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")
+          CONF_VERSION=$(node -p \
+            "require('./apps/desktop/src-tauri/tauri.conf.json').version")
           echo "tag=$TAG_VERSION conf=$CONF_VERSION"
           if [ "$TAG_VERSION" != "$CONF_VERSION" ]; then
-            echo "::error::标签版本 v$TAG_VERSION 与 tauri.conf.json 中的 version=$CONF_VERSION 不一致"
+            echo "::error::标签版本 v$TAG_VERSION 与"
+            echo "::error::tauri.conf.json 中 version=$CONF_VERSION 不一致"
             exit 1
           fi
 
@@ -154,7 +159,7 @@ jobs:
 
       # 脚本负责凭据程序 lipo 合成、tauri build 与产物自检，并把 dmg 与升级产物路径写进 GITHUB_OUTPUT。
       # 构建注入 TAURI_SIGNING_PRIVATE_KEY 以产出 .app.tar.gz 与 .sig 升级产物（设计 M5/M7）；
-      # 若 CI 未配置该 secret，构建步骤会先失败并给出清晰报错，可接受。
+      # 若 CI 未配置该 secret，构建脚本的升级产物自检（要求恰好一个 tar.gz 且 .sig 非空）会先失败并给出报错。
       - name: 构建 universal dmg 与升级产物
         id: build
         env:
@@ -180,6 +185,7 @@ jobs:
             2. 首次打开被拦截时：系统设置 → 隐私与安全性 → “仍要打开”；或执行
                `xattr -dr com.apple.quarantine /Applications/CodexHelper.app`。
             3. 卸载：先在菜单栏图标选“撤销配置并退出”，再把应用拖进废纸篓。如果已经先删了应用、Codex 打不开对话：重新安装后执行一次撤销。
-            4. 删除 Key（可选）：`security delete-generic-password -s codex-helper/managed-gateway -a codex-helper`。
+            4. 删除 Key（可选）：`security delete-generic-password \\
+               -s codex-helper/managed-gateway -a codex-helper`。
 
             已安装旧版的内网用户也可在应用内「检查更新」直接升级。
