@@ -25,7 +25,7 @@ import { EVENT_CONNECTION_RECORDED, EVENT_STATUS_CHANGED } from "./types";
 /** Key 只允许可打印 ASCII（0x21–0x7E，与 Rust 侧一致）。 */
 const KEY_CHARS = /^[\x21-\x7e]+$/;
 
-/** 非 Windows 平台拒绝升级命令时的错误（与 Rust 侧 update.rs 一致）。 */
+/** other 平台（Windows / macOS 之外）拒绝升级命令时的错误（与 Rust 侧 update.rs 一致）。 */
 const UPDATE_UNSUPPORTED: ErrorPayload = {
   code: "update",
   message: "当前平台不支持内部升级，请到 GitHub Release 下载新版本",
@@ -63,7 +63,8 @@ function baseStatus(): Status {
  * 用 `?scenario=` 选择预览的状态，例如：
  * `?scenario=needsKey`、`?scenario=residue`、`?scenario=legacy`、
  * `?scenario=configError`、`?scenario=dev`、`?scenario=catalog`、`?scenario=running`（默认）、
- * `?scenario=macos`（macOS：隐藏升级区、显示卸载前提示）、`?scenario=transient`（macOS 从临时位置运行）。
+ * `?scenario=macos`（macOS：显示升级区与卸载前提示）、`?scenario=transient`（macOS 从临时位置运行，
+ * 禁用安装按钮并提示）、`?scenario=other`（不支持的平台：隐藏升级区）。
  * Key 录入区里输入 `bad` 模拟 keyRejected，输入 `slow` 模拟 gatewayUnavailable。
  */
 function applyScenario(status: Status, scenario: string): Status {
@@ -89,9 +90,11 @@ function applyScenario(status: Status, scenario: string): Status {
         modelCatalogJson: "/dev/fake-codex-home/model_catalog.json",
       };
     case "macos":
-      return { ...applyScenario(status, "running"), platform: "macos", updateSupported: false };
+      return { ...applyScenario(status, "running"), platform: "macos" };
     case "transient":
       return { ...applyScenario(status, "macos"), installLocationOk: false };
+    case "other":
+      return { ...status, platform: "other", platformSupported: false, updateSupported: false };
     case "running":
     default:
       return {
@@ -314,7 +317,7 @@ export function installDevMock(): void {
         }
 
         case "check_update":
-          if (!status.updateSupported) return reject(UPDATE_UNSUPPORTED);
+          if (status.platform === "other") return reject(UPDATE_UNSUPPORTED);
           // 预览可用更新：`?scenario=updateAvailable`；其余场景返回“已是最新”。
           return scenario === "updateAvailable"
             ? {
@@ -327,7 +330,7 @@ export function installDevMock(): void {
             : { available: false, currentVersion: "0.1.1", version: null, notes: null, date: null };
 
         case "install_update":
-          if (!status.updateSupported) return reject(UPDATE_UNSUPPORTED);
+          if (status.platform === "other") return reject(UPDATE_UNSUPPORTED);
           // 忽略 expectedVersion 参数；开发预览不支持真实安装。
           return reject({ code: "update", message: "开发预览不支持真实安装更新。" });
 
