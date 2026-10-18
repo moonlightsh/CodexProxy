@@ -130,3 +130,8 @@ test("updatePanelViewState：无可用更新时 hint 为空且不误伤", () => 
   const view = updatePanelViewState({ available: null, installing: false, installLocationOk: false });
   assert.equal(view.hint, "");
 });
+
+test("updatePanelViewState 与安装位置横幅文案来源一致", () => {
+  const view = updatePanelViewState({ available: fakeUpdate("0.4.0"), installing: false, installLocationOk: false });
+  assert.ok(view.hint.includes("「应用程序」"));
+});

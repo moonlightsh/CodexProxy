@@ -1,6 +1,7 @@
 // 更新区：显示当前版本、检查更新，发现新版本后由用户确认再安装（设计 §15）。
 // 检测/安装逻辑在 Rust 侧命令（api.checkUpdate / api.installUpdate），本模块只管展示与回调。
 import { el } from "./dom";
+import { updatePanelViewState } from "./format";
 import type { UpdateCheck } from "./types";
 
 export interface UpdatePanelHandlers {
@@ -19,6 +20,8 @@ export interface UpdatePanelState {
   installing: boolean;
   /** 最近一次检测到的可用更新；无可用更新为 null。 */
   available: UpdateCheck | null;
+  /** 安装位置是否正常；异常且有可用更新时禁用安装并提示。 */
+  installLocationOk: boolean;
 }
 
 export interface UpdatePanelRegion {
@@ -54,12 +57,15 @@ export function createUpdatePanel(handlers: UpdatePanelHandlers): UpdatePanelReg
     checkButton.textContent = state.checking ? "检查中…" : "检查更新";
 
     const available = state.available;
+    // 视图状态（禁用与否、引导文案）由纯函数统一计算，便于在 node --test 中直接断言。
+    const view = updatePanelViewState(state);
     installButton.hidden = available === null;
-    installButton.disabled = state.installing;
+    installButton.disabled = view.installDisabled || state.installing;
     installButton.textContent = installLabel(state);
 
-    if (state.installing) {
-      hint.textContent = "正在下载并安装更新，完成后会自动重启应用…";
+    // hint 优先级：安装中 > 安装位置异常 > 正常新版本 > 无可用更新。
+    if (state.installing || (available && !state.installLocationOk)) {
+      hint.textContent = view.hint;
       hint.hidden = false;
     } else if (available) {
       hint.textContent = available.notes?.trim()

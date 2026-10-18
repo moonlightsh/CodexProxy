@@ -196,6 +196,7 @@ async function main(): Promise<void> {
       checking: busy.has("checkUpdate"),
       installing: busy.has("installUpdate"),
       available: updateAvailable,
+      installLocationOk: status?.installLocationOk ?? true,
     });
   }
 
