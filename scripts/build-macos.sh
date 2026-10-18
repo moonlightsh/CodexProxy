@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # 构建 macOS universal（arm64 + x86_64）dmg，本机与 CI（release.yml 的 macos-release job）共用。
-# 无参数；产物为 ad-hoc 签名（tauri.macos.conf.json 的 signingIdentity "-"），不生成升级产物。
+# 无参数；产物为 ad-hoc 签名（tauri.macos.conf.json 的 signingIdentity "-"）。
+# 提供环境变量 TAURI_SIGNING_PRIVATE_KEY 时额外产出升级产物（.app.tar.gz + .sig），
+# 未提供时降级为不生成升级产物（本地开发构建不受影响）。
 #
 # 前置条件：
 # - macOS，Xcode 命令行工具（lipo、codesign、hdiutil）
@@ -81,10 +83,19 @@ for t in "${TARGETS[@]}"; do
   cp "$UNIVERSAL" "$BIN_DIR/$SIDECAR-$t"
 done
 
-# 打包：先删旧产物，避免旧版本 dmg 被当成本次结果。
+# 打包：先删旧产物，避免旧版本 dmg / 升级产物被当成本次结果。
 BUNDLE=target/universal-apple-darwin/release/bundle
 rm -rf "$BUNDLE/dmg" "$BUNDLE/macos"
-(cd apps/desktop && npx tauri build --target universal-apple-darwin --config src-tauri/tauri.bundle.conf.json)
+# 未提供签名私钥时，用第三个 --config 内联覆盖 createUpdaterArtifacts=false，
+# 走降级路径（CLI 按顺序合并 --config，后传覆盖先传，标量覆盖）。
+UPDATER_ARGS=()
+if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+  echo "本地构建：未提供签名私钥，跳过升级产物"
+  UPDATER_ARGS+=(--config '{"bundle":{"createUpdaterArtifacts":false}}')
+fi
+# bash 3.2（macOS 自带）在 set -u 下展开空数组会报 unbound variable，
+# 用 ${arr[@]+…} 惯用法兼容空数组。
+(cd apps/desktop && npx tauri build --target universal-apple-darwin --config src-tauri/tauri.bundle.conf.json ${UPDATER_ARGS[@]+"${UPDATER_ARGS[@]}"})
 
 # 自检：恰好一个 dmg；.app 内两个可执行文件都含两种架构；签名完整。
 shopt -s nullglob
@@ -100,8 +111,38 @@ for exe in codex-helper "$SIDECAR"; do
 done
 codesign --verify --deep --strict "$APP"
 
+# 升级产物自检：有私钥时恰好一个 .app.tar.gz 且对应 .sig 非空；
+# 无私钥时断言 tar.gz 不存在（防旧产物残留误传）。
+shopt -s nullglob
+targzs=("$BUNDLE"/macos/*.app.tar.gz)
+shopt -u nullglob
+UPDATER_ARTIFACT=""
+if [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+  if [[ ${#targzs[@]} -ne 1 ]]; then
+    echo "期望恰好 1 个 .app.tar.gz 升级产物，实际 ${#targzs[@]} 个：${targzs[*]:-无}" >&2
+    exit 1
+  fi
+  UPDATER_ARTIFACT="${targzs[0]}"
+  SIG="$UPDATER_ARTIFACT.sig"
+  if [[ ! -s "$SIG" ]]; then
+    echo "升级产物签名缺失或为空：$SIG" >&2
+    exit 1
+  fi
+else
+  if [[ ${#targzs[@]} -ne 0 ]]; then
+    echo "未提供签名私钥却存在 .app.tar.gz（应为降级路径，无升级产物）：${targzs[*]}" >&2
+    exit 1
+  fi
+fi
+
 DMG="$(cd "$(dirname "${dmgs[0]}")" && pwd)/$(basename "${dmgs[0]}")"
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+  if [[ -n "$UPDATER_ARTIFACT" ]]; then
+    echo "updater_artifact=$(cd "$(dirname "$UPDATER_ARTIFACT")" && pwd)/$(basename "$UPDATER_ARTIFACT")" >> "$GITHUB_OUTPUT"
+  fi
 fi
 echo "产物：$DMG"
+if [[ -n "$UPDATER_ARTIFACT" ]]; then
+  echo "升级产物：$UPDATER_ARTIFACT（+$UPDATER_ARTIFACT.sig）"
+fi
