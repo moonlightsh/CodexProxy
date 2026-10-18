@@ -94,7 +94,7 @@ pub struct Status {
     pub platform_supported: bool,
     /// 平台标识：`"windows"` / `"macos"` / `"other"`
     pub platform: String,
-    /// 是否支持内部升级（仅 Windows 为 true；为 false 时界面隐藏升级区域）
+    /// 是否支持内部升级（Windows 与 macOS 为 true；为 false 时界面隐藏升级区域）
     pub update_supported: bool,
     /// 安装位置是否正常；macOS 上从 dmg 或 App Translocation 临时路径运行时为 false，
     /// 其他平台恒为 true

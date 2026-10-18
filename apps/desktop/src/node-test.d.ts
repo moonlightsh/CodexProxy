@@ -9,10 +9,12 @@ declare module "node:assert/strict" {
   function ok(value: unknown, message?: string | Error): asserts value;
   function equal(actual: unknown, expected: unknown, message?: string | Error): void;
   function deepEqual(actual: unknown, expected: unknown, message?: string | Error): void;
+  function match(actual: string, expected: RegExp, message?: string | Error): void;
   const assertStrict: {
     ok: typeof ok;
     equal: typeof equal;
     deepEqual: typeof deepEqual;
+    match: typeof match;
   };
   export default assertStrict;
 }

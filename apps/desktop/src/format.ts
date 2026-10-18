@@ -1,5 +1,6 @@
 // 纯函数：状态 / 数值到界面文案与颜色等级的映射。不依赖 DOM，可在 Node 测试中直接运行。
 import type { ProxyStatus, Reachability, Route, Status } from "./types";
+import type { UpdatePanelState } from "./updatepanel";
 
 /**
  * 首次运行判定（设计 §8）：未配置 Key 且未启用时，只显示简短说明与 Key 录入区，
@@ -116,4 +117,23 @@ export function uninstallHint(status: Pick<Status, "platform">): string | null {
 /** 是否显示升级区：只有支持内部升级时显示；状态未加载时也隐藏，避免 macOS 上闪现。 */
 export function showUpdatePanel(status: Pick<Status, "updateSupported"> | null): boolean {
   return status?.updateSupported === true;
+}
+
+/**
+ * 升级区视图状态：由安装中、可用更新与安装位置共同决定“立即更新”禁用与否及提示文案。
+ * 优先级：安装中 > 安装位置异常 > 正常新版本 / 无可用更新（后两者 hint 为空，由面板自行展示）。
+ */
+export function updatePanelViewState(
+  state: Pick<UpdatePanelState, "available" | "installing" | "installLocationOk">,
+): { installDisabled: boolean; hint: string } {
+  if (state.installing) {
+    return { installDisabled: true, hint: "正在下载并安装更新，完成后会自动重启应用…" };
+  }
+  if (state.available && !state.installLocationOk) {
+    return {
+      installDisabled: true,
+      hint: `发现新版本 v${state.available.version}，请先把 CodexHelper 拖到「应用程序」文件夹后再更新`,
+    };
+  }
+  return { installDisabled: false, hint: "" };
 }

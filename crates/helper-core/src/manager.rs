@@ -1304,7 +1304,7 @@ impl Manager {
         Status {
             platform_supported: cfg!(any(windows, target_os = "macos")),
             platform: consts::PLATFORM.to_string(),
-            update_supported: cfg!(windows),
+            update_supported: cfg!(any(windows, target_os = "macos")),
             install_location_ok: !self.transient_install(),
             enabled: state.enabled,
             key_configured,

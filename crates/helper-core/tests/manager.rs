@@ -1711,7 +1711,10 @@ async fn status_reports_static_fields_and_file_inspection() {
         status.platform_supported,
         cfg!(any(windows, target_os = "macos"))
     );
-    assert_eq!(status.update_supported, cfg!(windows));
+    assert_eq!(
+        status.update_supported,
+        cfg!(any(windows, target_os = "macos"))
+    );
     assert!(
         status.install_location_ok,
         "测试用 COMMAND 不是临时安装位置"
