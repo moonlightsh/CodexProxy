@@ -63,16 +63,42 @@ fn validate_endpoint(raw: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-/// 内部升级只在 Windows 上提供（与 `Status::update_supported` 同一判断）。其他平台直接拒绝，
-/// 不读环境变量、不请求检测地址。
+/// 临时安装位置（dmg / App Translocation）下尝试安装更新时的引导文案，
+/// 与前端 `INSTALL_LOCATION_MESSAGE` 同义（macOS 设计 §4.2）。
+pub const TRANSIENT_INSTALL_UPDATE_MESSAGE: &str =
+    "请先把 CodexHelper 拖到「应用程序」文件夹，再从那里打开后再更新";
+
+/// 内部升级只在 Windows 与 macOS 上提供（与 `Status::update_supported` 同一判断）。
+/// 其他平台直接拒绝，不读环境变量、不请求检测地址。
 fn ensure_update_supported() -> Result<(), ErrorPayload> {
-    if cfg!(windows) {
+    if cfg!(any(windows, target_os = "macos")) {
         Ok(())
     } else {
         Err(ErrorPayload {
             code: "update".to_string(),
             message: "当前平台不支持内部升级，请到 GitHub Release 下载新版本".to_string(),
         })
+    }
+}
+
+/// 当前主程序是否运行在 macOS 临时安装位置（dmg 直接运行或 App Translocation）。
+/// 判定核心抽成独立函数以便单测：`current_exe` 失败时视为正常（不拦升级）。
+fn transient_run_location() -> bool {
+    std::env::current_exe()
+        .map(|path| helper_core::paths::is_transient_install_path(&path))
+        .unwrap_or(false)
+}
+
+/// 拦截临时安装位置下的升级安装（macOS 设计 M3：检测可用、安装拦截，纵深防御）。
+/// 仅 macOS 生效，其他平台直接放行（用 `cfg!` 而非 `#[cfg]`，保持两平台都能编译测试）。
+fn ensure_install_location_ok() -> Result<(), ErrorPayload> {
+    if cfg!(target_os = "macos") && transient_run_location() {
+        Err(ErrorPayload {
+            code: "update".to_string(),
+            message: TRANSIENT_INSTALL_UPDATE_MESSAGE.to_string(),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -102,7 +128,7 @@ fn map_error(context: &str, error: tauri_plugin_updater::Error) -> ErrorPayload 
 }
 
 /// 检测是否有可用更新（只检测、不下载）。前端“检查更新”按钮与启动自动检测都调用它。
-/// 非 Windows 平台直接返回 `update` 错误。
+/// 非 Windows/macOS 平台直接返回 `update` 错误（临时安装位置不拦检测，设计 M3）。
 #[tauri::command]
 pub async fn check_update(app: AppHandle) -> Result<UpdateCheck, ErrorPayload> {
     ensure_update_supported()?;
@@ -146,13 +172,14 @@ pub fn app_version(app: AppHandle) -> Result<String, ErrorPayload> {
 }
 
 /// 下载并安装可用更新，成功后重启应用；无可用更新时返回错误由前端提示刷新。
-/// 非 Windows 平台直接返回 `update` 错误。
+/// 非 Windows/macOS 平台直接返回 `update` 错误；macOS 临时安装位置下拦截安装并引导。
 ///
 /// `expected_version` 是前端在确认框里向用户展示并确认的版本。安装前重新检查一次，若
 /// 服务器此刻返回的版本与用户确认的不一致，则拒绝安装，避免“确认 A 却装了 B”的竞态。
 #[tauri::command]
 pub async fn install_update(app: AppHandle, expected_version: String) -> Result<(), ErrorPayload> {
     ensure_update_supported()?;
+    ensure_install_location_ok()?;
     let updater = build_updater(&app)?;
     let update = match updater.check().await {
         Ok(Some(update)) => update,
@@ -192,9 +219,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn update_commands_only_supported_on_windows() {
+    fn update_commands_supported_on_windows_and_macos() {
         let result = ensure_update_supported();
-        assert_eq!(result.is_ok(), cfg!(windows));
+        assert_eq!(result.is_ok(), cfg!(any(windows, target_os = "macos")));
         if let Err(e) = result {
             assert_eq!(e.code, "update");
             assert_eq!(
@@ -202,6 +229,21 @@ mod tests {
                 "当前平台不支持内部升级，请到 GitHub Release 下载新版本"
             );
         }
+    }
+
+    #[test]
+    fn install_location_message_matches_design() {
+        assert_eq!(
+            TRANSIENT_INSTALL_UPDATE_MESSAGE,
+            "请先把 CodexHelper 拖到「应用程序」文件夹，再从那里打开后再更新"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn transient_run_location_false_for_normal_path() {
+        // 正常 /Applications 安装下 current_exe 不含 /Volumes/ 或 /AppTranslocation/
+        assert!(!transient_run_location());
     }
 
     #[test]
