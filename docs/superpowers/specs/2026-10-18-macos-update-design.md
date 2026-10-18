@@ -1,7 +1,7 @@
 # CodexHelper macOS 内部升级渠道设计
 
 - 日期：2026-10-18
-- 状态：已确认（用户授权按合理默认推进）
+- 状态：已实现（见 docs/superpowers/plans/2026-10-18-macos-update.md）
 - 上游设计：`docs/superpowers/specs/2026-09-23-codex-helper-design.md` §15（Windows 升级渠道）
 - 取代：`2026-10-14-codex-helper-macos-design.md` 决策 D6（"不接入内部升级渠道"）
 
