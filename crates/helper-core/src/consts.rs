@@ -11,9 +11,15 @@ pub const GATEWAY_PORT: u16 = 8080;
 pub const SOCKS5_HOST: &str = "10.20.30.61";
 /// 上游 SOCKS5 端口。
 pub const SOCKS5_PORT: u16 = 7891;
+/// 安全上游端口（独立 mihomo-auth 实例：TLS + mTLS + SOCKS5 用户名密码，设计 §4.1）。
+pub const SOCKS5_AUTH_PORT: u16 = 7892;
 
 /// 本地分流代理默认端口。
 pub const DEFAULT_PROXY_PORT: u16 = 17891;
+
+/// Secure 激活时旧代理句柄的排空上限（设计 §9.1：旧连接最多 5 分钟排空后关闭）。
+/// 超时后强制关闭，避免旧隧道永久绕过进程门禁。
+pub const LEGACY_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// 仅供应急覆盖本地代理端口的环境变量；界面不暴露。
 pub const PROXY_PORT_ENV: &str = "CODEX_HELPER_PROXY_PORT";
 
@@ -27,6 +33,19 @@ pub const KEYCHAIN_ACCOUNT: &str = "codex-helper";
 pub const SECURITY_TOOL: &str = "/usr/bin/security";
 /// 每次调用 `security` 子进程的超时（秒）。
 pub const SECURITY_TIMEOUT_SECS: u64 = 10;
+
+/// SOCKS5 密码的钥匙串 / Credential Manager target 前缀（设计 §5.2）：后接 device-id。
+pub const PROXY_PASSWORD_TARGET_PREFIX: &str = "codex-helper/proxy-password/";
+/// 客户端软件私钥的 target 前缀（设计 §5.2）：后接 device-id。
+pub const PROXY_KEY_TARGET_PREFIX: &str = "codex-helper/proxy-key/";
+
+/// 管理签名（ed25519）验证公钥，64 字节小写 hex。
+///
+/// ⚠️ 当前是**测试 CA 公钥**（种子 0x00..0x1f，与 `process_policy` 测试夹具同一把），
+/// 仅供开发与测试验证链路；**发布前必须替换为管理员保管的管理公钥**，替换动作列入发布清单。
+/// 公钥本身是公开信任锚而非秘密，可以随二进制分发（设计 §5.1）。
+pub const POLICY_VERIFY_KEY_HEX: &str =
+    "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8";
 
 /// `config.toml` 中受管 provider 的 id。
 pub const PROVIDER_ID: &str = "managed_gateway";

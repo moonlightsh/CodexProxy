@@ -28,26 +28,33 @@
 
 use std::path::Path;
 use std::sync::{Arc, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::codex_config::{self, ApplyOutcome, ConfigError, ConfigInspection, PreviousConfig};
 use crate::codex_env;
+use crate::connection_gate::ConnectionGate;
 use crate::consts;
 use crate::credential::{self, CredentialStore, Secret};
 use crate::fsutil;
 use crate::gateway;
 use crate::log;
 use crate::paths::{self, HelperPaths};
+use crate::peer_identity::system_resolver;
+use crate::process_policy::{ProcessPolicy, parse_and_verify};
 use crate::proxy::{
     self, ProxyConfig, ProxyHandle, ProxyStartError, RecentConnections, RecordSink,
 };
-use crate::state::{self, HelperState};
+use crate::proxy_identity::{self, EnrollmentBundle};
+use crate::state::{self, HelperState, ProxyMode};
 use crate::types::{
     CleanupReport, ConnectionRecord, EnableRequest, KeyCheck, ManagerError, ProxyState,
-    ProxyStatus, Reachability, ReconcileOutcome, ReconcileReport, SaveKeyRequest, Status,
+    ProxyStatus, Reachability, ReconcileOutcome, ReconcileReport, SaveKeyRequest, SecureStatus,
+    Status,
 };
+use crate::upstream::{SecureUpstream, TlsUpstreamConfig};
 
 /// 编排层的全部可注入依赖。生产环境用 [`ManagerOptions::production`]，测试注入临时目录、
 /// 内存凭据、假网关与假 SOCKS5。
@@ -68,6 +75,31 @@ pub struct ManagerOptions {
     pub gateway_port: u16,
     /// 每条代理连接结束后的外部回调（桌面应用用它推送事件）；编排层自身维护环形缓冲
     pub on_record: Option<RecordSink>,
+    /// Secure 模式构造门禁时使用的连接所有者解析器工厂（生产为 [`system_resolver`]，
+    /// 测试注入 fake resolver）。每次激活现取一个新实例，不做跨激活复用。
+    pub secure_resolver:
+        Option<Arc<dyn Fn() -> Box<dyn crate::peer_identity::PeerResolver> + Send + Sync>>,
+    /// Secure 激活前排空旧代理句柄的上限（设计 §9.1 默认 5 分钟；测试注入短值）。
+    pub secure_drain_timeout: Option<Duration>,
+}
+
+impl Default for ManagerOptions {
+    fn default() -> Self {
+        Self {
+            paths: HelperPaths::new("/codex", "/data"),
+            credentials: Arc::new(crate::credential::MemoryCredentialStore::new()),
+            credential_command: String::new(),
+            proxy_port: consts::DEFAULT_PROXY_PORT,
+            socks5_host: consts::SOCKS5_HOST.to_string(),
+            socks5_port: consts::SOCKS5_PORT,
+            gateway_base_url: consts::GATEWAY_BASE_URL.to_string(),
+            gateway_host: consts::GATEWAY_HOST.to_string(),
+            gateway_port: consts::GATEWAY_PORT,
+            on_record: None,
+            secure_resolver: None,
+            secure_drain_timeout: None,
+        }
+    }
 }
 
 impl ManagerOptions {
@@ -87,6 +119,8 @@ impl ManagerOptions {
             gateway_host: consts::GATEWAY_HOST.to_string(),
             gateway_port: consts::GATEWAY_PORT,
             on_record,
+            secure_resolver: Some(Arc::new(|| system_resolver())),
+            secure_drain_timeout: None,
         })
     }
 }
@@ -102,7 +136,8 @@ pub struct Manager {
     recent: RecentConnections,
 }
 
-/// 操作锁保护的状态。不变式：`proxy.is_some()` 时运行时的 `proxy_state == Running`。
+/// 操作锁保护的状态。不变式：`proxy.is_some()` 时运行时的 `proxy_state == Running`，
+/// 且 handle 的配置模式与 `Runtime.mode` 一致（Secure 句柄只在 `mode == Secure` 时存在）。
 #[derive(Default)]
 struct Ops {
     /// 本进程启动的代理
@@ -115,6 +150,11 @@ struct Runtime {
     proxy_state: ProxyState,
     gateway: Reachability,
     socks5: Reachability,
+    /// 内存中的代理模式（与状态文件 `mode` 同步更新；进程重启后从状态文件读回）。
+    /// 只在持有操作锁时写入。
+    mode: ProxyMode,
+    /// 本进程是否持有 Secure 配置的代理句柄（`Status.secure.active` 的数据源之一）。
+    secure_handle: bool,
 }
 
 impl Manager {
@@ -208,6 +248,8 @@ impl Manager {
     /// 工具启动对账（设计 §5.3）。
     pub async fn reconcile_on_startup(&self) -> ReconcileReport {
         let mut ops = self.ops.lock().await;
+        // 先从状态文件同步内存模式：Secure 模式的对账绝不进入 External 复用（设计 §6.3）。
+        self.sync_mode_from_state();
         let (outcome, error) = match self.reconcile_locked(&mut ops).await {
             Ok(outcome) => (outcome, None),
             Err(error) => (ReconcileOutcome::Failed, Some(error)),
@@ -280,6 +322,7 @@ impl Manager {
     /// 仍在（或无法读取），尽力重新启动代理，避免 Codex 指向无人监听的端口。
     pub async fn revoke_managed_config(&self) -> Result<Status, ManagerError> {
         let mut ops = self.ops.lock().await;
+        self.sync_mode_from_state();
         self.stop_proxy(&mut ops).await;
         let options = &self.options;
         let result = cleanup(&options.paths, options.credentials.as_ref(), false)
@@ -389,6 +432,8 @@ impl Manager {
 
         let mut ops = self.ops.lock().await;
         // 等锁期间文件可能已被其他操作改变：锁内重新预检，以此为准
+        // （同时从状态文件同步代理模式：Secure 已激活时 ensure_proxy 不得走 Legacy 路径）
+        self.sync_mode_from_state();
         let (mut snapshot, inspection) = self
             .enable_preflight(confirm_remove_catalog)
             .map_err(preflight)?;
@@ -695,23 +740,59 @@ impl Manager {
 
     // ---- 代理 ----
 
-    /// 确保本地代理可用：本进程已持有 → 复用；端口上是本工具另一实例 → 视为 External 复用；
-    /// 否则启动。返回本次是否新启动了代理（回滚时只停止它）。
+    /// 确保本地代理可用。
+    ///
+    /// - 本进程已持有句柄 → 直接复用（模式不变）；
+    /// - Legacy：端口上是本工具另一实例（自识探测命中）→ 视为 External 复用（既有行为）；
+    /// - **Secure：删除 External 复用分支（设计 §6.3、Task 9）**——端口被占一律报
+    ///   [`ManagerError::SecurePortOccupied`]，提示退出旧实例；绝不杀未知占用者、不换端口、
+    ///   不信任自识应答（那不是安全证明）。
+    ///
+    /// 返回本次是否新启动了代理（回滚时只停止它）。
     async fn ensure_proxy(&self, ops: &mut Ops) -> Result<bool, ManagerError> {
+        let mode = self.mode();
         if ops.proxy.is_some() {
             self.set_proxy_state(ProxyState::Running);
             return Ok(false);
         }
         let port = self.options.proxy_port;
-        if proxy::probe_existing(port).await {
-            self.set_proxy_state(ProxyState::External);
-            log::event("manager.proxy_external", json!({ "port": port }));
-            return Ok(false);
+        match mode {
+            ProxyMode::Legacy => {
+                if proxy::probe_existing(port).await {
+                    self.set_proxy_state(ProxyState::External);
+                    log::event("manager.proxy_external", json!({ "port": port }));
+                    return Ok(false);
+                }
+            }
+            // Secure 模式绝不复用外部实例：自识应答器可以被任何程序伪造，
+            // 复用等于把门禁让给不可核实的进程。
+            ProxyMode::Secure => {
+                if proxy::probe_existing(port).await {
+                    self.set_proxy_state(ProxyState::Stopped);
+                    log::event(
+                        "manager.secure_blocked",
+                        json!({ "port": port, "reason": "port_occupied" }),
+                    );
+                    return Err(ManagerError::SecurePortOccupied { port });
+                }
+            }
         }
-        match proxy::spawn(port, self.proxy_config()).await {
+        let secure = mode == ProxyMode::Secure;
+        let config = if secure {
+            // Secure 对账重启：需要从已保存的注册包与秘密重建上游与门禁。
+            let (upstream, gate) = self.rebuild_secure_runtime().await.map_err(|error| {
+                self.note_secure_blocked("rebuild_failed");
+                ManagerError::SecureActivation { message: error }
+            })?;
+            self.secure_proxy_config(upstream, gate)
+        } else {
+            self.proxy_config()
+        };
+        match proxy::spawn(port, config).await {
             Ok(handle) => {
                 ops.proxy = Some(handle);
                 self.set_proxy_state(ProxyState::Running);
+                self.set_secure_handle(secure);
                 Ok(true)
             }
             Err(error) => {
@@ -719,7 +800,17 @@ impl Manager {
                 log::event("manager.proxy_start_failed", json!({ "port": port }));
                 Err(match error {
                     ProxyStartError::PortUnavailable { port, reason } => {
-                        ManagerError::PortUnavailable { port, reason }
+                        if secure {
+                            // Secure 模式下端口不可用同样不得回退/复用：统一报独占错误。
+                            log::event(
+                                "manager.secure_blocked",
+                                json!({ "port": port, "reason": "port_unavailable" }),
+                            );
+                            self.note_secure_blocked("port_unavailable");
+                            ManagerError::SecurePortOccupied { port }
+                        } else {
+                            ManagerError::PortUnavailable { port, reason }
+                        }
                     }
                     ProxyStartError::Io(error) => ManagerError::Internal {
                         message: format!("启动本地代理失败：{error}"),
@@ -739,9 +830,38 @@ impl Manager {
             log::event("manager.proxy_external_left", json!({ "port": port }));
         }
         self.set_proxy_state(ProxyState::Stopped);
+        self.set_secure_handle(false);
     }
 
-    /// 代理参数：连接记录先进环形缓冲，再交给外部回调。回调运行在代理任务里，绝不获取任何编排锁。
+    /// 停止本进程代理并等待排空（设计 §9.1：旧连接最多 5 分钟排空后关闭）。
+    ///
+    /// `shutdown` 会等待全部在途连接任务被中止后返回；这里再套一个排空上限，防止监听循环
+    /// 因异常路径永久卡住而阻塞激活流程。超时后句柄被丢弃（drop 同样触发退出），端口仍会释放。
+    async fn stop_proxy_drained(&self, ops: &mut Ops) {
+        let timeout = self
+            .options
+            .secure_drain_timeout
+            .unwrap_or(consts::LEGACY_DRAIN_TIMEOUT);
+        if let Some(handle) = ops.proxy.take() {
+            let port = self.options.proxy_port;
+            if tokio::time::timeout(timeout, handle.shutdown())
+                .await
+                .is_err()
+            {
+                log::event(
+                    "manager.proxy_drain_timeout",
+                    json!({ "port": port, "secs": timeout.as_secs() }),
+                );
+            } else {
+                log::event("manager.proxy_stopped", json!({ "port": port }));
+            }
+        }
+        self.set_proxy_state(ProxyState::Stopped);
+        self.set_secure_handle(false);
+    }
+
+    /// 代理参数（Legacy）：连接记录先进环形缓冲，再交给外部回调。回调运行在代理任务里，
+    /// 绝不获取任何编排锁。
     fn proxy_config(&self) -> ProxyConfig {
         let recent = self.recent.clone();
         let external = self.options.on_record.clone();
@@ -756,7 +876,328 @@ impl Manager {
             socks5_port: self.options.socks5_port,
             on_record: Some(sink),
             direct_overrides: None,
+            secure_upstream: None,
+            gate: None,
         }
+    }
+
+    /// Secure 配置的代理参数：安全上游 + 进程门禁（设计 §6.3、§7）。
+    fn secure_proxy_config(
+        &self,
+        upstream: Arc<SecureUpstream>,
+        gate: Arc<ConnectionGate>,
+    ) -> ProxyConfig {
+        let mut config = self.proxy_config();
+        config.secure_upstream = Some(upstream);
+        config.gate = Some(gate);
+        config
+    }
+
+    // ---- Secure 模式（Task 9；设计 §5.1 第 5 步、§6.3、§8.1、§9.1）----
+
+    /// 激活 Secure 模式（设计 §5.1 第 5 步）。
+    ///
+    /// 流程（全部在操作锁内，任一步失败 fail-closed、不改状态文件里的模式）：
+    /// 1. 读取并解析注册包（`parse_enrollment`，形态校验）；
+    /// 2. 验证管理签名（`parse_and_verify` + `POLICY_VERIFY_KEY_HEX`）并比对策略版本：
+    ///    新版本低于已持久化版本（含 `deactivate_secure` 后仍保留的记录）即拒绝
+    ///    （Task 6 交接：版本回退防线落在持久化层）；
+    /// 3. 读取系统存储里的 SOCKS5 密码与客户端私钥（`load_secrets`）；
+    /// 4. 构造 `SecureUpstream`（TLS/mTLS + 用户名密码）与 `ConnectionGate`
+    ///    （`system_resolver`，测试可注入 fake）；
+    /// 5. **先关停现有 proxy handle（排空，上限 5 分钟）**；
+    /// 6. 以 Secure 配置 spawn；端口被外部进程占用（自识探测命中非本进程句柄或 bind
+    ///    失败）→ 激活失败（`SecurePortOccupied`），**不进入 External 复用**；
+    /// 7. 全部成功后原子写状态文件（mode=Secure、设备/策略记录、清除 blocked_reason）。
+    ///
+    /// 本函数不做到服务端的端到端探测（上游连通性由实际连接时的 fail-closed 路径兜底）；
+    /// 不改变 config.toml / .env（它们与模式无关，由 enable/reconcile 维护）。
+    pub async fn activate_secure(&self, bundle_path: &Path) -> Result<Status, ManagerError> {
+        let mut ops = self.ops.lock().await;
+        let result = self.activate_secure_locked(&mut ops, bundle_path).await;
+        match &result {
+            Ok(_) => log::event("manager.secure_activated", json!({})),
+            Err(error) => log::event("manager.secure_blocked", json!({ "code": error.code() })),
+        }
+        result?;
+        Ok(self.build_status())
+    }
+
+    /// 激活的锁内实现。失败时保持调用前的状态文件内容与（若此前持有）旧句柄不动。
+    async fn activate_secure_locked(
+        &self,
+        ops: &mut Ops,
+        bundle_path: &Path,
+    ) -> Result<(), ManagerError> {
+        let paths = &self.options.paths;
+        let mut snapshot = read_state(&paths.state_file())?;
+        quarantine_corrupt_state(paths, &mut snapshot);
+
+        // 1. 读取并解析注册包（读文件失败 → Io）
+        let bundle_bytes = std::fs::read(bundle_path).map_err(|error| ManagerError::Io {
+            message: format!("{}：{error}", bundle_path.display()),
+        })?;
+        let bundle = proxy_identity::parse_enrollment(&bundle_bytes).map_err(|error| {
+            ManagerError::SecureActivation {
+                message: format!("{error:#}"),
+            }
+        })?;
+
+        // 2. 管理签名验证 + 策略版本单调性（fail-closed，不回退）
+        let verify_key = proxy_identity::policy_verify_key().map_err(|error| {
+            ManagerError::SecureActivation {
+                message: format!("{error:#}"),
+            }
+        })?;
+        let policy = self.verify_policy_monotonic(&bundle, &verify_key, &snapshot.state)?;
+
+        // 3. 读取系统存储里的 SOCKS5 密码与客户端私钥（失败 → 拒绝激活）
+        let secrets = proxy_identity::load_secrets(&bundle.device_id).map_err(|error| {
+            ManagerError::SecureActivation {
+                message: format!("{error:#}"),
+            }
+        })?;
+
+        // 4. 构造 SecureUpstream 与 ConnectionGate（resolver 生产为 system_resolver）
+        let upstream = Arc::new(SecureUpstream {
+            host: bundle.server_host.clone(),
+            port: bundle.server_port,
+            tls: TlsUpstreamConfig {
+                server_name: bundle.server_name.clone(),
+                ca_pem: bundle.ca_pem.clone().into_bytes(),
+                client_cert_pem: bundle.client_cert_pem.clone().into_bytes(),
+                client_key_pem: secrets.client_key_pem.clone(),
+            },
+            username: secrets.username.clone(),
+            password: secrets.password.clone(),
+        });
+        let resolver = match &self.options.secure_resolver {
+            Some(factory) => factory(),
+            None => system_resolver(),
+        };
+        let gate = Arc::new(ConnectionGate::new(resolver, Arc::new(policy.clone())));
+        let config = self.secure_proxy_config(upstream, gate);
+
+        // 5. 先关停现有 proxy handle（排空；旧连接最多 5 分钟后关闭）
+        self.stop_proxy_drained(ops).await;
+
+        // 6. Secure spawn：绝不进入 External 复用；端口被占（自识命中或 bind 失败）即失败
+        let port = self.options.proxy_port;
+        if proxy::probe_existing(port).await {
+            log::event(
+                "manager.secure_blocked",
+                json!({ "port": port, "reason": "port_occupied" }),
+            );
+            self.record_secure_blocked(&mut snapshot, "port_occupied")?;
+            return Err(ManagerError::SecurePortOccupied { port });
+        }
+        match proxy::spawn(port, config).await {
+            Ok(handle) => {
+                ops.proxy = Some(handle);
+                self.set_proxy_state(ProxyState::Running);
+                self.set_mode(ProxyMode::Secure);
+                self.set_secure_handle(true);
+            }
+            Err(error) => {
+                self.set_proxy_state(ProxyState::Stopped);
+                log::event(
+                    "manager.secure_blocked",
+                    json!({ "port": port, "reason": "port_unavailable" }),
+                );
+                // 底层原因只进日志：错误对象保持面向用户行动的固定文案与稳定 code。
+                let detail = match &error {
+                    ProxyStartError::PortUnavailable { reason, .. } => reason.clone(),
+                    ProxyStartError::Io(error) => error.to_string(),
+                };
+                log::event(
+                    "manager.secure_spawn_failed",
+                    json!({ "port": port, "detail": detail }),
+                );
+                self.record_secure_blocked(&mut snapshot, "port_unavailable")?;
+                return Err(ManagerError::SecurePortOccupied { port });
+            }
+        }
+
+        // 7. 全部成功：原子写状态文件 + 归档注册包（归档失败不回滚激活——注册包可重新
+        //    提供；状态文件里已记录设备/策略，对账时按记录提示重装注册包）
+        let mut next = snapshot.state.clone();
+        next.mode = ProxyMode::Secure;
+        next.secure_device_id = Some(bundle.device_id.clone());
+        next.secure_policy_id = Some(policy.policy_id.clone());
+        next.secure_policy_version = Some(policy.version);
+        next.secure_blocked_reason = None;
+        if snapshot.exists || next != snapshot.state {
+            save_state(paths, &next)?;
+        }
+        if let Err(error) = archive_bundle(paths, &bundle_bytes) {
+            log::event(
+                "manager.secure_bundle_archive_failed",
+                json!({ "message": error.to_string() }),
+            );
+        }
+        Ok(())
+    }
+
+    /// 验证管理签名并比对版本单调性。新策略版本低于已见版本（含停用后保留的记录）
+    /// → [`ManagerError::PolicyVersionRollback`]（Task 6 交接的持久化层防线）。
+    fn verify_policy_monotonic(
+        &self,
+        bundle: &EnrollmentBundle,
+        verify_key: &ed25519_dalek::VerifyingKey,
+        state: &HelperState,
+    ) -> Result<ProcessPolicy, ManagerError> {
+        let signature = parse_signature_hex(&bundle.policy_signature)?;
+        let policy = parse_and_verify(bundle.policy_bundle_json.as_bytes(), &signature, verify_key)
+            .map_err(|error| ManagerError::SecureActivation {
+                message: format!("{error:#}"),
+            })?;
+        if let Some(seen) = state.secure_policy_version
+            && policy.version < seen
+        {
+            log::event(
+                "manager.secure_blocked",
+                json!({ "reason": "version_rollback", "seen": seen, "new": policy.version }),
+            );
+            return Err(ManagerError::PolicyVersionRollback {
+                seen,
+                new: policy.version,
+            });
+        }
+        Ok(policy)
+    }
+
+    /// 回滚：停用 Secure 模式（显式回退，设计 §8.1「显式停用 → Disabled」入口）。
+    ///
+    /// 停 handle → 模式回 Legacy → 按现有 Legacy 逻辑重启（已启用时）。策略版本记录
+    /// **保留**（防止借停用/重启回退到旧策略）。状态文件写入失败时仍返回错误，但内存
+    /// 模式已回 Legacy（下次进程重启读状态文件会看到 Secure——用户需重试停用）。
+    pub async fn deactivate_secure(&self) -> Result<Status, ManagerError> {
+        let mut ops = self.ops.lock().await;
+        let result = self.deactivate_secure_locked(&mut ops).await;
+        log::event(
+            "manager.secure_deactivated",
+            json!({ "ok": result.is_ok(), "code": result.as_ref().err().map(ManagerError::code) }),
+        );
+        result?;
+        Ok(self.build_status())
+    }
+
+    async fn deactivate_secure_locked(&self, ops: &mut Ops) -> Result<(), ManagerError> {
+        let paths = &self.options.paths;
+        let mut snapshot = read_state(&paths.state_file())?;
+        quarantine_corrupt_state(paths, &mut snapshot);
+        if snapshot.state.mode != ProxyMode::Secure {
+            return Ok(());
+        }
+
+        // 停 handle（受控排空）
+        self.stop_proxy_drained(ops).await;
+
+        // 模式回 Legacy；保留策略版本记录（版本回退防线）
+        self.set_mode(ProxyMode::Legacy);
+        let mut next = snapshot.state.clone();
+        next.mode = ProxyMode::Legacy;
+        next.secure_blocked_reason = None;
+        if snapshot.exists || next != snapshot.state {
+            save_state(paths, &next)?;
+        }
+
+        // 已启用时按 Legacy 逻辑重启代理
+        if snapshot.state.enabled {
+            self.ensure_proxy(ops).await?;
+        }
+        Ok(())
+    }
+
+    /// Secure 对账重启：从归档注册包与系统存储重建上游与门禁。
+    /// 任一步失败 → 上层记为激活失败（fail-closed，不回退 Legacy 路径）。
+    async fn rebuild_secure_runtime(
+        &self,
+    ) -> Result<(Arc<SecureUpstream>, Arc<ConnectionGate>), String> {
+        let paths = &self.options.paths;
+        let state = read_state(&paths.state_file())
+            .map_err(|error| format!("读取状态文件失败：{error:#}"))?
+            .state;
+        let device_id = state
+            .secure_device_id
+            .ok_or("状态文件缺少 secure_device_id，无法重建 Secure 配置")?;
+        let bundle_path = paths.enrollment_bundle();
+        let bundle_bytes = std::fs::read(&bundle_path)
+            .map_err(|error| format!("读取归档注册包失败（{}）：{error}", bundle_path.display()))?;
+        let bundle = proxy_identity::parse_enrollment(&bundle_bytes)
+            .map_err(|error| format!("归档注册包解析失败：{error:#}"))?;
+        if bundle.device_id != device_id {
+            return Err("归档注册包的 device_id 与状态文件记录不一致".into());
+        }
+        let verify_key =
+            proxy_identity::policy_verify_key().map_err(|error| format!("{error:#}"))?;
+        let signature =
+            parse_signature_hex(&bundle.policy_signature).map_err(|error| format!("{error:#}"))?;
+        let policy = parse_and_verify(
+            bundle.policy_bundle_json.as_bytes(),
+            &signature,
+            &verify_key,
+        )
+        .map_err(|error| format!("{error:#}"))?;
+        if let Some(seen) = state.secure_policy_version
+            && policy.version < seen
+        {
+            return Err(format!(
+                "策略版本倒退（已见 {seen}，注册包 {}），拒绝重建",
+                policy.version
+            ));
+        }
+        let secrets =
+            proxy_identity::load_secrets(&device_id).map_err(|error| format!("{error:#}"))?;
+        let upstream = Arc::new(SecureUpstream {
+            host: bundle.server_host.clone(),
+            port: bundle.server_port,
+            tls: TlsUpstreamConfig {
+                server_name: bundle.server_name.clone(),
+                ca_pem: bundle.ca_pem.clone().into_bytes(),
+                client_cert_pem: bundle.client_cert_pem.clone().into_bytes(),
+                client_key_pem: secrets.client_key_pem,
+            },
+            username: secrets.username,
+            password: secrets.password,
+        });
+        let resolver = match &self.options.secure_resolver {
+            Some(factory) => factory(),
+            None => system_resolver(),
+        };
+        let gate = Arc::new(ConnectionGate::new(resolver, Arc::new(policy)));
+        Ok((upstream, gate))
+    }
+
+    /// 把 SecureBlocked 的短原因码写进状态文件（尽力而为：写失败只记日志，激活失败的
+    /// 原始错误仍向上传播）。
+    fn record_secure_blocked(
+        &self,
+        snapshot: &mut StateSnapshot,
+        reason: &str,
+    ) -> Result<(), ManagerError> {
+        let paths = &self.options.paths;
+        let mut next = snapshot.state.clone();
+        next.secure_blocked_reason = Some(reason.to_string());
+        match save_state(paths, &next) {
+            Ok(()) => {
+                snapshot.state = next;
+                snapshot.exists = true;
+                Ok(())
+            }
+            Err(error) => {
+                log::event(
+                    "manager.secure_blocked_reason_write_failed",
+                    json!({ "code": error.code() }),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// 仅更新内存中的 blocked_reason（不写状态文件；对账路径在失败时已有独立报告）。
+    fn note_secure_blocked(&self, reason: &str) {
+        log::event("manager.secure_blocked", json!({ "reason": reason }));
     }
 
     // ---- 状态 ----
@@ -773,6 +1214,37 @@ impl Manager {
     /// 只应在持有操作锁时调用。
     fn set_proxy_state(&self, state: ProxyState) {
         self.runtime().proxy_state = state;
+    }
+
+    /// 当前内存模式（进程内以激活/停用调用为准；新 Manager 实例从状态文件同步，
+    /// 见 [`Manager::sync_mode_from_state`]）。
+    fn mode(&self) -> ProxyMode {
+        self.runtime().mode
+    }
+
+    /// 只应在持有操作锁时调用。
+    fn set_mode(&self, mode: ProxyMode) {
+        self.runtime().mode = mode;
+    }
+
+    /// 本进程是否持有 Secure 配置的代理句柄。
+    fn secure_handle(&self) -> bool {
+        self.runtime().secure_handle
+    }
+
+    /// 只应在持有操作锁时调用。
+    fn set_secure_handle(&self, held: bool) {
+        self.runtime().secure_handle = held;
+    }
+
+    /// 从状态文件同步内存模式（构造后、任何操作前调用一次；测试也直接使用）。
+    /// 状态文件读不出来时按 Legacy。
+    pub fn sync_mode_from_state(&self) {
+        let state = match read_state(&self.options.paths.state_file()) {
+            Ok(snapshot) => snapshot.state,
+            Err(_) => HelperState::default(),
+        };
+        self.set_mode(state.mode);
     }
 
     /// 检查 config.toml：无法解析、根键类型不符或受管结构不是 table 时返回 `ConfigInvalid`。
@@ -853,8 +1325,38 @@ impl Manager {
             config_error: config_error_message,
             autostart: state.autostart,
             codex_home: paths.codex_home.display().to_string(),
+            mode: state.mode,
+            secure: SecureStatus {
+                active: state.mode == ProxyMode::Secure && self.secure_handle(),
+                device_id: state.secure_device_id.clone(),
+                blocked_reason: state.secure_blocked_reason.clone(),
+            },
         }
     }
+}
+
+/// 把 128 位 hex 签名解析为 64 字节（统一小写；大写输入拒绝，fail-closed 不猜测修复）。
+fn parse_signature_hex(hex: &str) -> Result<Vec<u8>, ManagerError> {
+    let raw = hex.as_bytes();
+    if raw.len() != 128 || !raw.iter().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ManagerError::SecureActivation {
+            message: "注册包的 policy_signature 必须是 128 位 hex".into(),
+        });
+    }
+    let mut bytes = Vec::with_capacity(64);
+    for pair in raw.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16).expect("已校验 hex") as u8;
+        let lo = (pair[1] as char).to_digit(16).expect("已校验 hex") as u8;
+        bytes.push(hi << 4 | lo);
+    }
+    Ok(bytes)
+}
+
+/// 把已验证的注册包归档到 `enrollment/bundle.json`（原子写）。归档的是原始字节。
+fn archive_bundle(paths: &HelperPaths, bundle_bytes: &[u8]) -> std::io::Result<()> {
+    let dir = paths.enrollment_dir();
+    std::fs::create_dir_all(&dir)?;
+    fsutil::atomic_write(&paths.enrollment_bundle(), bundle_bytes)
 }
 
 /// 卸载清理（设计 §5.4），供 `codex-helper-credential.exe cleanup [--purge-key]` 调用。

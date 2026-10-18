@@ -15,18 +15,34 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml_edit.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+# 进程策略（设计 §6.2）：ed25519 管理签名验证与映像 SHA-256 哈希。
+ed25519-dalek.workspace = true
+sha2.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 对端进程身份解析（设计 §6.4）：按四元组枚举进程 socket，取映像路径、启动时间与 uid。
+libproc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # 开发环境检测（设计 §16）：从注册表重新读取系统 / 用户 Path 并展开环境变量（Registry、Environment）；
 # 用“关闭即结束”的 Job Object 在超时时结束整棵子进程树（JobObjects；CreateJobObjectW 需要 Security，
 # JOBOBJECT_EXTENDED_LIMIT_INFORMATION 需要 Threading）。
+# 对端进程身份解析（设计 §6.4）：GetExtendedTcpTable（IpHelper）定位连接所有者 PID，
+# OpenProcess/GetProcessTimes/QueryFullProcessImageNameW（Threading）取实例信息，
+# 进程 token 的用户 SID 转字符串（Security_Authorization）。
 windows = { workspace = true, features = [
     "Win32_System_Registry",
     "Win32_System_Environment",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_NetworkManagement_IpHelper",
 ] }
 
 [dev-dependencies]
+rcgen.workspace = true
 wiremock.workspace = true

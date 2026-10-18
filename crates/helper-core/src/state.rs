@@ -6,6 +6,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::codex_config::PreviousConfig;
 
+/// 本地代理运行模式（设计 §8.1）：
+/// - `Legacy`：现有行为——无认证 SOCKS5 上游、无进程门禁、允许复用外部实例（`External`）；
+/// - `Secure`：mTLS 上游 + 本机进程身份门禁，**独占本地端口**（绝不进入 External 复用，设计 §6.3）。
+///
+/// state.json 持久化，缺省 `Legacy`（旧状态文件无缝兼容）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProxyMode {
+    #[default]
+    Legacy,
+    Secure,
+}
+
 /// 状态文件内容。字段名与设计文档中的 JSON 一致（snake_case），缺失字段取默认值。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -22,6 +34,17 @@ pub struct HelperState {
     /// 启用前 `sandbox_mode` 的值；不存在为 `null`
     pub previous_sandbox_mode: Option<String>,
     pub autostart: bool,
+    /// 本地代理运行模式（缺省 Legacy；见 [`ProxyMode`]）
+    pub mode: ProxyMode,
+    /// Secure 模式激活的设备 ID（`device-<id>` 的 `<id>` 部分）
+    pub secure_device_id: Option<String>,
+    /// 已见过的管理策略 ID（诊断用；停用回 Legacy 后保留）
+    pub secure_policy_id: Option<String>,
+    /// 已见过的管理策略版本（Task 6 交接：新策略版本更低即拒绝激活；
+    /// 停用回 Legacy 后仍保留，防止借停用/重启回退到旧策略）
+    pub secure_policy_version: Option<u64>,
+    /// SecureBlocked 的短原因码（激活/对账失败时写入；成功激活清除）
+    pub secure_blocked_reason: Option<String>,
 }
 
 impl HelperState {
@@ -125,6 +148,11 @@ mod tests {
             previous_approvals_reviewer: Some("human_review".into()),
             previous_sandbox_mode: Some("read-only".into()),
             autostart: true,
+            mode: crate::state::ProxyMode::Secure,
+            secure_device_id: Some("dev-1".into()),
+            secure_policy_id: Some("policy-a".into()),
+            secure_policy_version: Some(7),
+            secure_blocked_reason: Some("policy_expired".into()),
         };
         save(&path, &state).unwrap();
         let loaded = load(&path).unwrap().unwrap();
@@ -157,6 +185,7 @@ mod tests {
                 previous_approvals_reviewer: None,
                 previous_sandbox_mode: None,
                 autostart: false,
+                ..Default::default()
             }
         );
     }
@@ -250,8 +279,38 @@ mod tests {
                 previous_approvals_reviewer: None,
                 previous_sandbox_mode: None,
                 autostart: false,
+                ..Default::default()
             }
         );
+    }
+
+    /// Secure 模式字段（Task 9）：snake_case 序列化、缺省 Legacy、旧状态文件兼容。
+    #[test]
+    fn secure_fields_round_trip_with_snake_case_and_default_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"mode": "Secure", "secure_device_id": "dev-1", "secure_policy_id": "p", "secure_policy_version": 3, "secure_blocked_reason": null, "enabled": true}"#,
+        )
+        .unwrap();
+        let state = load(&path).unwrap().unwrap();
+        assert_eq!(state.mode, ProxyMode::Secure);
+        assert_eq!(state.secure_device_id.as_deref(), Some("dev-1"));
+        assert_eq!(state.secure_policy_version, Some(3));
+        assert_eq!(state.secure_blocked_reason, None);
+
+        save(&path, &state).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"mode\": \"Secure\""));
+        assert!(text.contains("\"secure_policy_version"));
+
+        // 旧状态文件（无 mode 字段）缺省 Legacy
+        std::fs::write(&path, r#"{"enabled": true, "autostart": true}"#).unwrap();
+        let legacy = load(&path).unwrap().unwrap();
+        assert_eq!(legacy.mode, ProxyMode::Legacy);
+        assert!(legacy.secure_device_id.is_none());
+        assert_eq!(legacy.secure_policy_version, None);
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::rules::Route;
+use crate::state::ProxyMode;
 
 /// 网关 Key 校验结果（`GET /v1/models`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +53,20 @@ pub enum ProxyState {
 pub struct ProxyStatus {
     pub state: ProxyState,
     pub port: u16,
+}
+
+/// Secure 模式状态（设计 §8.1，前端展示预留；本字段只描述本地编排层视角：
+/// `active == true` 仅当本进程持有 Secure 配置的代理句柄且状态文件记录为 Secure。
+/// 它不是安全证明——证书/策略是否真的仍在服务端生效，以服务端拒绝为准）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecureStatus {
+    /// 是否处于 SecureActive（本进程持有 Secure 代理句柄且状态文件为 Secure）
+    pub active: bool,
+    /// 激活的设备 ID（`device-<id>` 的 `<id>` 部分；仅诊断用）
+    pub device_id: Option<String>,
+    /// SecureBlocked 的短原因码（如 `port_occupied`、`bad_signature`；无则为 None）
+    pub blocked_reason: Option<String>,
 }
 
 /// 一条代理连接的记录（设计 §6）。连接结束后产生，写入内存环形缓冲并按采样写日志。
@@ -115,6 +130,10 @@ pub struct Status {
     pub autostart: bool,
     /// Codex home 路径（展示用）
     pub codex_home: String,
+    /// 本地代理运行模式（状态文件 `mode`，缺省 Legacy）
+    pub mode: ProxyMode,
+    /// Secure 模式状态（前端字段预留，Task 9 不改 TS 界面）
+    pub secure: SecureStatus,
 }
 
 /// 启用请求（设计 §5.1）。
@@ -219,6 +238,19 @@ pub enum ManagerError {
     InvalidKeyChars,
     #[error("请先把 CodexHelper 拖到「应用程序」文件夹，再从那里打开")]
     InstallLocation,
+    /// 注册包解析、管理签名验证、秘密读取失败等激活前置步骤失败（fail-closed，
+    /// 不回退 Legacy 代理路径）。消息为脱敏后的阶段描述，绝不携带密码/私钥内容。
+    #[error("Secure 激活失败：{message}")]
+    SecureActivation { message: String },
+    /// Secure 模式要求独占本地端口：端口被外部进程占用（自识探测命中非本进程句柄）。
+    /// 提示用户退出占用 17891 的旧实例；绝不杀未知占用者、不换端口、不进入 External 复用。
+    #[error(
+        "本地代理端口 {port} 被其他进程占用，Secure 模式需要独占该端口；请退出占用它的旧 CodexHelper 实例后重试"
+    )]
+    SecurePortOccupied { port: u16 },
+    /// 管理策略版本倒退：新注册包策略版本低于已持久化版本（Task 6 交接的回滚防线）。
+    #[error("管理策略版本倒退：已见版本 {seen}，新策略版本 {new}，拒绝激活")]
+    PolicyVersionRollback { seen: u64, new: u64 },
 }
 
 impl ManagerError {
@@ -237,6 +269,9 @@ impl ManagerError {
             Self::Internal { .. } => "internal",
             Self::InvalidKeyChars => "invalidKeyChars",
             Self::InstallLocation => "installLocation",
+            Self::SecureActivation { .. } => "secureActivation",
+            Self::SecurePortOccupied { .. } => "securePortOccupied",
+            Self::PolicyVersionRollback { .. } => "policyVersionRollback",
         }
     }
 
@@ -315,6 +350,39 @@ mod tests {
             assert_eq!(payload.code, code);
             assert_eq!(payload.message, message);
         }
+    }
+
+    /// Task 9 新增错误变体：稳定错误码 + 消息含端口/版本但不携带秘密。
+    #[test]
+    fn secure_error_variants_have_stable_codes() {
+        let occupied = ManagerError::SecurePortOccupied { port: 17891 };
+        assert_eq!(occupied.code(), "securePortOccupied");
+        let message = occupied.to_string();
+        assert!(message.contains("17891"));
+        assert!(message.contains("独占"));
+
+        let rollback = ManagerError::PolicyVersionRollback { seen: 7, new: 3 };
+        assert_eq!(rollback.code(), "policyVersionRollback");
+        assert!(rollback.to_string().contains("7"));
+
+        let activation = ManagerError::SecureActivation {
+            message: "策略签名验证失败".into(),
+        };
+        assert_eq!(activation.code(), "secureActivation");
+        assert!(activation.to_string().contains("策略签名验证失败"));
+    }
+
+    /// SecureStatus 序列化为 camelCase（前端契约）。
+    #[test]
+    fn secure_status_serializes_as_camel_case() {
+        let json = serde_json::to_value(SecureStatus::default()).unwrap();
+        assert!(json.get("active").is_some());
+        assert!(json.get("deviceId").is_some());
+        assert!(json.get("blockedReason").is_some());
+
+        let status = serde_json::to_value(Status::default()).unwrap();
+        assert!(status.get("secure").is_some());
+        assert_eq!(status["mode"], "Legacy");
     }
 
     #[test]

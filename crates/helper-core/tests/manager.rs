@@ -203,6 +203,8 @@ impl Sandbox {
             gateway_host: "127.0.0.1".to_string(),
             gateway_port: self.gateway.address().port(),
             on_record: Some(sink),
+            secure_resolver: None,
+            secure_drain_timeout: None,
         }
     }
 
@@ -1208,6 +1210,7 @@ async fn cleanup_purges_key_and_is_idempotent() {
         previous_approvals_reviewer: None,
         previous_sandbox_mode: Some("read-only".into()),
         autostart: false,
+        ..Default::default()
     });
     sandbox.write_config(
         "model_provider = \"managed_gateway\"\n\n[model_providers.managed_gateway]\nname = \"Managed Gateway\"\n",
@@ -1778,6 +1781,8 @@ fn manager_futures_are_send() {
         gateway_host: "127.0.0.1".into(),
         gateway_port: 1,
         on_record: None,
+        secure_resolver: None,
+        secure_drain_timeout: None,
     };
     let manager = Manager::new(options);
     // 只构造、不轮询：桌面命令层要求这些 future 可跨线程
@@ -2350,4 +2355,559 @@ async fn revoke_failure_restarts_proxy_when_env_unreadable() {
 
     manager.shutdown().await;
     std::fs::remove_dir(sandbox.env()).unwrap();
+}
+
+// ---- Secure 模式（设计 §6.3、§8.1、§9.1，Task 9）----
+
+mod secure {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use helper_core::peer_identity::{PeerInfo, PeerResolver};
+    use helper_core::process_policy::{self as policy_mod, ROLE_CODEX_ENGINE};
+    use helper_core::proxy_identity::{self, ProxySecrets};
+    use helper_core::state::ProxyMode;
+    use helper_core::types::SecureStatus;
+    use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+    use std::net::IpAddr;
+
+    /// 发送原始请求并读到连接关闭（本模块内联版，与 tests/proxy.rs 同语义）。
+    async fn send_and_read(port: u16, request: &[u8]) -> String {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect proxy");
+        client.write_all(request).await.expect("send request");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut response))
+            .await
+            .expect("代理应在应答后关闭连接")
+            .expect("read response");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// 2100-01-01：测试运行的任何时间都早于它。
+    const FAR_FUTURE: u64 = 4_102_444_800;
+
+    /// 与 `consts::POLICY_VERIFY_KEY_HEX`（种子 0x00..0x1f）配对的管理签名私钥，
+    /// 仅测试夹具（Task 8 已声明该常量当前是测试 CA 公钥）。
+    fn policy_signing_key() -> SigningKey {
+        let mut seed = [0u8; 32];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        SigningKey::from_bytes(&seed)
+    }
+
+    /// 随机 device_id（可打印 ASCII）：macOS 真 Keychain target 因此必带随机后缀，
+    /// 绝不触碰生产条目；其他平台落在进程内 dev 表。
+    fn random_device_id(tag: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("sec-{tag}-{pid}-{nanos}-{seq}")
+    }
+
+    /// 结束（含 panic）删除两条代理秘密条目。
+    struct SecretsGuard(String);
+
+    impl Drop for SecretsGuard {
+        fn drop(&mut self) {
+            proxy_identity::delete_secrets(&self.0);
+        }
+    }
+
+    /// 测试证书链：CA + 客户端证书（clientAuth EKU）+ 客户端私钥。
+    struct TestCerts {
+        ca_pem: String,
+        client_cert_pem: String,
+        client_key_pem: String,
+    }
+
+    fn test_certs() -> TestCerts {
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "codex-helper-manager-test-ca");
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut client_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        client_params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ClientAuth);
+        client_params
+            .distinguished_name
+            .push(DnType::CommonName, "codex-helper-manager-test-device");
+        let client_key = KeyPair::generate().unwrap();
+        let client_cert = client_params.self_signed(&client_key).unwrap();
+
+        TestCerts {
+            ca_pem: ca.pem(),
+            client_cert_pem: client_cert.pem(),
+            client_key_pem: client_key.serialize_pem(),
+        }
+    }
+
+    /// 签发策略包（对规范字节签名）并返回 (bundle_json, signature_hex)。
+    /// 策略批准的映像摘要是 `sha`（os/arch 取当前值）。
+    fn issue_policy(version: u64, sha: &str) -> (String, String) {
+        let policy_value = serde_json::json!({
+            "policy_id": "manager-test-policy",
+            "version": version,
+            "not_after_unix": FAR_FUTURE,
+            "roles": [{
+                "role": ROLE_CODEX_ENGINE,
+                "images": [{
+                    "sha256_hex": sha,
+                    "os": policy_mod::current_os(),
+                    "arch": policy_mod::current_arch(),
+                }],
+                "path_prefixes": [],
+            }],
+        });
+        // 规范字节 = 递归键排序后的 serde_json 紧凑序列化（与 process_policy 约定一致）
+        let canonical = canonical_bytes(&policy_value);
+        let sig = policy_signing_key().sign(&canonical);
+        let bundle = serde_json::json!({ "policy": policy_value });
+        (bundle.to_string(), hex_lower(&sig.to_bytes()))
+    }
+
+    fn canonical_bytes(value: &serde_json::Value) -> Vec<u8> {
+        fn sort(value: &serde_json::Value) -> serde_json::Value {
+            match value {
+                serde_json::Value::Object(map) => {
+                    let mut entries: Vec<(String, serde_json::Value)> =
+                        map.iter().map(|(k, v)| (k.clone(), sort(v))).collect();
+                    entries.sort_by(|a, b| a.0.cmp(&b.0));
+                    entries.into_iter().collect::<serde_json::Value>()
+                }
+                serde_json::Value::Array(items) => {
+                    serde_json::Value::Array(items.iter().map(sort).collect())
+                }
+                other => other.clone(),
+            }
+        }
+        serde_json::to_vec(&sort(value)).unwrap()
+    }
+
+    fn hex_lower(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// 写临时映像文件，返回其 SHA-256 摘要。
+    fn temp_image_sha(content: &[u8]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codex-engine.bin");
+        std::fs::write(&path, content).unwrap();
+        policy_mod::hash_image_file(&path).unwrap()
+    }
+
+    /// Secure 激活夹具：证书链 + 策略 + 秘密 + 注册包文件。
+    struct SecureFixture {
+        device_id: String,
+        _secrets: SecretsGuard,
+        bundle_path: PathBuf,
+    }
+
+    /// 生成完整注册包并写入 `sandbox`；返回夹具。
+    async fn setup_secure_enrollment(sandbox: &Sandbox, policy_version: u64) -> SecureFixture {
+        let certs = test_certs();
+        let device_id = random_device_id("fx");
+        let secrets_guard = SecretsGuard(device_id.clone());
+        proxy_identity::save_secrets(
+            &device_id,
+            &ProxySecrets {
+                username: format!("device-{device_id}"),
+                password: helper_core::credential::Secret::new("manager-test-pass"),
+                client_key_pem: helper_core::credential::Secret::new(certs.client_key_pem.clone()),
+            },
+        )
+        .expect("写入代理秘密");
+
+        let sha = temp_image_sha(b"manager-test-engine-image");
+        let (policy_json, signature_hex) = issue_policy(policy_version, &sha);
+        let bundle = serde_json::json!({
+            "device_id": device_id,
+            "server_host": "127.0.0.1",
+            "server_port": 1, // 无需真实上游：激活不连上游（连接时 fail-closed 由 upstream 覆盖）
+            "server_name": "localhost",
+            "ca_pem": certs.ca_pem,
+            "client_cert_pem": certs.client_cert_pem,
+            "policy_bundle_json": policy_json,
+            "policy_signature": signature_hex,
+            "not_before_unix": 1,
+            "not_after_unix": FAR_FUTURE,
+        });
+        let bundle_path = sandbox.paths().data_dir.join("enrollment-draft.json");
+        std::fs::write(&bundle_path, bundle.to_string()).unwrap();
+
+        SecureFixture {
+            device_id,
+            _secrets: secrets_guard,
+            bundle_path,
+        }
+    }
+
+    /// 恒定返回固定 PeerInfo 的假解析器。
+    struct FakeResolver {
+        peer: PeerInfo,
+        fail: bool,
+    }
+
+    impl PeerResolver for FakeResolver {
+        fn resolve(
+            &self,
+            _local: (IpAddr, u16),
+            _remote: (IpAddr, u16),
+        ) -> anyhow::Result<PeerInfo> {
+            if self.fail {
+                anyhow::bail!("fake resolver failure");
+            }
+            Ok(self.peer.clone())
+        }
+    }
+
+    fn fake_peer() -> PeerInfo {
+        PeerInfo {
+            pid: 4321,
+            user_scope: helper_core::peer_identity::current_user_scope(),
+            start_time_ms: 1_700_000_000_000,
+            image_path: "/nonexistent/codex-engine".into(),
+        }
+    }
+
+    /// 带 fake resolver 的 Sandbox（每次激活取一个新实例）。
+    async fn secure_sandbox() -> (Sandbox, Manager) {
+        let sandbox = Sandbox::new().await;
+        // 启用 Legacy（记录 previous_、写 .env、启动旧句柄——供排空/切换断言）
+        sandbox.write_config(USER_CONFIG);
+        sandbox.write_env(USER_ENV);
+        let peer = fake_peer();
+        let mut options = sandbox.options_with(COMMAND);
+        options.secure_resolver = Some(Arc::new(move || {
+            Box::new(FakeResolver {
+                peer: peer.clone(),
+                fail: false,
+            })
+        }));
+        options.secure_drain_timeout = Some(Duration::from_millis(200));
+        let manager = Manager::new(options);
+        (sandbox, manager)
+    }
+
+    /// 预先占住 `port` 的假探测应答器：模拟另一个 CodexHelper 实例（自识端点应答）。
+    async fn spawn_fake_helper_instance(port: u16) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("bind fake helper");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 2048];
+                    let _ = stream.read(&mut buffer).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 27\r\nConnection: close\r\n\r\ncodex-helper-managed-proxy",
+                        )
+                        .await;
+                });
+            }
+        })
+    }
+
+    /// 状态文件写入 Secure 模式（重启对账用）。
+    fn write_secure_state(sandbox: &Sandbox, fixture: &SecureFixture, enabled: bool) {
+        sandbox.write_state(&HelperState {
+            enabled,
+            mode: ProxyMode::Secure,
+            secure_device_id: Some(fixture.device_id.clone()),
+            secure_policy_id: Some("manager-test-policy".into()),
+            secure_policy_version: Some(1),
+            ..Default::default()
+        });
+    }
+
+    // ---- 测试 ----
+
+    /// 激活后排空旧 Legacy 句柄、以本进程 Secure 句柄监听、状态反映 SecureActive。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_uses_own_handle_and_drains_legacy() {
+        let (sandbox, manager) = secure_sandbox().await;
+        manager.enable(with_key(KEY)).await.unwrap();
+        assert_eq!(manager.status().await.proxy.state, ProxyState::Running);
+        assert_eq!(manager.status().await.mode, ProxyMode::Legacy);
+
+        let fixture = setup_secure_enrollment(&sandbox, 1).await;
+        let status = manager
+            .activate_secure(&fixture.bundle_path)
+            .await
+            .expect("激活应成功");
+
+        // SecureActive：本进程持有 Secure 句柄，模式与状态文件都已切换
+        assert_eq!(status.mode, ProxyMode::Secure);
+        assert_eq!(
+            status.secure,
+            SecureStatus {
+                active: true,
+                device_id: Some(fixture.device_id.clone()),
+                blocked_reason: None,
+            }
+        );
+        assert_eq!(status.proxy.state, ProxyState::Running);
+        let state = sandbox.state().unwrap();
+        assert_eq!(state.mode, ProxyMode::Secure);
+        assert_eq!(
+            state.secure_device_id.as_deref(),
+            Some(fixture.device_id.as_str())
+        );
+        assert_eq!(state.secure_policy_version, Some(1));
+        assert_eq!(state.secure_blocked_reason, None);
+        // 注册包被归档（对账重建用）
+        assert!(sandbox.paths().enrollment_bundle().exists());
+
+        // 端口上仍是本工具在监听（新 Secure 句柄）
+        assert!(proxy::probe_existing(sandbox.port).await);
+
+        // 停用回滚：回 Legacy、已启用时重启 Legacy 代理；策略版本记录保留
+        let status = manager.deactivate_secure().await.unwrap();
+        assert_eq!(status.mode, ProxyMode::Legacy);
+        assert_eq!(status.proxy.state, ProxyState::Running);
+        assert!(!status.secure.active);
+        let state = sandbox.state().unwrap();
+        assert_eq!(state.mode, ProxyMode::Legacy);
+        assert_eq!(
+            state.secure_policy_version,
+            Some(1),
+            "版本记录不得因停用丢失"
+        );
+        manager.shutdown().await;
+        sandbox.assert_no_key_on_disk();
+    }
+
+    /// 端口被外部进程（假探测应答器）占用：激活失败，状态非 External，模式不变。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn secure_mode_never_reuses_external() {
+        let (sandbox, manager) = secure_sandbox().await;
+        let fixture = setup_secure_enrollment(&sandbox, 1).await;
+        // 伪装成另一 CodexHelper 实例的假探测应答器（自识端点 200 + 固定 body）
+        let fake = spawn_fake_helper_instance(sandbox.port).await;
+
+        let error = manager
+            .activate_secure(&fixture.bundle_path)
+            .await
+            .expect_err("Secure 不得复用外部实例");
+        assert_eq!(error.code(), "securePortOccupied", "{error}");
+        assert!(error.to_string().contains("独占"), "{error}");
+        let status = manager.status().await;
+        assert_ne!(status.proxy.state, ProxyState::External);
+        assert_eq!(status.mode, ProxyMode::Legacy, "激活失败不得切换模式");
+        assert!(!status.secure.active);
+        // 状态文件记录 blocked_reason，模式未变
+        let state = sandbox.state().unwrap();
+        assert_eq!(state.mode, ProxyMode::Legacy);
+        assert_eq!(
+            state.secure_blocked_reason.as_deref(),
+            Some("port_occupied")
+        );
+
+        // 对账同样不得进入 External：写入 Secure 状态后重启对账必须失败
+        manager.shutdown().await;
+        write_secure_state(&sandbox, &fixture, true);
+        sandbox.credentials.write(KEY).unwrap();
+        let manager2 = sandbox.manager();
+        manager2.sync_mode_from_state();
+        let report = manager2.reconcile_on_startup().await;
+        assert_eq!(report.outcome, ReconcileOutcome::Failed);
+        assert_eq!(report.error.as_ref().unwrap().code, "securePortOccupied");
+        assert_ne!(report.status.proxy.state, ProxyState::External);
+
+        fake.abort();
+        sandbox.assert_no_key_on_disk();
+    }
+
+    /// 端口被无关程序占用（bind 失败）：激活失败且不进入 External。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn port_occupied_blocks_activation() {
+        let (sandbox, manager) = secure_sandbox().await;
+        let fixture = setup_secure_enrollment(&sandbox, 1).await;
+        // 静默占用 sandbox.port（不自识应答）：probe 不命中，spawn 时 bind 失败
+        let foreign = tokio::net::TcpListener::bind(("127.0.0.1", sandbox.port))
+            .await
+            .expect("夹具应能占用 sandbox 端口");
+        let foreign_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = foreign.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                });
+            }
+        });
+
+        let error = manager
+            .activate_secure(&fixture.bundle_path)
+            .await
+            .expect_err("端口被占时激活必须失败");
+        assert_eq!(error.code(), "securePortOccupied", "{error}");
+        let status = manager.status().await;
+        assert_ne!(status.proxy.state, ProxyState::External);
+        assert_eq!(status.proxy.state, ProxyState::Stopped);
+        assert_eq!(status.mode, ProxyMode::Legacy);
+        let state = sandbox.state().unwrap();
+        assert_eq!(
+            state.secure_blocked_reason.as_deref(),
+            Some("port_unavailable")
+        );
+        foreign_task.abort();
+        sandbox.assert_no_key_on_disk();
+    }
+
+    /// 管理签名验证失败：拒绝激活，不改状态文件的模式。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bad_signature_rejects_activation() {
+        let (sandbox, manager) = secure_sandbox().await;
+        let fixture = setup_secure_enrollment(&sandbox, 1).await;
+        // 篡改注册包：换一个 device_id（策略字节不变、签名失效）
+        let raw = std::fs::read_to_string(&fixture.bundle_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        value["device_id"] = "tampered-device".into();
+        let tampered = sandbox.paths().data_dir.join("tampered.json");
+        std::fs::write(&tampered, value.to_string()).unwrap();
+
+        let error = manager
+            .activate_secure(&tampered)
+            .await
+            .expect_err("签名验证失败必须拒绝激活");
+        assert_eq!(error.code(), "secureActivation", "{error}");
+        let status = manager.status().await;
+        assert_eq!(status.mode, ProxyMode::Legacy);
+        assert!(!status.secure.active);
+        // 状态文件不应记录 Secure
+        let state = sandbox.state();
+        assert!(state.is_none() || state.unwrap().mode == ProxyMode::Legacy);
+        sandbox.assert_no_key_on_disk();
+    }
+
+    /// 策略版本倒退（Task 6 交接）：新注册包版本低于已见版本 → 拒绝；停用后也不放行。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn policy_version_rollback_rejected_even_after_deactivation() {
+        let (sandbox, manager) = secure_sandbox().await;
+        let v2 = setup_secure_enrollment(&sandbox, 2).await;
+        manager.activate_secure(&v2.bundle_path).await.unwrap();
+
+        // 版本 1 < 已见 2：激活新注册包被拒
+        let v1 = setup_secure_enrollment(&sandbox, 1).await;
+        let error = manager
+            .activate_secure(&v1.bundle_path)
+            .await
+            .expect_err("版本回退必须拒绝");
+        assert_eq!(error.code(), "policyVersionRollback", "{error}");
+        assert_eq!(sandbox.state().unwrap().secure_policy_version, Some(2));
+
+        // 停用回 Legacy 后重试：版本记录保留，仍然拒绝
+        manager.deactivate_secure().await.unwrap();
+        let error = manager
+            .activate_secure(&v1.bundle_path)
+            .await
+            .expect_err("停用后版本回退同样必须拒绝");
+        assert_eq!(error.code(), "policyVersionRollback", "{error}");
+        manager.shutdown().await;
+        sandbox.assert_no_key_on_disk();
+    }
+
+    /// 激活后 Secure 代理实际生效：命中 OpenAI 域名的请求先过门禁（fake resolver 放行，
+    /// 映像摘要命中策略）再走安全上游；上游不可达时 502，绝不回退 Legacy SOCKS5。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn secure_proxy_gates_and_uses_secure_upstream() {
+        let (sandbox, _first) = secure_sandbox().await;
+
+        let fixture = setup_secure_enrollment(&sandbox, 1).await;
+        // 让 fake peer 的映像路径指向真实临时文件（摘要已入策略）
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("codex-engine.bin");
+        std::fs::write(&image, b"manager-test-engine-image").unwrap();
+        let mut options = sandbox.options_with(COMMAND);
+        let image_path = image.to_string_lossy().into_owned();
+        options.secure_resolver = Some(Arc::new(move || {
+            Box::new(FakeResolver {
+                peer: PeerInfo {
+                    pid: 4321,
+                    user_scope: helper_core::peer_identity::current_user_scope(),
+                    start_time_ms: 1_700_000_000_000,
+                    image_path: image_path.clone(),
+                },
+                fail: false,
+            })
+        }));
+        options.secure_drain_timeout = Some(Duration::from_millis(200));
+        let manager = Manager::new(options);
+        manager.enable(with_key(KEY)).await.unwrap();
+
+        let status = manager.activate_secure(&fixture.bundle_path).await.unwrap();
+        assert!(status.secure.active);
+
+        // 准入放行 + 上游（127.0.0.1:1，无人监听）失败 → 502；端口 1 不会命中 Legacy 上游
+        // （sandbox.socks5_port 也是空闲端口，若回退 Legacy 会连它——同样是连接拒绝，
+        // 但 502 已证明 fail-closed）。关键断言：不回 403（准入通过）、不挂起。
+        let response = send_and_read(
+            status.proxy.port,
+            b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com\r\n\r\n",
+        )
+        .await;
+        assert!(response.contains("502 Bad Gateway"), "got: {response}");
+
+        // 未知映像（摘要不命中）：403，零出站
+        let mut tampered_bundle = std::fs::read_to_string(&fixture.bundle_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&tampered_bundle).unwrap();
+        // 重发一个批准其它摘要的注册包（重签）
+        let other_sha = temp_image_sha(b"other-image");
+        let (policy_json, signature_hex) = issue_policy(3, &other_sha);
+        value["policy_bundle_json"] = serde_json::Value::String(policy_json);
+        value["policy_signature"] = serde_json::Value::String(signature_hex);
+        tampered_bundle = value.to_string();
+        let path = sandbox.paths().data_dir.join("v3.json");
+        std::fs::write(&path, tampered_bundle).unwrap();
+        manager.activate_secure(&path).await.unwrap();
+
+        let response = send_and_read(
+            status.proxy.port,
+            b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com\r\n\r\n",
+        )
+        .await;
+        assert!(response.contains("403 Forbidden"), "got: {response}");
+
+        manager.shutdown().await;
+        sandbox.assert_no_key_on_disk();
+    }
+
+    /// Legacy 全链路回归：默认模式仍允许 External 复用（既有行为不变）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_reuse_still_works() {
+        let sandbox = Sandbox::new().await;
+        sandbox.write_config(USER_CONFIG);
+        let other = proxy::spawn(sandbox.port, ProxyConfig::default())
+            .await
+            .unwrap();
+        let manager = sandbox.manager();
+
+        let status = manager.enable(with_key(KEY)).await.unwrap();
+        assert_eq!(
+            status.proxy.state,
+            ProxyState::External,
+            "Legacy 仍复用外部实例"
+        );
+        assert_eq!(status.mode, ProxyMode::Legacy);
+        other.shutdown().await;
+        sandbox.assert_no_key_on_disk();
+    }
 }

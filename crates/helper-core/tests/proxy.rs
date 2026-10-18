@@ -939,3 +939,333 @@ async fn probe_existing_recognizes_only_this_proxy() {
         "{elapsed:?}"
     );
 }
+
+// ---- 进程身份门禁（设计 §6.3，Task 7）----
+
+mod gate {
+    use super::*;
+    use helper_core::connection_gate::ConnectionGate;
+    use helper_core::peer_identity::{PeerInfo, PeerResolver};
+    use helper_core::process_policy::{AllowedRole, CodeImage, ProcessPolicy, ROLE_CODEX_ENGINE};
+    use std::net::IpAddr;
+
+    /// 2100-01-01：测试运行的任何时间都早于它。
+    const FAR_FUTURE: u64 = 4_102_444_800;
+
+    /// 与当前用户同作用域的 PeerInfo。
+    fn peer_now(image_path: &str) -> PeerInfo {
+        PeerInfo {
+            pid: 4321,
+            user_scope: helper_core::peer_identity::current_user_scope(),
+            start_time_ms: 1_700_000_000_000,
+            image_path: image_path.to_string(),
+        }
+    }
+
+    /// 只批准摘要 `sha` 的单角色策略。
+    fn policy_allowing(sha: &str) -> Arc<ProcessPolicy> {
+        Arc::new(ProcessPolicy {
+            policy_id: "gate-it-policy".into(),
+            version: 3,
+            not_after_unix: FAR_FUTURE,
+            roles: vec![AllowedRole {
+                role: ROLE_CODEX_ENGINE.into(),
+                images: vec![CodeImage {
+                    sha256_hex: sha.into(),
+                    os: helper_core::process_policy::current_os(),
+                    arch: helper_core::process_policy::current_arch(),
+                }],
+                path_prefixes: vec![],
+            }],
+        })
+    }
+
+    /// 恒定返回 `result` 的假解析器；`fail` 是 `Some` 时返回该错误。
+    struct StaticResolver {
+        peer: PeerInfo,
+        fail: Option<&'static str>,
+    }
+
+    impl PeerResolver for StaticResolver {
+        fn resolve(
+            &self,
+            _local: (IpAddr, u16),
+            _remote: (IpAddr, u16),
+        ) -> anyhow::Result<PeerInfo> {
+            match self.fail {
+                Some(message) => anyhow::bail!("{message}"),
+                None => Ok(self.peer.clone()),
+            }
+        }
+    }
+
+    /// 写临时映像文件，返回（目录，路径，摘要）。
+    fn temp_image(content: &[u8]) -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("codex-engine.bin");
+        std::fs::write(&path, content).expect("write image");
+        let sha = helper_core::process_policy::hash_image_file(&path).expect("hash image");
+        (dir, path.to_string_lossy().into_owned(), sha)
+    }
+
+    /// 带门禁的代理：解析器恒返回 `peer`（`fail` 为 `Some` 时恒失败）。
+    async fn spawn_gated_proxy(
+        peer: PeerInfo,
+        fail: Option<&'static str>,
+        direct_overrides: Option<Arc<HashMap<String, SocketAddr>>>,
+    ) -> (ProxyHandle, Records) {
+        let (_dir, _path, sha) = temp_image(b"policy-anchor");
+        let gate = Arc::new(ConnectionGate::new(
+            Box::new(StaticResolver { peer, fail }),
+            policy_allowing(&sha),
+        ));
+        let (sink, records) = record_sink();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind proxy");
+        let handle = spawn_with_listener(
+            listener,
+            ProxyConfig {
+                on_record: Some(sink),
+                gate: Some(gate),
+                direct_overrides,
+                ..ProxyConfig::default()
+            },
+        );
+        (handle, records)
+    }
+
+    #[tokio::test]
+    async fn allowed_peer_passes() {
+        let (dir, image_path, sha) = temp_image(b"codex-engine-image");
+        // 直连路由：用 direct_overrides 映射到假目标验证连通。
+        let (target_port, hits) = spawn_fake_target().await;
+        let addr = SocketAddr::from(([127, 0, 0, 1], target_port));
+        let overrides = HashMap::from([("unmatched.example".to_string(), addr)]);
+        let gate = Arc::new(ConnectionGate::new(
+            Box::new(StaticResolver {
+                peer: peer_now(&image_path),
+                fail: None,
+            }),
+            policy_allowing(&sha),
+        ));
+        let (sink, records) = record_sink();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind proxy");
+        let proxy = spawn_with_listener(
+            listener,
+            ProxyConfig {
+                on_record: Some(sink),
+                gate: Some(gate),
+                direct_overrides: Some(Arc::new(overrides)),
+                ..ProxyConfig::default()
+            },
+        );
+        let response = send_and_read(
+            proxy.port(),
+            b"GET http://unmatched.example/ping HTTP/1.1\r\nHost: unmatched.example\r\n\r\n",
+        )
+        .await;
+        assert!(response.contains("200 OK"), "got: {response}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // 准入通过的连接正常产生记录。
+        let records = wait_for_records(&records, 1).await;
+        assert_eq!(records[0].host, "unmatched.example");
+        assert_eq!(records[0].decision, Route::Direct);
+        assert!(records[0].ok);
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn denied_peer_gets_403() {
+        // 摘要与解析出的映像不匹配 → 映像未批准 → 403。
+        let (_dir, image_path, _sha) = temp_image(b"codex-engine-image");
+        let peer = peer_now(&image_path);
+        let (proxy, records) = spawn_gated_proxy(peer, None, None).await;
+        let response = send_and_read(
+            proxy.port(),
+            b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 403"), "got: {response}");
+        // 门禁拒绝发生在建立上游之前：不产生连接记录。
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(records.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolver_error_denies_without_upstream() {
+        let (target_port, hits) = spawn_fake_target().await;
+        let addr = SocketAddr::from(([127, 0, 0, 1], target_port));
+        // 映射一个直连路由域名，若门禁放行或回退直连，目标必被命中。
+        let overrides = HashMap::from([
+            ("unmatched.example".to_string(), addr),
+            ("github.com".to_string(), addr),
+        ]);
+        let (_dir, image_path, _sha) = temp_image(b"whatever");
+        let gate = Arc::new(ConnectionGate::new(
+            Box::new(StaticResolver {
+                peer: peer_now(&image_path),
+                fail: Some("未找到连接所有者进程"),
+            }),
+            // 批准一个无关摘要：解析失败发生在策略判定之前。
+            policy_allowing(&"ee".repeat(32)),
+        ));
+        let (sink, records) = record_sink();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind proxy");
+        let proxy = spawn_with_listener(
+            listener,
+            ProxyConfig {
+                on_record: Some(sink),
+                gate: Some(gate),
+                direct_overrides: Some(Arc::new(overrides)),
+                ..ProxyConfig::default()
+            },
+        );
+        for request in [
+            b"CONNECT chatgpt.com:443 HTTP/1.1\r\n\r\n".as_slice(),
+            b"GET http://unmatched.example/x HTTP/1.1\r\n\r\n".as_slice(),
+        ] {
+            let response = send_and_read(proxy.port(), request).await;
+            assert!(response.starts_with("HTTP/1.1 403"), "got: {response}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "必须零出站连接");
+        assert!(records.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_route_also_gated() {
+        // github.com 不在规则内 → 直连路由；但门禁身份被拒 → 仍 403、零出站。
+        let (target_port, hits) = spawn_fake_target().await;
+        let addr = SocketAddr::from(([127, 0, 0, 1], target_port));
+        let overrides = HashMap::from([("github.com".to_string(), addr)]);
+        let (_dir, image_path, _sha) = temp_image(b"codex-engine-image");
+        let gate = Arc::new(ConnectionGate::new(
+            Box::new(StaticResolver {
+                peer: peer_now(&image_path),
+                fail: None,
+            }),
+            // 批准摘要与实际映像不同 → Deny{image}。
+            policy_allowing(&"aa".repeat(32)),
+        ));
+        let (sink, records) = record_sink();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind proxy");
+        let proxy = spawn_with_listener(
+            listener,
+            ProxyConfig {
+                on_record: Some(sink),
+                gate: Some(gate),
+                direct_overrides: Some(Arc::new(overrides)),
+                ..ProxyConfig::default()
+            },
+        );
+        let response = send_and_read(
+            proxy.port(),
+            b"CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 403"), "got: {response}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "直连路由同样受门禁");
+        assert!(records.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn self_identify_survives_gate() {
+        // 自识端点在门禁之前放行：解析器恒失败也不影响。
+        let (_dir, image_path, _sha) = temp_image(b"codex-engine-image");
+        let (proxy, records) =
+            spawn_gated_proxy(peer_now(&image_path), Some("未找到连接所有者进程"), None).await;
+        let response = send_and_read(
+            proxy.port(),
+            b"GET /__codex_helper_proxy_id HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .await;
+        assert!(response.contains("200 OK"), "got: {response}");
+        assert!(
+            response.contains("codex-helper-managed-proxy"),
+            "got: {response}"
+        );
+        assert!(records.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn gate_none_keeps_legacy_behavior() {
+        // 现有 Legacy 测试已覆盖 gate: None 的行为；这里显式验证 None 时直连可达
+        // 且自识端点可用（同一条连接上不引入门禁副作用）。
+        let (socks5, _seen) = spawn_fake_socks5().await;
+        let (target_port, hits) = spawn_fake_target().await;
+        let (proxy, _records) = spawn_recording_proxy(proxy_config(&socks5)).await;
+        let request = format!("GET http://127.0.0.1:{target_port}/ping HTTP/1.1\r\n\r\n");
+        let response = send_and_read(proxy.port(), request.as_bytes()).await;
+        assert!(response.contains("200 OK"), "got: {response}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gate_runs_before_target_parsing() {
+        // 设计 §6.3：门禁在读代理请求（target 解析）之前。解析器恒失败时，
+        // 连首行不可解析的请求也回 403（而不是 400）：身份核实先于一切语义处理。
+        let (_dir, image_path, _sha) = temp_image(b"codex-engine-image");
+        let (proxy, records) =
+            spawn_gated_proxy(peer_now(&image_path), Some("未找到连接所有者进程"), None).await;
+        for request in [
+            b"HELLO\r\n\r\n".as_slice(),
+            b"GET /models HTTP/1.1\r\n\r\n".as_slice(),
+        ] {
+            let response = send_and_read(proxy.port(), request).await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "request {:?} got: {response}",
+                String::from_utf8_lossy(request)
+            );
+        }
+        assert!(records.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn matched_user_scope_allows_tunnel() {
+        // 完整链路：解析成功 + 映像批准 + 命中规则 → 走 SOCKS5 隧道。
+        let (socks5, seen) = spawn_fake_socks5().await;
+        let (dir, image_path, sha) = temp_image(b"codex-engine-image");
+        let gate = Arc::new(ConnectionGate::new(
+            Box::new(StaticResolver {
+                peer: peer_now(&image_path),
+                fail: None,
+            }),
+            policy_allowing(&sha),
+        ));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind proxy");
+        let proxy = spawn_with_listener(
+            listener,
+            ProxyConfig {
+                gate: Some(gate),
+                ..proxy_config(&socks5)
+            },
+        );
+        // CONNECT 隧道建立后不会关闭连接：只读应答头。
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port()))
+            .await
+            .expect("connect proxy");
+        client
+            .write_all(b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n")
+            .await
+            .expect("send connect");
+        let mut head = vec![0u8; 64];
+        let read = tokio::time::timeout(IO_TIMEOUT, client.read(&mut head))
+            .await
+            .expect("隧道应建立")
+            .expect("read tunnel");
+        let text = String::from_utf8_lossy(&head[..read]).to_string();
+        assert!(text.starts_with("HTTP/1.1 200"), "got: {text}");
+        let targets = seen.lock().expect("lock").clone();
+        assert_eq!(targets, vec!["chatgpt.com:443".to_string()]);
+        let _ = dir;
+    }
+}

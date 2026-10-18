@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0-rc.1"
 edition = "2024"
 publish = false
 
@@ -22,6 +22,14 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync", "process"] }
 toml_edit = "0.22"
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+rustls-pki-types = "1"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# 进程策略签名验证（设计 §6.2）：ed25519 与其生态的 SHA-256 实现。
+ed25519-dalek = "2"
+sha2 = "0.10"
 wiremock = "0.6"
+libproc = "0.14.11"
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 helper-core = { path = "crates/helper-core" }

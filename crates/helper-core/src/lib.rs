@@ -8,6 +8,7 @@
 
 pub mod codex_config;
 pub mod codex_env;
+pub mod connection_gate;
 pub mod consts;
 pub mod credential;
 pub mod devenv;
@@ -16,7 +17,11 @@ pub mod gateway;
 pub mod log;
 pub mod manager;
 pub mod paths;
+pub mod peer_identity;
+pub mod process_policy;
 pub mod proxy;
+pub mod proxy_identity;
 pub mod rules;
 pub mod state;
 pub mod types;
+pub mod upstream;

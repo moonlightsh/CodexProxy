@@ -20,14 +20,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
 use serde_json::json;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
+use crate::connection_gate::ConnectionGate;
 use crate::consts;
+use crate::credential::Secret;
+use crate::process_policy::Decision;
 use crate::rules::{self, Route};
 use crate::types::ConnectionRecord;
+use crate::upstream::SecureUpstream;
+
+/// 上游传输抽象：直连 TCP 与（后续任务的）TLS 上游统一装箱，转发路径不感知具体类型。
+/// TCP 特有选项（`set_nodelay`）在装箱前设置。
+pub type BoxedTransport = Box<dyn AsyncTransport + Unpin + Send>;
+
+/// 装箱传输的统一接口：合并 `AsyncRead + AsyncWrite`，供 trait object 使用。
+pub trait AsyncTransport: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncTransport for T {}
 
 /// 自识端点路径。
 pub const PROXY_ID_PATH: &str = "/__codex_helper_proxy_id";
@@ -56,11 +68,17 @@ const LINGER_MAX_BYTES: usize = 1024 * 1024;
 /// 成功连接的日志采样：前 N 条全记，之后每 M 条记 1 条；失败全部记录。
 const LOG_SAMPLE_HEAD: u64 = 20;
 const LOG_SAMPLE_EVERY: u64 = 20;
+/// 门禁整体预算（设计 §6.4：单连接总门禁超时 1s，超时拒绝，不自动放行）。
+/// 含连接所有者解析（含一次 150ms 复查间隔）与映像文件摘要计算。
+const GATE_TIMEOUT: Duration = Duration::from_secs(1);
 
 const BAD_REQUEST: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const BAD_GATEWAY: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+/// 门禁拒绝应答：固定最小文案，不区分拒绝原因，不携带对端任何信息。
+const GATE_FORBIDDEN: &[u8] =
+    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const CONNECTION_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 /// 明文转发前移除的逐跳头；`Connection` 随后统一改写为 `close`。
 const HOP_BY_HOP_HEADERS: &[&str] = &["connection", "proxy-connection", "keep-alive"];
@@ -244,6 +262,11 @@ pub fn build_socks5_greeting() -> [u8; 3] {
     [0x05, 0x01, 0x00]
 }
 
+/// SOCKS5 RFC1929 用户名密码认证问候：只提供用户名密码方法（VER=5, NMETHODS=1, METHOD=0x02）。
+pub fn build_socks5_auth_greeting() -> [u8; 3] {
+    [0x05, 0x01, 0x02]
+}
+
 /// SOCKS5 CONNECT 请求，固定域名寻址（ATYP=0x03），不在本地解析 DNS。
 pub fn build_socks5_connect_request(host: &str, port: u16) -> anyhow::Result<Vec<u8>> {
     let host_bytes = host.as_bytes();
@@ -269,6 +292,62 @@ pub fn parse_socks5_method_reply(bytes: &[u8]) -> anyhow::Result<()> {
     }
     if bytes[1] != 0x00 {
         bail!("SOCKS5 上游要求认证方法 0x{:02x}", bytes[1]);
+    }
+    Ok(())
+}
+
+/// 校验认证协商的方法应答：必须选中用户名密码方法（`05 02`）。
+/// 服务端选择 `0x00`（无认证）视为降级攻击，必须失败，绝不继续发送任何后续报文。
+pub fn parse_socks5_method_reply_auth(bytes: &[u8]) -> anyhow::Result<()> {
+    if bytes.len() < 2 {
+        bail!("SOCKS5 方法应答长度不足");
+    }
+    if bytes[0] != 0x05 {
+        bail!("SOCKS5 版本不支持：0x{:02x}", bytes[0]);
+    }
+    match bytes[1] {
+        0x02 => Ok(()),
+        0x00 => bail!("上游拒绝认证降级（选择了无认证方法）"),
+        method => bail!("上游不支持用户名密码认证：方法 0x{method:02x}"),
+    }
+}
+
+/// 构造 RFC1929 用户名密码子协商请求：`01 ULEN USER PLEN PASSWORD`。
+/// 用户名与密码各限 1–255 字节；错误信息不含凭据内容。
+pub fn build_socks5_auth_request(username: &str, password: &Secret) -> anyhow::Result<Vec<u8>> {
+    let user = username.as_bytes();
+    if user.is_empty() {
+        bail!("SOCKS5 认证用户名为空");
+    }
+    if user.len() > 255 {
+        bail!("SOCKS5 认证用户名过长：{} 字节", user.len());
+    }
+    let pass = password.expose().as_bytes();
+    if pass.is_empty() {
+        bail!("SOCKS5 认证密码为空");
+    }
+    if pass.len() > 255 {
+        bail!("SOCKS5 认证密码过长：{} 字节", pass.len());
+    }
+    let mut request = Vec::with_capacity(3 + user.len() + pass.len());
+    request.push(0x01);
+    request.push(u8::try_from(user.len()).expect("已校验 ≤255"));
+    request.extend_from_slice(user);
+    request.push(u8::try_from(pass.len()).expect("已校验 ≤255"));
+    request.extend_from_slice(pass);
+    Ok(request)
+}
+
+/// 校验 RFC1929 认证应答：仅接受成功状态 `01 00`。
+pub fn parse_socks5_auth_reply(bytes: &[u8]) -> anyhow::Result<()> {
+    if bytes.len() < 2 {
+        bail!("SOCKS5 认证应答长度不足");
+    }
+    if bytes[0] != 0x01 {
+        bail!("SOCKS5 认证子协议版本不支持：0x{:02x}", bytes[0]);
+    }
+    if bytes[1] != 0x00 {
+        bail!("SOCKS5 用户名密码认证失败：状态 0x{:02x}", bytes[1]);
     }
     Ok(())
 }
@@ -315,13 +394,13 @@ pub fn socks5_connect_reply_len(bytes: &[u8]) -> Option<usize> {
     Some(4 + addr_len + 2)
 }
 
-/// 经指定上游 SOCKS5 建立到目标的隧道。失败返回错误，**调用方不得回退直连**。
+/// 经指定上游 SOCKS5 建立到目标的隧道（无认证）。失败返回错误，**调用方不得回退直连**。
 pub async fn connect_via_socks5_at(
     upstream_host: &str,
     upstream_port: u16,
     host: &str,
     port: u16,
-) -> anyhow::Result<tokio::net::TcpStream> {
+) -> anyhow::Result<BoxedTransport> {
     // 先构造请求：主机名为空或过长时不必连接上游
     let request = build_socks5_connect_request(host, port)?;
     let mut stream = tokio::time::timeout(
@@ -331,19 +410,58 @@ pub async fn connect_via_socks5_at(
     .await
     .map_err(|_| anyhow!("SOCKS5 上游连接超时"))?
     .context("SOCKS5 上游连接失败")?;
+    let _ = stream.set_nodelay(true);
     tokio::time::timeout(SOCKS5_TIMEOUT, socks5_handshake(&mut stream, &request))
         .await
         .map_err(|_| anyhow!("SOCKS5 握手超时"))??;
-    Ok(stream)
+    Ok(Box::new(stream))
 }
 
-async fn socks5_handshake(stream: &mut TcpStream, connect_request: &[u8]) -> anyhow::Result<()> {
+async fn socks5_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    connect_request: &[u8],
+) -> anyhow::Result<()> {
     stream.write_all(&build_socks5_greeting()).await?;
     let mut method_reply = [0u8; 2];
     stream.read_exact(&mut method_reply).await?;
     parse_socks5_method_reply(&method_reply)?;
 
+    socks5_connect_phase(stream, connect_request).await
+}
+
+/// 认证握手：认证问候 → 方法应答（必须 0x02）→ RFC1929 子协商（必须 01 00）→ CONNECT。
+/// 任何阶段失败都不发 CONNECT，也不重试。`stream` 已完成传输层建连（TLS 上游在装箱前调用）。
+/// 仅限 crate 内使用：唯一生产调用方是 [`crate::upstream::connect_secure`]（TLS 之内执行），
+/// 不对外暴露“明文 TCP 上直接发密码”的入口。每次写入后 `flush`，确保 TLS 记录及时发出。
+pub(crate) async fn socks5_auth_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    username: &str,
+    password: &Secret,
+    connect_request: &[u8],
+) -> anyhow::Result<()> {
+    let auth_request = build_socks5_auth_request(username, password)?;
+    stream.write_all(&build_socks5_auth_greeting()).await?;
+    stream.flush().await?;
+    let mut method_reply = [0u8; 2];
+    stream.read_exact(&mut method_reply).await?;
+    parse_socks5_method_reply_auth(&method_reply)?;
+
+    stream.write_all(&auth_request).await?;
+    stream.flush().await?;
+    let mut auth_reply = [0u8; 2];
+    stream.read_exact(&mut auth_reply).await?;
+    parse_socks5_auth_reply(&auth_reply)?;
+
+    socks5_connect_phase(stream, connect_request).await
+}
+
+/// CONNECT 阶段：发请求、校验应答并读完整应答尾部（两个握手共用）。
+async fn socks5_connect_phase<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    connect_request: &[u8],
+) -> anyhow::Result<()> {
     stream.write_all(connect_request).await?;
+    stream.flush().await?;
     let mut head = [0u8; 5];
     stream.read_exact(&mut head).await?;
     parse_socks5_connect_reply(&head)?;
@@ -367,6 +485,13 @@ pub struct ProxyConfig {
     /// 仅供测试：直连时把主机名（规范化后）映射到固定地址，用于验证“命中规则但上游失败时
     /// 目标未收到直连”。生产必须为 `None`；只影响直连路径，不影响分流判定与 SOCKS5 路径。
     pub direct_overrides: Option<Arc<HashMap<String, SocketAddr>>>,
+    /// 安全上游（TLS + mTLS + SOCKS5 用户名密码）。`Some` 时命中规则的流量只走它，
+    /// 失败即 502，绝不回退 `socks5_host:socks5_port` 旧入口；`None` 走旧的无认证路径。
+    pub secure_upstream: Option<Arc<SecureUpstream>>,
+    /// 本机进程身份门禁（设计 §6.3）。`Some` 时除自识端点外的每个请求都必须先通过门禁，
+    /// 任何失败（解析失败/超时/作用域不符/映像未批准）都回 403 并关闭，零出站；
+    /// `None` 保持 Legacy 行为（无门禁）。
+    pub gate: Option<Arc<ConnectionGate>>,
 }
 
 impl Default for ProxyConfig {
@@ -376,6 +501,8 @@ impl Default for ProxyConfig {
             socks5_port: crate::consts::SOCKS5_PORT,
             on_record: None,
             direct_overrides: None,
+            secure_upstream: None,
+            gate: None,
         }
     }
 }
@@ -387,6 +514,9 @@ impl fmt::Debug for ProxyConfig {
             .field("socks5_port", &self.socks5_port)
             .field("on_record", &self.on_record.as_ref().map(|_| "<fn>"))
             .field("direct_overrides", &self.direct_overrides)
+            // SecureUpstream 的 Debug 已脱敏：不含密码与 PEM
+            .field("secure_upstream", &self.secure_upstream)
+            .field("gate", &self.gate.as_ref().map(|_| "<ConnectionGate>"))
             .finish()
     }
 }
@@ -764,9 +894,50 @@ async fn handle_connection(mut client: TcpStream, shared: Arc<Shared>) {
         return respond_and_close(client, identify_response().as_bytes()).await;
     }
 
+    // 门禁（设计 §6.3）：自识端点之外，在读代理请求（target 解析）与任何上游/直连出站
+    // 之前，先核实连接所有者进程身份；失败/超时/作用域不符/映像未批准 → 403 并关闭，
+    // 零出站。解析（含复查）与映像摘要都是阻塞 IO，整体放进 spawn_blocking 并套上门禁
+    // 超时（设计 §6.4：单连接总门禁超时 1s，超时拒绝，不自动放行）。
+    if let Some(gate) = shared.config.gate.clone() {
+        let remote = client.peer_addr().map(|addr| (addr.ip(), addr.port())).ok();
+        let local = client
+            .local_addr()
+            .map(|addr| (addr.ip(), addr.port()))
+            .ok();
+        let (Some(remote), Some(local)) = (remote, local) else {
+            // 连接端点都拿不到：无法定位所有者，fail-closed。
+            crate::log::event("proxy.gate_denied", json!({ "reason": "endpoints" }));
+            return respond_and_close(client, GATE_FORBIDDEN).await;
+        };
+        // 超时、任务失败（panic/取消）、解析失败（含复查后仍多候选）一样按 fail-closed 拒绝。
+        let checked = tokio::time::timeout(
+            GATE_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                gate.resolve_with_retry(local, remote)
+                    .map(|peer| gate.admit(&peer))
+            }),
+        )
+        .await
+        .ok()
+        .and_then(|joined| joined.ok())
+        .and_then(|decision| decision.ok());
+        match checked {
+            Some(Decision::Allow { .. }) => {}
+            Some(Decision::Deny { reason }) => {
+                crate::log::event("proxy.gate_denied", json!({ "reason": reason }));
+                return respond_and_close(client, GATE_FORBIDDEN).await;
+            }
+            None => {
+                crate::log::event("proxy.gate_denied", json!({ "reason": "resolve" }));
+                return respond_and_close(client, GATE_FORBIDDEN).await;
+            }
+        }
+    }
+
     let Some(target) = parse_proxy_request_line(first_line) else {
         return reject(client, "bad_request_line").await;
     };
+
     if is_self_target(&target, shared.listen_port) {
         return reject(client, "self_loop").await;
     }
@@ -799,7 +970,6 @@ async fn handle_connection(mut client: TcpStream, shared: Arc<Shared>) {
         pending.finish();
         return respond_and_close(client, BAD_GATEWAY).await;
     };
-    let _ = upstream.set_nodelay(true);
 
     match plain_head {
         None => {
@@ -820,22 +990,31 @@ async fn connect_upstream(
     config: &ProxyConfig,
     target: &ProxyTarget,
     decision: Route,
-) -> anyhow::Result<TcpStream> {
+) -> anyhow::Result<BoxedTransport> {
     match decision {
-        Route::Socks5 => {
-            connect_via_socks5_at(
-                &config.socks5_host,
-                config.socks5_port,
-                &target.host,
-                target.port,
-            )
-            .await
-        }
+        Route::Socks5 => match &config.secure_upstream {
+            // 安全上游已配置：只走它，失败不回退旧入口
+            Some(secure) => {
+                crate::upstream::connect_secure(secure, &target.host, target.port).await
+            }
+            None => {
+                connect_via_socks5_at(
+                    &config.socks5_host,
+                    config.socks5_port,
+                    &target.host,
+                    target.port,
+                )
+                .await
+            }
+        },
         Route::Direct => connect_direct(config, target).await,
     }
 }
 
-async fn connect_direct(config: &ProxyConfig, target: &ProxyTarget) -> anyhow::Result<TcpStream> {
+async fn connect_direct(
+    config: &ProxyConfig,
+    target: &ProxyTarget,
+) -> anyhow::Result<BoxedTransport> {
     let override_addr = config
         .direct_overrides
         .as_ref()
@@ -847,14 +1026,16 @@ async fn connect_direct(config: &ProxyConfig, target: &ProxyTarget) -> anyhow::R
             None => TcpStream::connect((target.host.as_str(), target.port)).await,
         }
     };
-    tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, connect)
+    let stream = tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, connect)
         .await
         .map_err(|_| anyhow!("直连目标超时"))?
-        .context("直连目标失败")
+        .context("直连目标失败")?;
+    let _ = stream.set_nodelay(true);
+    Ok(Box::new(stream))
 }
 
 /// CONNECT：回 200 后双向透传，不解密；请求头之后已读入的字节先交给上游。
-async fn tunnel(client: &mut TcpStream, mut upstream: TcpStream, extra: &[u8]) {
+async fn tunnel(client: &mut TcpStream, mut upstream: BoxedTransport, extra: &[u8]) {
     if client.write_all(CONNECTION_ESTABLISHED).await.is_err() {
         return;
     }
@@ -865,7 +1046,12 @@ async fn tunnel(client: &mut TcpStream, mut upstream: TcpStream, extra: &[u8]) {
 }
 
 /// 明文转发：发送改写后的请求头与已读入的请求体开头，随后透传，直到上游响应结束（上游关闭）。
-async fn forward_plain(client: &mut TcpStream, mut upstream: TcpStream, head: &[u8], extra: &[u8]) {
+async fn forward_plain(
+    client: &mut TcpStream,
+    mut upstream: BoxedTransport,
+    head: &[u8],
+    extra: &[u8],
+) {
     if upstream.write_all(head).await.is_err() {
         return;
     }
@@ -873,7 +1059,7 @@ async fn forward_plain(client: &mut TcpStream, mut upstream: TcpStream, head: &[
         return;
     }
     let (mut client_read, mut client_write) = client.split();
-    let (mut upstream_read, mut upstream_write) = upstream.split();
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream.as_mut());
     let request = async {
         let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
         let _ = upstream_write.shutdown().await;
@@ -978,6 +1164,66 @@ mod tests {
     #[test]
     fn builds_no_auth_greeting() {
         assert_eq!(build_socks5_greeting(), [0x05, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn builds_rfc1929_auth_greeting() {
+        // 只声明用户名密码方法；多声明无认证是错误报文
+        assert_eq!(build_socks5_auth_greeting(), [0x05, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn auth_method_reply_accepts_only_username_password() {
+        assert!(parse_socks5_method_reply_auth(&[0x05, 0x02]).is_ok());
+        // 选择无认证是降级攻击，必须失败
+        let downgrade = parse_socks5_method_reply_auth(&[0x05, 0x00]).expect_err("downgrade");
+        assert!(downgrade.to_string().contains("拒绝认证降级"));
+        let other = parse_socks5_method_reply_auth(&[0x05, 0xff]).expect_err("other");
+        assert!(other.to_string().contains("不支持用户名密码认证"));
+        assert!(parse_socks5_method_reply_auth(&[0x04, 0x02]).is_err());
+        assert!(parse_socks5_method_reply_auth(&[0x05]).is_err());
+    }
+
+    #[test]
+    fn auth_request_fixed_vector_roundtrip() {
+        // ("user","pass") → 01 04 "user" 04 "pass"
+        let request = build_socks5_auth_request("user", &Secret::new("pass")).expect("built");
+        assert_eq!(
+            request,
+            vec![
+                0x01, 0x04, b'u', b's', b'e', b'r', 0x04, b'p', b'a', b's', b's'
+            ]
+        );
+    }
+
+    #[test]
+    fn auth_request_validates_lengths_without_leaking_credentials() {
+        // 空用户名/密码与超长用户名/密码均报错，且错误信息不含凭据内容
+        assert!(build_socks5_auth_request("", &Secret::new("pass")).is_err());
+        assert!(build_socks5_auth_request("user", &Secret::new("")).is_err());
+        let long_user = "u".repeat(256);
+        let long_pass = "p".repeat(256);
+        assert!(build_socks5_auth_request(&long_user, &Secret::new("pass")).is_err());
+        let error = build_socks5_auth_request("user", &Secret::new(&long_pass)).expect_err("long");
+        assert!(error.to_string().contains("密码过长"));
+        assert!(!error.to_string().contains(&long_pass));
+        // 边界：恰好 255 字节可用
+        let max_user = "u".repeat(255);
+        let max_pass = "p".repeat(255);
+        let request =
+            build_socks5_auth_request(&max_user, &Secret::new(&max_pass)).expect("boundary");
+        assert_eq!(request.len(), 3 + 255 + 255);
+        assert_eq!(request[1], 255);
+        assert_eq!(request[257], 255);
+    }
+
+    #[test]
+    fn auth_reply_accepts_only_success_status() {
+        assert!(parse_socks5_auth_reply(&[0x01, 0x00]).is_ok());
+        let failed = parse_socks5_auth_reply(&[0x01, 0x01]).expect_err("failed");
+        assert!(failed.to_string().contains("认证失败"));
+        assert!(parse_socks5_auth_reply(&[0x02, 0x00]).is_err());
+        assert!(parse_socks5_auth_reply(&[0x01]).is_err());
     }
 
     #[test]
@@ -1266,5 +1512,247 @@ Connection: close\r\n\r\n"
         }
         let other = bind_error(17891, std::io::Error::from(std::io::ErrorKind::Other));
         assert!(matches!(other, ProxyStartError::Io(_)));
+    }
+
+    // ---- Task 2：SOCKS5 RFC1929 用户名密码认证 ----
+
+    /// 要求认证的假 SOCKS5：方法协商必须选 0x02，凭据正确才回 CONNECT 成功，否则断开。
+    /// 返回 (host:port, CONNECT 目标记录)。
+    async fn spawn_auth_socks5(
+        username: &str,
+        password: &str,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind auth socks5");
+        let addr = listener.local_addr().expect("addr");
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let username = username.to_string();
+        let password = password.to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen = Arc::clone(&seen_clone);
+                let username = username.clone();
+                let password = password.clone();
+                tokio::spawn(async move {
+                    // 认证问候必须声明且仅声明 0x02
+                    let mut greeting = [0u8; 3];
+                    if stream.read_exact(&mut greeting).await.is_err() {
+                        return;
+                    }
+                    if greeting != [0x05, 0x01, 0x02] {
+                        return; // 错误问候直接断开
+                    }
+                    if stream.write_all(&[0x05, 0x02]).await.is_err() {
+                        return;
+                    }
+                    // RFC1929：01 ULEN USER PLEN PASS
+                    let mut version = [0u8; 2];
+                    if stream.read_exact(&mut version).await.is_err() {
+                        return;
+                    }
+                    if version[0] != 0x01 {
+                        return;
+                    }
+                    let mut user = vec![0u8; usize::from(version[1])];
+                    if stream.read_exact(&mut user).await.is_err() {
+                        return;
+                    }
+                    let mut plen = [0u8; 1];
+                    if stream.read_exact(&mut plen).await.is_err() {
+                        return;
+                    }
+                    let mut pass = vec![0u8; usize::from(plen[0])];
+                    if stream.read_exact(&mut pass).await.is_err() {
+                        return;
+                    }
+                    let ok = user == username.as_bytes() && pass == password.as_bytes();
+                    if !ok || stream.write_all(&[0x01, 0x00]).await.is_err() {
+                        // 错误凭据：回失败状态后断开
+                        if !ok {
+                            let _ = stream.write_all(&[0x01, 0x01]).await;
+                        }
+                        return;
+                    }
+                    // CONNECT 阶段与无认证版一致
+                    let mut head = [0u8; 5];
+                    if stream.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    let host_len = usize::from(head[4]);
+                    let mut host = vec![0u8; host_len];
+                    if stream.read_exact(&mut host).await.is_err() {
+                        return;
+                    }
+                    let mut port = [0u8; 2];
+                    if stream.read_exact(&mut port).await.is_err() {
+                        return;
+                    }
+                    let target = format!(
+                        "{}:{}",
+                        String::from_utf8_lossy(&host),
+                        u16::from_be_bytes(port)
+                    );
+                    seen.lock().expect("lock").push(target);
+                    let reply = [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80];
+                    if stream.write_all(&reply).await.is_err() {
+                        return;
+                    }
+                    let mut buffer = vec![0u8; 4096];
+                    while let Ok(read) = stream.read(&mut buffer).await {
+                        if read == 0 {
+                            break;
+                        }
+                        if stream.write_all(&buffer[..read]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        (addr.to_string(), seen)
+    }
+
+    #[tokio::test]
+    async fn auth_handshake_succeeds_with_correct_credentials() {
+        let (socks5, seen) = spawn_auth_socks5("device-test", "secret-pass").await;
+        let (host, port) = socks5.rsplit_once(':').expect("addr");
+        let mut stream = tokio::net::TcpStream::connect((host, port.parse::<u16>().expect("port")))
+            .await
+            .expect("connect auth socks5");
+        let connect = build_socks5_connect_request("chatgpt.com", 443).expect("build");
+        socks5_auth_handshake(
+            &mut stream,
+            "device-test",
+            &Secret::new("secret-pass"),
+            &connect,
+        )
+        .await
+        .expect("auth handshake");
+
+        // 握手后透传回显
+        stream.write_all(b"ping").await.expect("write");
+        let mut echo = vec![0u8; 4];
+        stream.read_exact(&mut echo).await.expect("echo");
+        assert_eq!(&echo, b"ping");
+        let targets = seen.lock().expect("lock").clone();
+        assert_eq!(targets, vec!["chatgpt.com:443".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn wrong_password_fails_and_server_disconnects() {
+        let (socks5, seen) = spawn_auth_socks5("device-test", "secret-pass").await;
+        let (host, port) = socks5.rsplit_once(':').expect("addr");
+        let mut stream = tokio::net::TcpStream::connect((host, port.parse::<u16>().expect("port")))
+            .await
+            .expect("connect auth socks5");
+        let connect = build_socks5_connect_request("chatgpt.com", 443).expect("build");
+        let error = socks5_auth_handshake(
+            &mut stream,
+            "device-test",
+            &Secret::new("wrong-pass"),
+            &connect,
+        )
+        .await
+        .expect_err("wrong password must fail");
+        assert!(error.to_string().contains("认证失败"), "{error}");
+        // 服务端断开：CONNECT 目标绝不能收到
+        assert!(seen.lock().expect("lock").is_empty());
+    }
+
+    /// 主动选无认证方法的假上游：客户端必须把 0x00 视为降级攻击并失败。
+    #[tokio::test]
+    async fn no_auth_downgrade_is_rejected_by_client() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind downgrade server");
+        let addr = listener.local_addr().expect("addr");
+        let (after_tx, after_rx) = oneshot::channel::<usize>();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut greeting = [0u8; 3];
+            let _ = stream.read_exact(&mut greeting).await;
+            // 恶意/配置错误的上游：选择无认证
+            let _ = stream.write_all(&[0x05, 0x00]).await;
+            // 统计降级应答之后客户端发来的全部字节（直到客户端关闭连接）
+            let mut total = 0usize;
+            let mut buffer = vec![0u8; 512];
+            while let Ok(read) = stream.read(&mut buffer).await {
+                if read == 0 {
+                    break;
+                }
+                total += read;
+            }
+            let _ = after_tx.send(total);
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let connect = build_socks5_connect_request("chatgpt.com", 443).expect("build");
+        let error = socks5_auth_handshake(
+            &mut stream,
+            "device-test",
+            &Secret::new("secret-pass"),
+            &connect,
+        )
+        .await
+        .expect_err("downgrade must fail");
+        assert!(
+            error.to_string().contains("拒绝认证降级"),
+            "unexpected: {error}"
+        );
+        // 客户端关闭连接后，服务端必须一个字节都没收到（既无认证请求，也无 CONNECT）
+        drop(stream);
+        let after = tokio::time::timeout(Duration::from_secs(5), after_rx)
+            .await
+            .expect("server finished")
+            .expect("server reported");
+        assert_eq!(after, 0, "降级应答后客户端不得再发送任何字节");
+    }
+
+    /// 上游在认证应答返回非 0x00：必须失败。
+    #[tokio::test]
+    async fn auth_failure_status_fails_handshake() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind auth-fail server");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut greeting = [0u8; 3];
+                    let _ = stream.read_exact(&mut greeting).await;
+                    let _ = stream.write_all(&[0x05, 0x02]).await;
+                    // 读掉认证请求后回失败状态
+                    let mut head = [0u8; 2];
+                    let _ = stream.read_exact(&mut head).await;
+                    let mut rest = vec![0u8; usize::from(head[1])];
+                    let _ = stream.read_exact(&mut rest).await;
+                    let mut plen = [0u8; 1];
+                    let _ = stream.read_exact(&mut plen).await;
+                    let mut pass = vec![0u8; usize::from(plen[0])];
+                    let _ = stream.read_exact(&mut pass).await;
+                    let _ = stream.write_all(&[0x01, 0x01]).await;
+                });
+            }
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let connect = build_socks5_connect_request("chatgpt.com", 443).expect("build");
+        let error = socks5_auth_handshake(
+            &mut stream,
+            "device-test",
+            &Secret::new("secret-pass"),
+            &connect,
+        )
+        .await
+        .expect_err("auth failure must fail");
+        assert!(error.to_string().contains("认证失败"), "{error}");
     }
 }
