@@ -19,7 +19,14 @@ import {
   reachabilityLevel,
   showUpdatePanel,
   uninstallHint,
+  updatePanelViewState,
 } from "./format.ts";
+import type { UpdateCheck } from "./types.ts";
+
+/** 构造可用更新检测结果（字段对应 types.ts 的 UpdateCheck）。 */
+function fakeUpdate(version: string): UpdateCheck {
+  return { available: true, currentVersion: "0.3.0", version, notes: null, date: null };
+}
 
 test("formatProxyStateLabel 覆盖三种代理状态", () => {
   assert.equal(formatProxyStateLabel({ state: "running", port: 17891 }), "运行中");
@@ -106,4 +113,20 @@ test("只有支持内部升级时显示升级区", () => {
   assert.equal(showUpdatePanel(null), false);
   assert.equal(showUpdatePanel({ updateSupported: false }), false);
   assert.equal(showUpdatePanel({ updateSupported: true }), true);
+});
+
+test("updatePanelViewState：安装位置异常且有可用更新时禁用安装并给出引导", () => {
+  const view = updatePanelViewState({ available: fakeUpdate("0.4.0"), installing: false, installLocationOk: false });
+  assert.equal(view.installDisabled, true);
+  assert.match(view.hint, /请先把 CodexHelper 拖到「应用程序」文件夹/);
+});
+
+test("updatePanelViewState：安装位置正常时安装可用", () => {
+  const view = updatePanelViewState({ available: fakeUpdate("0.4.0"), installing: false, installLocationOk: true });
+  assert.equal(view.installDisabled, false);
+});
+
+test("updatePanelViewState：无可用更新时 hint 为空且不误伤", () => {
+  const view = updatePanelViewState({ available: null, installing: false, installLocationOk: false });
+  assert.equal(view.hint, "");
 });
