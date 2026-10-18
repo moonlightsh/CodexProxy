@@ -152,18 +152,25 @@ jobs:
       - name: 安装前端依赖
         run: npm ci --prefix apps/desktop
 
-      # 脚本负责凭据程序 lipo 合成、tauri build 与产物自检，并把 dmg 路径写进 GITHUB_OUTPUT。
-      # macOS 不生成升级产物（createUpdaterArtifacts=false），因此不需要签名私钥，
-      # 也不调用 publish-update.sh：latest.json 仍只含 windows-x86_64。
-      - name: 构建 universal dmg
+      # 脚本负责凭据程序 lipo 合成、tauri build 与产物自检，并把 dmg 与升级产物路径写进 GITHUB_OUTPUT。
+      # 构建注入 TAURI_SIGNING_PRIVATE_KEY 以产出 .app.tar.gz 与 .sig 升级产物（设计 M5/M7）；
+      # 若 CI 未配置该 secret，构建步骤会先失败并给出清晰报错，可接受。
+      - name: 构建 universal dmg 与升级产物
         id: build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: bash scripts/build-macos.sh
 
       # windows-release 不写 Release 正文，由这里补上 macOS 安装说明（设计 §7.3）。
+      # files 同时上传：dmg、升级产物 .app.tar.gz 及其 .sig（fail_on_unmatched_files=true，
+      # 缺一即失败，确保升级渠道产物完整入 Release）。
       - name: 上传 dmg 到 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.build.outputs.dmg }}
+          files: |
+            ${{ steps.build.outputs.dmg }}
+            target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+            target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
           fail_on_unmatched_files: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
@@ -174,3 +181,5 @@ jobs:
                `xattr -dr com.apple.quarantine /Applications/CodexHelper.app`。
             3. 卸载：先在菜单栏图标选“撤销配置并退出”，再把应用拖进废纸篓。如果已经先删了应用、Codex 打不开对话：重新安装后执行一次撤销。
             4. 删除 Key（可选）：`security delete-generic-password -s codex-helper/managed-gateway -a codex-helper`。
+
+            已安装旧版的内网用户也可在应用内「检查更新」直接升级。
