@@ -144,5 +144,5 @@ if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
 fi
 echo "产物：$DMG"
 if [[ -n "$UPDATER_ARTIFACT" ]]; then
-  echo "升级产物：$UPDATER_ARTIFACT（+$UPDATER_ARTIFACT.sig）"
+  echo "升级产物: $UPDATER_ARTIFACT (+$UPDATER_ARTIFACT.sig)"
 fi
