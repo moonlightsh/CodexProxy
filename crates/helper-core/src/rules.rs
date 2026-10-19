@@ -29,6 +29,7 @@ pub const DOMAIN_SUFFIXES: &[&str] = &[
     "client-api.arkoselabs.com",
     "events.statsigapi.net",
     "featuregates.org",
+    "github.com",
     "host.livekit.cloud",
     "identrust.com",
     "intercom.io",
@@ -172,8 +173,19 @@ mod tests {
 
     #[test]
     fn normal_non_openai_host_is_direct() {
-        assert_eq!(route_for_host("github.com"), Route::Direct);
         assert_eq!(route_for_host("example.com"), Route::Direct);
+    }
+
+    #[test]
+    fn github_routes_through_socks5() {
+        // 策略调整：github.com 及其子域名走内置 SOCKS5 上游。
+        assert_eq!(route_for_host("github.com"), Route::Socks5);
+        assert_eq!(route_for_host("api.github.com"), Route::Socks5);
+        assert_eq!(route_for_host("gist.github.com"), Route::Socks5);
+        assert_eq!(route_for_host("GITHUB.COM."), Route::Socks5);
+        // 标签边界：相似域名不因后缀规则命中
+        assert_eq!(route_for_host("notgithub.com"), Route::Direct);
+        assert_eq!(route_for_host("github.example"), Route::Direct);
     }
 
     /// 原测试 `matched_result_has_no_direct_fallback` 断言的是 PAC 文本常量
@@ -208,7 +220,7 @@ mod tests {
 
     #[test]
     fn unrelated_hosts_go_direct() {
-        for host in ["github.com", "registry.npmjs.org", "example.com"] {
+        for host in ["registry.npmjs.org", "example.com"] {
             assert_eq!(route_for_host(host), Route::Direct);
         }
     }
@@ -223,7 +235,7 @@ mod tests {
     #[test]
     fn rule_snapshot_counts_and_no_duplicates() {
         assert_eq!(EXACT_DOMAINS.len(), 7);
-        assert_eq!(DOMAIN_SUFFIXES.len(), 24);
+        assert_eq!(DOMAIN_SUFFIXES.len(), 25);
         assert_eq!(KEYWORDS.len(), 1);
 
         let exact_set: HashSet<_> = EXACT_DOMAINS.iter().collect();

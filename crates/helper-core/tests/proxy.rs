@@ -1138,10 +1138,11 @@ mod gate {
 
     #[tokio::test]
     async fn direct_route_also_gated() {
-        // github.com 不在规则内 → 直连路由；但门禁身份被拒 → 仍 403、零出站。
+        // unmatched.example 不在规则内 → 直连路由；但门禁身份被拒 → 仍 403、零出站。
+        // （github.com 已改走 SOCKS5，不再适合作直连路由示例。）
         let (target_port, hits) = spawn_fake_target().await;
         let addr = SocketAddr::from(([127, 0, 0, 1], target_port));
-        let overrides = HashMap::from([("github.com".to_string(), addr)]);
+        let overrides = HashMap::from([("unmatched.example".to_string(), addr)]);
         let (_dir, image_path, _sha) = temp_image(b"codex-engine-image");
         let gate = Arc::new(ConnectionGate::new(
             Box::new(StaticResolver {
@@ -1166,7 +1167,7 @@ mod gate {
         );
         let response = send_and_read(
             proxy.port(),
-            b"CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n",
+            b"CONNECT unmatched.example:443 HTTP/1.1\r\nHost: unmatched.example:443\r\n\r\n",
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 403"), "got: {response}");
