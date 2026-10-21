@@ -669,7 +669,7 @@ tests/gate_self_allow.rs（门禁代理：`ConnectionGate::new(system_resolver()
 
 - [ ] **Step 5: 手动验收清单（真机，结果写入报告；无法执行的标“未验证”）**——逐条对应设计 §6：Windows 代理运行两组件结果与线上清单 / GitHub latest 一致、`Get-AppxPackage` 版本与“设置→应用”一致；Legacy 停代理直连或失败原因正确；Secure 停代理时远端“Secure 代理未就绪”且日志无 `component_updates` 之外的出站、“最近连接”无新记录；Secure 运行时检测成功、“最近连接”可见 `persistent.oaistatic.com` / `api.github.com`、日志有 `proxy.gate_allowed {"self":true}`，同时 `curl -x http://127.0.0.1:17891 https://api.github.com` 仍 403；未安装组件的机器显示未安装；macOS CLI 行可用（Finder 启动）、ChatGPT 行“暂不支持（二期）”；`peer_identity_windows` 与 `gate_self_allow` 在 Windows 真机 `-- --ignored` 跑通。
 
-- [ ] **Step 6: 更新设计文档状态**（`docs/superpowers/specs/2026-10-20-component-update-check-design.md` 状态行改“已实现（2026-10-xx）”并在 §10 追加“实施偏差”指向本计划；提交 `docs(spec): 组件更新检查设计标记为已实现`）
+- [x] **Step 6: 更新设计文档状态**（`docs/superpowers/specs/2026-10-20-component-update-check-design.md` 状态行改“已实现（2026-10-xx）”并在 §10 追加“实施偏差”指向本计划；提交 `docs(spec): 组件更新检查设计标记为已实现`）
 
 ---
 

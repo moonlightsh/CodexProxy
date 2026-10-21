@@ -1,7 +1,7 @@
 # CodexHelper 组件更新检查设计（ChatGPT Desktop / Codex CLI）
 
 - 日期：2026-10-20（2026-10-21 两轮评审修订，见 §10）
-- 状态：已评审通过（2026-10-21，进入实施）
+- 状态：已实现（2026-10-21，分支 `pi/component-update-check`；真机验收见 §6，待执行）
 - 上游设计：`docs/superpowers/specs/2026-09-23-codex-helper-design.md`（§9 界面层流量、§15 升级渠道）、
   `docs/superpowers/specs/2026-10-16-proxy-mtls-process-binding-design.md`（Secure 进程门禁与 openai-restrict）
 - 数据源依据：对 `ChatGPT-x64.msix`（SHA-256 `e2d892e6…afbe7f`）的静态逆向，
@@ -595,3 +595,22 @@ pub struct ComponentUpdates {
    写入 `component_updates.rs` 模块头注释（列入 §8 交付物与 §4.4）。
 10. **C6 开发版语义（C6/§5/§6）**：本地 `0.0.0` 比较结果定为 `Unknown`（文案
     “开发版，不比较”），不提示更新；替换“视为开发版参与比较”；§2.2/§4.5 同步。
+
+### 实施偏差（2026-10-21）
+
+实施中对本设计的补充与偏差共 15 条（D1–D15），以实施计划
+`docs/superpowers/plans/2026-10-21-component-update-check.md` 的“实施偏差与设计缺口”表为准。
+其中改变数据形状或对外语义的几条：
+
+- **D1**：`check_component_updates` 返回 `Result<ComponentUpdates, ErrorPayload>`（Tauri 对带
+  `State` 的 async 命令的要求），恒 `Ok`，前端形状不变。
+- **D2**：`LocalState` 新增 `UnsupportedPlatform`（`{"kind":"unsupportedPlatform"}`），用于 macOS
+  的 ChatGPT 行本地列。
+- **D6/D7**：GitHub API 仅 403/429 走 302 回退，其他失败直接本地缓存兜底；API 的
+  `tag_name` 也按 `^rust-v\d+\.\d+\.\d+$` 校验。
+- **D8**：清单缺 x64 条目时版本照常比较、不给下载地址。
+- **D9/D10**：`schemaVersion != 1` 或响应体超过 256 KiB 判 `invalid`。
+- **D11**：Legacy + Stopped 的直连原因文案为“本地代理未运行，已直连”。
+- **D14**：先完成本地探测再发远端请求。
+- **C9 收紧**：下载地址原串含非可打印 ASCII（控制符、空白、双向符、全角符号）一律拒绝，
+  采信后返回规范化地址（展示与校验对象一致）。
