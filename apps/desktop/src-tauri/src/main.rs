@@ -76,6 +76,7 @@ fn main() {
             commands::recent_connections,
             commands::get_reconcile_report,
             commands::detect_dev_env,
+            commands::check_component_updates,
             update::check_update,
             update::install_update,
             update::app_version,

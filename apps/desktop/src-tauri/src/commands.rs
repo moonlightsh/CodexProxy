@@ -9,8 +9,10 @@
 //! - `reconcile-finished`：payload 为 `ReconcileReport`，启动对账完成后推送一次；
 //! - `operation-failed`：payload 为 `ErrorPayload`，非前端发起的操作（如托盘开关）失败时推送。
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use helper_core::component_updates::{self, CheckContext, ComponentUpdates, SystemProbe};
 use helper_core::devenv::{self, DevEnvReport};
 use helper_core::log;
 use helper_core::manager::Manager;
@@ -216,6 +218,27 @@ pub async fn detect_dev_env() -> DevEnvReport {
     devenv::detect().await
 }
 
+/// 组件更新检查（组件更新检查设计 §4.4）：只检测、不下载不安装；网络路径由 Manager 状态快照决定。
+///
+/// 恒返回 `Ok`：失败已编码进各组件状态；签名带 `Result` 是 Tauri 对带 `State<'_>` 的 async 命令的要求。
+#[tauri::command]
+pub async fn check_component_updates(
+    state: tauri::State<'_, AppState>,
+) -> Result<ComponentUpdates, ErrorPayload> {
+    let status = state.manager.status().await;
+    let ctx = component_check_context(&status);
+    Ok(component_updates::check_all(&ctx).await)
+}
+
+/// 由状态快照构造生产检测上下文：代理端口取 `status.proxy.port`（与 `ManagerOptions` 同源），
+/// codex home 取 `status.codex_home`。
+fn component_check_context(status: &Status) -> CheckContext<SystemProbe> {
+    CheckContext::production(
+        component_updates::network_path_for(status),
+        PathBuf::from(&status.codex_home),
+    )
+}
+
 /// 让系统自启项与期望一致。已一致时不动（Windows 删除不存在的注册表值会报错）。
 pub(crate) fn apply_system_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let autolaunch = app.autolaunch();
@@ -260,6 +283,46 @@ fn autostart_error(reason: &str) -> ErrorPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_context_follows_status_snapshot() {
+        use helper_core::component_updates::{Endpoints, NetworkPath};
+        use helper_core::state::ProxyMode;
+        use helper_core::types::{ProxyState, ProxyStatus};
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        let secure_stopped = Status {
+            mode: ProxyMode::Secure,
+            proxy: ProxyStatus {
+                state: ProxyState::Stopped,
+                port: 17891,
+            },
+            codex_home: "/tmp/cuc-home".into(),
+            ..Default::default()
+        };
+        let ctx = component_check_context(&secure_stopped);
+        assert!(matches!(ctx.network, NetworkPath::Blocked { .. }));
+        assert_eq!(ctx.codex_home, PathBuf::from("/tmp/cuc-home"));
+        assert_eq!(ctx.endpoints, Endpoints::production());
+        assert_eq!(ctx.desktop_supported, cfg!(windows));
+        assert_eq!(ctx.timeout, Duration::from_secs(15));
+
+        let legacy_running = Status {
+            mode: ProxyMode::Legacy,
+            proxy: ProxyStatus {
+                state: ProxyState::Running,
+                port: 23456,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            component_check_context(&legacy_running).network,
+            NetworkPath::ViaProxy {
+                proxy_url: "http://127.0.0.1:23456".into()
+            }
+        );
+    }
 
     #[test]
     fn autostart_error_uses_internal_code() {
