@@ -3,6 +3,7 @@
 // 下载地址只以可选中文本展示（不做链接、不自动打开浏览器——内网机器打开也没用）。
 import {
   componentCheckButton,
+  componentEmptyText,
   componentNetworkText,
   componentRowViewState,
   type ComponentId,
@@ -98,13 +99,7 @@ export function createComponentPanel(handlers: ComponentPanelHandlers): Componen
     networkText.textContent = result ? componentNetworkText(result) : "";
     networkText.hidden = result === null;
     if (!result) {
-      results.append(
-        el("p", { class: "component-empty" }, [
-          state.checking
-            ? "正在检查，最长约需十几秒…"
-            : "点击“检查组件更新”查看 ChatGPT Desktop 与 Codex CLI 的最新版本。",
-        ]),
-      );
+      results.append(el("p", { class: "component-empty" }, [componentEmptyText(state.checking)]));
       return;
     }
     for (const id of COMPONENT_ORDER) {

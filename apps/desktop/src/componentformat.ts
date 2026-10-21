@@ -124,3 +124,14 @@ export function componentNetworkText(result: ComponentUpdates): string {
 export function componentCheckButton(checking: boolean): { text: string; disabled: boolean } {
   return checking ? { text: "检查中…", disabled: true } : { text: "检查组件更新", disabled: false };
 }
+
+/**
+ * 尚无检测结果时结果区的占位文案。
+ * 检查中如实提示最坏耗时：本地探测（子进程 15s，macOS 另加登录 shell 5s）后，
+ * CLI 远端还可能顺序经历 API 与 302 回退各 15s 超时，合计约 50s。
+ */
+export function componentEmptyText(checking: boolean): string {
+  return checking
+    ? "正在检查：先探测本地版本，再请求远端；网络不佳时最长可能需要约 1 分钟…"
+    : "点击“检查组件更新”查看 ChatGPT Desktop 与 Codex CLI 的最新版本。";
+}

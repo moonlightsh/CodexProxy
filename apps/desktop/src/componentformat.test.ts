@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { componentCheckButton, componentNetworkText, componentRowViewState } from "./componentformat.ts";
+import {
+  componentCheckButton,
+  componentEmptyText,
+  componentNetworkText,
+  componentRowViewState,
+} from "./componentformat.ts";
 import type { ComponentUpdate, ComponentUpdates } from "./types";
 
 // 契约示例（组件更新检查设计 §4.1 原样）：tsc 同时校验 TS 类型与 Rust 序列化形状一致。
@@ -181,4 +186,12 @@ test("直连说明带原因", () => {
 test("检查按钮状态", () => {
   assert.deepEqual(componentCheckButton(true), { text: "检查中…", disabled: true });
   assert.deepEqual(componentCheckButton(false), { text: "检查组件更新", disabled: false });
+});
+
+test("尚无结果时的占位文案：检查中如实提示最坏耗时", () => {
+  // 最坏：本地探测 15s（macOS 另加登录 shell 5s）+ API 15s + 302 回退 15s ≈ 50s
+  const checking = componentEmptyText(true);
+  assert.match(checking, /1 分钟/);
+  assert.ok(!checking.includes("十几秒"));
+  assert.equal(componentEmptyText(false), "点击“检查组件更新”查看 ChatGPT Desktop 与 Codex CLI 的最新版本。");
 });
