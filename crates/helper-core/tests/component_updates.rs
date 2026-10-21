@@ -502,6 +502,21 @@ mod check_all {
     }
 
     #[tokio::test]
+    async fn cli_redirect_non_ascii_location_reports_unparsable() {
+        // Location 存在但不是可见 ASCII：文案应区分“无法解析”与“缺少”
+        let server = MockServer::start().await;
+        mount(&server, API_PATH, ResponseTemplate::new(403)).await;
+        let bad = "https://github.com/openai/codex/releases/tag/rust-v0.9.0\u{e9}";
+        mount(&server, LATEST_PATH, redirect_to(bad)).await;
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path(), VERSION_JSON);
+        let row = run(&server, home.path(), default_probe()).await.codex_cli;
+        let reason = cache_fallback(&row.remote);
+        assert!(reason.contains("Location 无法解析"), "{reason}");
+        assert!(!reason.contains("缺少 Location"), "{reason}");
+    }
+
+    #[tokio::test]
     async fn cli_redirect_prerelease_tag_rejected_falls_back_to_cache() {
         let server = MockServer::start().await;
         mount(&server, API_PATH, ResponseTemplate::new(403)).await;

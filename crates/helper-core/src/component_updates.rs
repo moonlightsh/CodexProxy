@@ -333,30 +333,40 @@ pub fn parse_desktop_feed(body: &[u8]) -> Result<DesktopRelease, String> {
         .into_iter()
         .find(|p| p.architecture.as_deref() == Some("x64"))
         .and_then(|p| p.download_url);
-    if let Some(url) = &download_url
-        && !is_allowed_download_url(url)
-    {
-        return Err("下载地址不在官方白名单内".to_string());
-    }
+    let download_url = match download_url {
+        Some(url) => Some(
+            normalize_download_url(&url).ok_or_else(|| "下载地址不在官方白名单内".to_string())?,
+        ),
+        None => None,
+    };
     Ok(DesktopRelease {
         version: raw.package_version,
         download_url,
     })
 }
 
-/// 下载地址白名单（C9）：https、无用户信息、主机精确匹配、无显式端口、无 query/fragment，
-/// 路径以白名单前缀开头且更长。原串含 `..`、`%2e`、`\` 一律拒绝（不依赖解析器的规范化）。
+/// 下载地址白名单（C9）：见 [`normalize_download_url`]。
 pub fn is_allowed_download_url(url: &str) -> bool {
-    if url.contains("..") || url.to_ascii_lowercase().contains("%2e") || url.contains('\\') {
-        return false;
+    normalize_download_url(url).is_some()
+}
+
+/// 下载地址白名单校验（C9），通过时返回规范化后的地址（即白名单实际校验的对象，
+/// 展示与校验一致）。
+///
+/// https、无用户信息、主机精确匹配、无显式端口、无 query/fragment，路径以白名单前缀开头且更长。
+/// 原串含非可打印 ASCII（控制符、空白、双向符、全角符号等）、`..`、`%2e`、`\` 一律拒绝
+/// （不依赖解析器的规范化：url crate 会剥掉 tab/换行、按 IDNA 映射全角句点）。
+pub fn normalize_download_url(url: &str) -> Option<String> {
+    if !url.bytes().all(|b| b.is_ascii_graphic())
+        || url.contains("..")
+        || url.to_ascii_lowercase().contains("%2e")
+        || url.contains('\\')
+    {
+        return None;
     }
-    let (Ok(parsed), Ok(prefix)) = (
-        reqwest::Url::parse(url),
-        reqwest::Url::parse(consts::CHATGPT_DOWNLOAD_URL_PREFIX),
-    ) else {
-        return false;
-    };
-    parsed.scheme() == "https"
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let prefix = reqwest::Url::parse(consts::CHATGPT_DOWNLOAD_URL_PREFIX).ok()?;
+    let allowed = parsed.scheme() == "https"
         && parsed.username().is_empty()
         && parsed.password().is_none()
         && parsed.host_str().is_some()
@@ -365,7 +375,8 @@ pub fn is_allowed_download_url(url: &str) -> bool {
         && parsed.query().is_none()
         && parsed.fragment().is_none()
         && parsed.path().starts_with(prefix.path())
-        && parsed.path().len() > prefix.path().len()
+        && parsed.path().len() > prefix.path().len();
+    allowed.then(|| parsed.as_str().to_string())
 }
 
 /// 与 aitools-download `prepare.py` 的 `rust-v[0-9]+\.[0-9]+\.[0-9]+`（fullmatch）等价的手写判定。
@@ -704,9 +715,16 @@ enum Fetch {
     /// 2xx 但响应体超过上限
     TooLarge,
     /// 非 2xx：状态码与 `Location` 头
-    Status(u16, Option<String>),
+    Status(u16, LocationHeader),
     /// 网络错误（类别文案）
     Network(&'static str),
+}
+
+/// 非 2xx 响应的 `Location` 头：区分“缺少”与“存在但不是可见 ASCII”（文案不同）。
+enum LocationHeader {
+    Missing,
+    Unparsable,
+    Value(String),
 }
 
 const TOO_LARGE_TEXT: &str = "响应体超过 256 KiB";
@@ -733,11 +751,12 @@ async fn fetch(client: &reqwest::Client, url: &str, accept: Option<&str>) -> Fet
     };
     let status = response.status();
     if !status.is_success() {
-        let location = response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
+        let location = match response.headers().get(reqwest::header::LOCATION) {
+            None => LocationHeader::Missing,
+            Some(value) => value.to_str().map_or(LocationHeader::Unparsable, |text| {
+                LocationHeader::Value(text.to_string())
+            }),
+        };
         return Fetch::Status(status.as_u16(), location);
     }
     let mut body = Vec::new();
@@ -833,10 +852,13 @@ async fn fetch_cli<P: LocalProbe>(client: &reqwest::Client, ctx: &CheckContext<P
 /// releases/latest 不跟随重定向，从 3xx 的 `Location` 末段取 tag。
 async fn fetch_redirect_tag(client: &reqwest::Client, url: &str) -> Result<String, String> {
     match fetch(client, url, None).await {
-        Fetch::Status(code, location) if (300..400).contains(&code) => {
-            let location = location.ok_or_else(|| "缺少 Location".to_string())?;
-            tag_from_location(&location).ok_or_else(|| "tag 格式不符".to_string())
-        }
+        Fetch::Status(code, location) if (300..400).contains(&code) => match location {
+            LocationHeader::Value(location) => {
+                tag_from_location(&location).ok_or_else(|| "tag 格式不符".to_string())
+            }
+            LocationHeader::Missing => Err("缺少 Location".to_string()),
+            LocationHeader::Unparsable => Err("Location 无法解析".to_string()),
+        },
         Fetch::Status(code, _) => Err(format!("HTTP {code}")),
         Fetch::Body(_) | Fetch::TooLarge => Err("未返回重定向".to_string()),
         Fetch::Network(class) => Err(class.to_string()),
@@ -1309,9 +1331,36 @@ mod tests {
             "https://persistent.oaistatic.com/codex-app-prod/x?y=1",
             "https://persistent.oaistatic.com/codex-app-prod/x#y",
             "not a url",
+            // 仅用户名（无密码）的 userinfo：单独守住 username 检查
+            "https://user@persistent.oaistatic.com/codex-app-prod/x",
+            // 规范化后仍落在前缀内的 `..`：单独守住原串 `..` 检查
+            "https://persistent.oaistatic.com/codex-app-prod/a/../b",
+            // 控制符、空白、非 ASCII（url crate 会剥掉 tab/换行、IDNA 映射全角句点，
+            // 原样展示时可伪装文件名）：原串含非可打印 ASCII 一律拒绝
+            "https://persistent.oaistatic.com/codex-app-prod/x\n",
+            "https://persistent.oaistatic.com/codex-app-prod/x\ty",
+            "https://persistent.oaistatic.com/codex-app-prod/x y",
+            "https://persistent.oaistatic.com/codex-app-prod/\u{202e}x",
+            "https://persistent\u{3002}oaistatic\u{3002}com/codex-app-prod/x",
         ] {
             assert!(!is_allowed_download_url(url), "{url}");
         }
+    }
+
+    #[test]
+    fn desktop_feed_returns_normalized_download_url() {
+        // 采信后返回规范化后的地址（与白名单实际校验的对象一致），而不是原串
+        let body = json!({
+            "schemaVersion": 1, "packageVersion": "26.1013.4894.0",
+            "packages": [{ "architecture": "x64",
+                "downloadUrl": "https://PERSISTENT.oaistatic.com:443/codex-app-prod/x.msix" }]
+        })
+        .to_string();
+        let release = parse_desktop_feed(body.as_bytes()).unwrap();
+        assert_eq!(
+            release.download_url.as_deref(),
+            Some("https://persistent.oaistatic.com/codex-app-prod/x.msix")
+        );
     }
 
     #[test]
