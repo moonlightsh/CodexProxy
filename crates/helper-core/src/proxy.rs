@@ -922,7 +922,11 @@ async fn handle_connection(mut client: TcpStream, shared: Arc<Shared>) {
         .and_then(|joined| joined.ok())
         .and_then(|decision| decision.ok());
         match checked {
-            Some(Decision::Allow { .. }) => {}
+            Some(Decision::Allow { role }) => {
+                if let Some(detail) = gate_allowed_event(&role) {
+                    crate::log::event("proxy.gate_allowed", detail);
+                }
+            }
             Some(Decision::Deny { reason }) => {
                 crate::log::event("proxy.gate_denied", json!({ "reason": reason }));
                 return respond_and_close(client, GATE_FORBIDDEN).await;
@@ -1104,6 +1108,13 @@ async fn linger_close(mut client: TcpStream) {
         }
     };
     let _ = tokio::time::timeout(LINGER_TIMEOUT, drain).await;
+}
+
+/// 门禁放行时的日志详情（组件更新检查设计 §7）：只有本进程放行记 `proxy.gate_allowed
+/// {"self": true}`（不带 pid——pid 是本进程的，日志里无意义）；其他角色放行沿用现状，
+/// 不记日志（返回 `None`）。
+fn gate_allowed_event(role: &str) -> Option<serde_json::Value> {
+    (role == crate::connection_gate::ROLE_CODEX_HELPER_SELF).then(|| json!({ "self": true }))
 }
 
 #[cfg(test)]
@@ -1754,5 +1765,18 @@ Connection: close\r\n\r\n"
         .await
         .expect_err("auth failure must fail");
         assert!(error.to_string().contains("认证失败"), "{error}");
+    }
+
+    #[test]
+    fn gate_allowed_event_only_for_self() {
+        use crate::connection_gate::ROLE_CODEX_HELPER_SELF;
+        use crate::process_policy::ROLE_CODEX_ENGINE;
+        // 本进程放行只记 self 标记，不带 pid（pid 是本进程的，日志里无意义）。
+        assert_eq!(
+            gate_allowed_event(ROLE_CODEX_HELPER_SELF),
+            Some(json!({ "self": true }))
+        );
+        // 其他角色放行沿用现状：不新增日志。
+        assert!(gate_allowed_event(ROLE_CODEX_ENGINE).is_none());
     }
 }

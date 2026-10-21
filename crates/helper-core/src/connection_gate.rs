@@ -20,6 +20,17 @@
 //! 缓存边界（设计 §6.3）：仅缓存 `decide` 的 Allow/Deny 结果；`resolve`（socket 所有者
 //! 查证）每条连接都重新做；映像摘要每次重新计算（文件被替换即得新键，立即失效），
 //! 不以 PID/路径缓存。
+//!
+//! 本进程放行（组件更新检查设计 `docs/superpowers/specs/2026-10-20-component-update-check-design.md`
+//! §7 方案 d）：解析出的对端 PID 等于 CodexHelper 自身（`std::process::id()`）时，
+//! [`ConnectionGate::admit`] 直接返回 `Allow { role: "codex-helper-self" }`，跳过映像摘要与策略
+//! 判定、不读写缓存。理由：本进程就是策略执行者，代理与上游凭据都在它手里，放行它
+//! 自己未扩大信任面。解析本身不变：仍按四元组、仍经复查预算、失败/超时/多候选
+//! 照旧 fail-closed——这条放行只在解析**成功**且 PID 命中时生效。
+//!
+//! 不变量：本进程放行对进程内**任何**经本地代理端口（默认 17891）的客户端生效，
+//! 门禁本身不校验目标。约定进程内只有组件检测把本地代理当代理使用（其 URL 全部为
+//! 编译期常量），新增进程内代理客户端须评审。
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -36,12 +47,17 @@ const RESOLVE_ATTEMPTS: usize = 2;
 /// 复查间隔：100-200ms 预算内取 150ms，两次尝试合计仍远小于 1 秒门禁超时。
 const RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(150);
 
+/// 本进程放行的角色名（组件更新检查设计 §7 方案 d）。
+pub const ROLE_CODEX_HELPER_SELF: &str = "codex-helper-self";
+
 /// 本机进程身份门禁。由 [`crate::proxy::ProxyConfig::gate`] 持有；`None` 时代理保持
 /// Legacy 行为（无门禁）。
 pub struct ConnectionGate {
     resolver: Box<dyn PeerResolver>,
     policy: Arc<ProcessPolicy>,
     cache: Mutex<PolicyCache>,
+    /// CodexHelper 自身 PID（构造时取 `std::process::id()`），见模块头「本进程放行」。
+    self_pid: i32,
 }
 
 impl ConnectionGate {
@@ -52,6 +68,7 @@ impl ConnectionGate {
             resolver,
             policy,
             cache: Mutex::new(PolicyCache::new()),
+            self_pid: std::process::id() as i32,
         }
     }
 
@@ -80,10 +97,16 @@ impl ConnectionGate {
 
     /// 对已解析出的对端身份做映像验证并给出判定。
     ///
-    /// 顺序：计算映像摘要 → 组缓存键 → 命中缓存直接返回；未命中则 `decide` 后入缓存。
+    /// 顺序：对端是本进程 → 直接以 [`ROLE_CODEX_HELPER_SELF`] 放行（不算摘要、不读写缓存）；
+    /// 否则计算映像摘要 → 组缓存键 → 命中缓存直接返回；未命中则 `decide` 后入缓存。
     /// 映像摘要计算失败（文件不存在/不可读）按 `"image"` 拒绝且不入缓存——没有摘要就
     /// 组不出缓存键，且不能替「曾经可读」的旧判定背书（fail-closed）。
     pub fn admit(&self, peer: &PeerInfo) -> Decision {
+        if peer.pid == self.self_pid {
+            return Decision::Allow {
+                role: ROLE_CODEX_HELPER_SELF.to_string(),
+            };
+        }
         let image_sha256_hex = match hash_image_file(Path::new(&peer.image_path)) {
             Ok(sha) => sha,
             Err(_) => return Decision::Deny { reason: "image" },
@@ -320,6 +343,60 @@ mod tests {
                 }
             );
         }
+    }
+
+    // ---------- 本进程放行（组件更新检查设计 §7 方案 d） ----------
+
+    #[test]
+    fn admit_allows_self_pid_without_policy_or_image() {
+        // 映像不存在、策略只批准无关摘要：放行只可能来自本进程 PID 判定。
+        let mut peer = peer_with("/nonexistent/self-image");
+        peer.pid = std::process::id() as i32;
+        let peer_for_resolver = peer.clone();
+        let (resolver, _calls) = FakeResolver::new(move |_n| Ok(peer_for_resolver.clone()));
+        let gate = ConnectionGate::new(Box::new(resolver), policy_allowing(&"ee".repeat(32)));
+        assert_eq!(
+            gate.admit(&peer),
+            Decision::Allow {
+                role: ROLE_CODEX_HELPER_SELF.to_string()
+            }
+        );
+        // 本进程放行不读写策略缓存（模块约定）：admit 之后缓存仍为空。
+        assert_eq!(gate.cache.lock().expect("门禁缓存锁中毒").len(), 0);
+    }
+
+    #[test]
+    fn admit_other_pid_still_uses_policy() {
+        let (_dir, image_path, sha) = temp_image(b"codex-engine-image");
+        let peer = peer_with(&image_path);
+        assert_ne!(peer.pid, std::process::id() as i32);
+        // 未批准映像：照旧 Deny。
+        let peer_for_resolver = peer.clone();
+        let (resolver, _calls) = FakeResolver::new(move |_n| Ok(peer_for_resolver.clone()));
+        let gate = ConnectionGate::new(Box::new(resolver), policy_allowing(&"ff".repeat(32)));
+        assert_eq!(gate.admit(&peer), Decision::Deny { reason: "image" });
+        // 批准映像：照旧按策略角色放行，不会被改写成本进程角色。
+        let peer_for_resolver = peer.clone();
+        let (resolver, _calls) = FakeResolver::new(move |_n| Ok(peer_for_resolver.clone()));
+        let gate = ConnectionGate::new(Box::new(resolver), policy_allowing(&sha));
+        assert_eq!(
+            gate.admit(&peer),
+            Decision::Allow {
+                role: ROLE_CODEX_ENGINE.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_failure_still_fails_closed() {
+        let (resolver, calls) = FakeResolver::new(|_n| anyhow::bail!("未找到连接所有者进程"));
+        let gate = ConnectionGate::new(Box::new(resolver), policy_allowing(&"ee".repeat(32)));
+        assert!(
+            gate.resolve_with_retry(endpoint(17891), endpoint(50000))
+                .is_err(),
+            "解析失败必须拒绝，本进程放行不得介入解析失败路径"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

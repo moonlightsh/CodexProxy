@@ -10,6 +10,7 @@ import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 
 import type {
+  ComponentUpdates,
   ConnectionRecord,
   DevEnvReport,
   EnableRequest,
@@ -65,6 +66,7 @@ function baseStatus(): Status {
  * `?scenario=configError`、`?scenario=dev`、`?scenario=catalog`、`?scenario=running`（默认）、
  * `?scenario=macos`（macOS：显示升级区与卸载前提示）、`?scenario=transient`（macOS 从临时位置运行，
  * 禁用安装按钮并提示）、`?scenario=other`（不支持的平台：隐藏升级区）。
+ * 组件版本区另用 `?components=`（latest / cliUpdate / cacheFallback / blocked）选择检测结果，见 componentUpdates()。
  * Key 录入区里输入 `bad` 模拟 keyRejected，输入 `slow` 模拟 gatewayUnavailable。
  */
 function applyScenario(status: Status, scenario: string): Status {
@@ -182,6 +184,81 @@ function devEnvReport(kind: string): DevEnvReport {
   }
 }
 
+/**
+ * 组件版本区预览：`?components=` 选择检测结果，可与 `?scenario=` 组合。
+ * 取值：latest（默认：两组件已是最新、经代理）、cliUpdate（CLI 有更新）、
+ * cacheFallback（设计 §4.1 契约示例：CLI 本地缓存兜底 + 直连原因）、
+ * blocked（Secure 代理未就绪：零出站，本地照常）。
+ * macOS 场景下 ChatGPT 行改为暂不支持（与 Rust 侧一致）。
+ */
+function componentUpdates(kind: string, status: Status): ComponentUpdates {
+  const cliRelease = "https://github.com/openai/codex/releases/tag/rust-v0.163.0";
+  const result: ComponentUpdates = {
+    chatgptDesktop: {
+      local: { kind: "installed", version: "26.1013.4894.0" },
+      remote: { kind: "ok", version: "26.1013.4894.0", source: { kind: "desktopReleaseFeed" } },
+      comparison: "upToDate",
+      downloadUrl: null,
+      viaProxy: true,
+      directReason: null,
+    },
+    codexCli: {
+      local: { kind: "installed", version: "0.163.0" },
+      remote: { kind: "ok", version: "0.163.0", source: { kind: "githubApi" } },
+      comparison: "upToDate",
+      downloadUrl: null,
+      viaProxy: true,
+      directReason: null,
+    },
+  };
+  switch (kind) {
+    case "cliUpdate":
+      result.codexCli = {
+        ...result.codexCli,
+        local: { kind: "installed", version: "0.162.1" },
+        comparison: "updateAvailable",
+        downloadUrl: cliRelease,
+      };
+      break;
+    case "cacheFallback":
+      result.chatgptDesktop = { ...result.chatgptDesktop, viaProxy: false, directReason: "代理为外部实例，模式未知，已直连" };
+      result.codexCli = {
+        local: { kind: "installed", version: "0.162.1" },
+        remote: {
+          kind: "ok",
+          version: "0.163.0",
+          source: { kind: "codexLocalCache", checkedAt: "2026-10-16T05:53:49Z" },
+          fallbackFrom: "github api 403 限流",
+        },
+        comparison: "updateAvailable",
+        downloadUrl: cliRelease,
+        viaProxy: false,
+        directReason: "代理为外部实例，模式未知，已直连",
+      };
+      break;
+    case "blocked":
+      for (const row of [result.chatgptDesktop, result.codexCli]) {
+        row.remote = { kind: "blocked", detail: "Secure 代理未就绪（代理未运行）" };
+        row.comparison = "unknown";
+        row.viaProxy = false;
+      }
+      break;
+    default:
+      break;
+  }
+  if (status.platform === "macos") {
+    result.chatgptDesktop = {
+      local: { kind: "unsupportedPlatform" },
+      remote: { kind: "unsupportedPlatform" },
+      comparison: "unknown",
+      downloadUrl: null,
+      viaProxy: false,
+      directReason: null,
+    };
+  }
+  return result;
+}
+
 function sampleConnections(): ConnectionRecord[] {
   return [
     { time: Date.now() - 4000, host: "chatgpt.com", port: 443, decision: "socks5", ok: true, ms: 120 },
@@ -194,6 +271,7 @@ export function installDevMock(): void {
   const params = new URLSearchParams(window.location.search);
   const scenario = params.get("scenario") ?? "running";
   const devEnvKind = params.get("devenv") ?? "ok";
+  const componentsKind = params.get("components") ?? "latest";
 
   let status = applyScenario(baseStatus(), scenario);
   let connections = sampleConnections();
@@ -345,6 +423,12 @@ export function installDevMock(): void {
 
         case "recent_connections":
           return connections;
+
+        case "check_component_updates":
+          // 模拟检测耗时，便于预览“检查中…”状态。
+          return new Promise<ComponentUpdates>((resolve) => {
+            window.setTimeout(() => resolve(componentUpdates(componentsKind, status)), 800);
+          });
 
         case "get_reconcile_report":
           return reconcileReport;

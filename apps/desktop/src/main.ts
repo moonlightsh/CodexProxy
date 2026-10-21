@@ -7,6 +7,7 @@ import { listen } from "@tauri-apps/api/event";
 import { api, toErrorPayload } from "./api";
 import { createBannerRegion } from "./banners";
 import { catalogConfirmMessageForPath, confirmCatalogRemoval } from "./catalogconfirm";
+import { createComponentPanel } from "./componentpanel";
 import { withNewConnection, truncateConnections } from "./connections";
 import { createConnectionsListRegion } from "./connectionslist";
 import { createDevEnvPanel } from "./devenvpanel";
@@ -22,6 +23,7 @@ import { createSwitchRegion } from "./switchcontrol";
 import { createTabs } from "./tabs";
 import { createUpdatePanel } from "./updatepanel";
 import type {
+  ComponentUpdates,
   ConnectionRecord,
   DevEnvReport,
   ErrorPayload,
@@ -48,7 +50,8 @@ type OpKind =
   | "setAutostart"
   | "checkUpdate"
   | "installUpdate"
-  | "detectDevEnv";
+  | "detectDevEnv"
+  | "checkComponentUpdates";
 
 async function main(): Promise<void> {
   // 开发预览：仅在 DEV 构建且不存在 Tauri 运行时注入时加载；`import.meta.env.DEV`
@@ -69,6 +72,9 @@ async function main(): Promise<void> {
   // 开发环境页（设计 §16）：最近一次检测结果与完成时间。
   let devEnvReport: DevEnvReport | null = null;
   let devEnvCheckedAt: number | null = null;
+  // 组件更新检查（ChatGPT Desktop / Codex CLI）：最近一次检测结果与完成时间；仅手动触发（设计 C10）。
+  let componentUpdates: ComponentUpdates | null = null;
+  let componentCheckedAt: number | null = null;
   const busy = new Set<OpKind>();
 
   const messageRegion = createMessageRegion();
@@ -129,6 +135,12 @@ async function main(): Promise<void> {
     },
   });
 
+  const componentPanel = createComponentPanel({
+    onCheck: () => {
+      void runCheckComponentUpdates();
+    },
+  });
+
   const title = el("h1", { class: "app-title" }, ["CodexHelper"]);
   const loading = el("p", { class: "app-loading" }, ["加载中…"]);
   const connectionsTitle = el("h2", { class: "section-title" }, ["最近连接（最多 50 条）"]);
@@ -176,6 +188,8 @@ async function main(): Promise<void> {
     gatewayPage,
     devEnvPage,
     updatePanel.root,
+    // 组件版本区始终显示（不随升级区）：平台差异由 Rust 返回的 unsupportedPlatform 表达。
+    componentPanel.root,
     platformHint,
   );
 
@@ -197,6 +211,11 @@ async function main(): Promise<void> {
       installing: busy.has("installUpdate"),
       available: updateAvailable,
       installLocationOk: status?.installLocationOk ?? true,
+    });
+    componentPanel.update({
+      checking: busy.has("checkComponentUpdates"),
+      result: componentUpdates,
+      checkedAt: componentCheckedAt,
     });
   }
 
@@ -233,6 +252,22 @@ async function main(): Promise<void> {
       messageRegion.show(toErrorPayload(error).message, "error");
     } finally {
       busy.delete("detectDevEnv");
+      render();
+    }
+  }
+
+  /** 组件更新检查：只检测、不下载；invoke 本身出错时在消息区提示，保留上一次的结果。 */
+  async function runCheckComponentUpdates(): Promise<void> {
+    if (busy.has("checkComponentUpdates")) return;
+    busy.add("checkComponentUpdates");
+    render();
+    try {
+      componentUpdates = await api.checkComponentUpdates();
+      componentCheckedAt = Date.now();
+    } catch (error) {
+      messageRegion.show(toErrorPayload(error).message, "error");
+    } finally {
+      busy.delete("checkComponentUpdates");
       render();
     }
   }

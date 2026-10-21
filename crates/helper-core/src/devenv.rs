@@ -465,7 +465,7 @@ impl SearchEnv {
         }
     }
 
-    fn find(&self, name: &str) -> Option<PathBuf> {
+    pub(crate) fn find(&self, name: &str) -> Option<PathBuf> {
         find_in_path(name, &self.path, &self.exts)
     }
 }
@@ -525,7 +525,7 @@ fn merge_search_path(login: Option<&OsString>, process: &OsStr, extras: &[&str])
 
 /// 取登录 shell：`SHELL` 是存在的绝对路径就用它，否则用 `/bin/zsh`。
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn pick_login_shell(shell: Option<&OsStr>) -> PathBuf {
+pub(crate) fn pick_login_shell(shell: Option<&OsStr>) -> PathBuf {
     shell
         .map(Path::new)
         .filter(|path| path.is_absolute() && path.is_file())
@@ -578,24 +578,24 @@ pub async fn with_login_shell_path(
     SearchEnv::new(path, process.exts)
 }
 
-struct CommandOutput {
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
+pub(crate) struct CommandOutput {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 impl CommandOutput {
-    fn success(&self) -> bool {
+    pub(crate) fn success(&self) -> bool {
         self.code == Some(0)
     }
 }
 
-fn exit_text(code: Option<i32>) -> String {
+pub(crate) fn exit_text(code: Option<i32>) -> String {
     code.map_or_else(|| "被终止".to_string(), |code| format!("退出码 {code}"))
 }
 
 /// 运行一个检测命令：参数全部是常量；stdin 为空、工作目录为系统临时目录、超时即结束进程。
-async fn run(
+pub(crate) async fn run(
     program: &Path,
     args: &[&str],
     env: &SearchEnv,

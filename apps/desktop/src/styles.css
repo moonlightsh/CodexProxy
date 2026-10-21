@@ -645,6 +645,121 @@ input[type="text"]:focus,
   font-size: 12px;
 }
 
+/* ---- 组件版本区 ---- */
+
+.component-region {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+.component-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.component-header .section-title {
+  margin: 0 auto 0 0;
+}
+
+.component-checked {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.component-network {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.component-results {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.component-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.component-row-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.component-label {
+  font-weight: 600;
+}
+
+.component-versions {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-right: auto;
+  overflow-wrap: anywhere;
+}
+
+.component-badge {
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.component-badge-ok {
+  background: var(--ok-bg);
+  color: var(--ok-fg);
+}
+
+.component-badge-warn {
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+}
+
+.component-badge-bad {
+  background: var(--bad-bg);
+  color: var(--bad-fg);
+}
+
+.component-note,
+.component-download-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.component-download {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.component-url {
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: all;
+}
+
+.component-empty {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 /* ---- 模态框 ---- */
 
 .modal-overlay {

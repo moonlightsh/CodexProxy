@@ -137,6 +137,58 @@ export interface DevEnvReport {
   npmMirror: MirrorReport;
 }
 
+// ---- 组件更新检查（与 crates/helper-core/src/component_updates.rs 一一对应） ----
+// 枚举统一内部标签 `kind` + camelCase 字段；Comparison 为纯字符串。
+
+/** 单组件的本地探测结果。 */
+export type LocalState =
+  | { kind: "installed"; version: string }
+  /** 仅 CLI：PATH 无 codex */
+  | { kind: "notInstalled" }
+  /** 仅 ChatGPT：Get-AppxPackage 空输出（无法区分未安装与当前用户未注册） */
+  | { kind: "notRegisteredForUser" }
+  | { kind: "probeFailed"; detail: string }
+  /** 非 Windows 的 ChatGPT 行 */
+  | { kind: "unsupportedPlatform" };
+
+/** 远端版本来源（展示用）。 */
+export type RemoteSource =
+  | { kind: "desktopReleaseFeed" }
+  | { kind: "githubApi" }
+  | { kind: "githubRedirect" }
+  /** $CODEX_HOME/version.json 本地缓存兜底 */
+  | { kind: "codexLocalCache"; checkedAt: string };
+
+/** 远端最新版本结果。 */
+export type RemoteState =
+  /** fallbackFrom 仅在本地缓存兜底时出现，记录远端失败的简要原因 */
+  | { kind: "ok"; version: string; source: RemoteSource; fallbackFrom?: string }
+  | { kind: "unreachable"; detail: string }
+  /** 清单/响应格式无效，或下载地址不在官方白名单内 */
+  | { kind: "invalid"; detail: string }
+  /** Secure 代理未就绪：本次未发出任何远端请求 */
+  | { kind: "blocked"; detail: string }
+  | { kind: "unsupportedPlatform" };
+
+export type Comparison = "updateAvailable" | "upToDate" | "localNewer" | "unknown";
+
+export interface ComponentUpdate {
+  local: LocalState;
+  remote: RemoteState;
+  comparison: Comparison;
+  /** 有更新时的下载入口：ChatGPT 为带版本号的安装包地址，CLI 为 release 页面 */
+  downloadUrl: string | null;
+  /** 本次检测是否经本地代理出网 */
+  viaProxy: boolean;
+  /** 直连原因文案 */
+  directReason: string | null;
+}
+
+export interface ComponentUpdates {
+  chatgptDesktop: ComponentUpdate;
+  codexCli: ComponentUpdate;
+}
+
 /** Rust → 前端事件名 */
 export const EVENT_STATUS_CHANGED = "status-changed";
 export const EVENT_CONNECTION_RECORDED = "connection-recorded";
