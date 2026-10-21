@@ -1615,4 +1615,184 @@ mod tests {
         assert!(build_client(&via, timeout).is_some());
         assert!(build_client(&NetworkPath::Direct { reason: None }, timeout).is_some());
     }
+
+    /// 跨端契约夹具：`apps/desktop/src/componentcontract.test.ts` 中 BEGIN/END 标记之间的严格 JSON。
+    /// 该夹具在 TS 侧以 `ComponentUpdates[]` 类型声明（tsc 校验与 types.ts 一致），
+    /// 这里校验 Rust 序列化结果与之逐项相等——两端形状经同一份夹具闭环。
+    const CONTRACT_SOURCE: &str =
+        include_str!("../../../apps/desktop/src/componentcontract.test.ts");
+
+    fn contract_fixture() -> serde_json::Value {
+        let begin = "/* CONTRACT-JSON-BEGIN */";
+        let end = "/* CONTRACT-JSON-END */";
+        let start = CONTRACT_SOURCE.find(begin).expect("缺少 BEGIN 标记") + begin.len();
+        let stop = CONTRACT_SOURCE.find(end).expect("缺少 END 标记");
+        serde_json::from_str(&CONTRACT_SOURCE[start..stop]).expect("夹具须为严格 JSON")
+    }
+
+    fn row(
+        local: LocalState,
+        remote: RemoteState,
+        comparison: Comparison,
+        download_url: Option<&str>,
+        via_proxy: bool,
+        direct_reason: Option<&'static str>,
+    ) -> ComponentUpdate {
+        ComponentUpdate {
+            local,
+            remote,
+            comparison,
+            download_url: download_url.map(str::to_string),
+            via_proxy,
+            direct_reason,
+        }
+    }
+
+    /// 覆盖全部 LocalState / RemoteState / RemoteSource 变体、fallbackFrom 有无、四种 Comparison。
+    fn contract_cases() -> Vec<ComponentUpdates> {
+        let msix = "https://persistent.oaistatic.com/codex-app-prod/releases/26.1013.4894.0/ChatGPT-x64.msix";
+        let release = "https://github.com/openai/codex/releases/tag/rust-v0.163.0";
+        let blocked = RemoteState::Blocked {
+            detail: "Secure 代理未就绪（代理未运行）".into(),
+        };
+        vec![
+            // 1. 经代理：ChatGPT 有更新（清单下载地址）、CLI 本地缓存兜底有更新
+            ComponentUpdates {
+                chatgpt_desktop: row(
+                    installed("26.1012.1.0"),
+                    remote_ok("26.1013.4894.0", RemoteSource::DesktopReleaseFeed),
+                    Comparison::UpdateAvailable,
+                    Some(msix),
+                    true,
+                    None,
+                ),
+                codex_cli: row(
+                    installed("0.162.1"),
+                    RemoteState::Ok {
+                        version: "0.163.0".into(),
+                        source: RemoteSource::CodexLocalCache {
+                            checked_at: "2026-10-16T05:53:49Z".into(),
+                        },
+                        fallback_from: Some("github api 403 限流；302 回退失败：超时".into()),
+                    },
+                    Comparison::UpdateAvailable,
+                    Some(release),
+                    true,
+                    None,
+                ),
+            },
+            // 2. 直连（Legacy 停止）：ChatGPT 未注册、CLI 未安装（302 回退取到版本）
+            ComponentUpdates {
+                chatgpt_desktop: row(
+                    LocalState::NotRegisteredForUser,
+                    remote_ok("26.1013.4894.0", RemoteSource::DesktopReleaseFeed),
+                    Comparison::Unknown,
+                    None,
+                    false,
+                    Some("本地代理未运行，已直连"),
+                ),
+                codex_cli: row(
+                    LocalState::NotInstalled,
+                    remote_ok("0.163.0", RemoteSource::GithubRedirect),
+                    Comparison::Unknown,
+                    None,
+                    false,
+                    Some("本地代理未运行，已直连"),
+                ),
+            },
+            // 3. 经代理：ChatGPT 探测失败 + 清单无效、CLI 本地较新（GitHub API）
+            ComponentUpdates {
+                chatgpt_desktop: row(
+                    LocalState::ProbeFailed {
+                        detail: "超过 15 秒未完成".into(),
+                    },
+                    RemoteState::Invalid {
+                        detail: "清单格式无效：下载地址不在官方白名单内".into(),
+                    },
+                    Comparison::Unknown,
+                    None,
+                    true,
+                    None,
+                ),
+                codex_cli: row(
+                    installed("0.164.0"),
+                    remote_ok("0.163.0", RemoteSource::GithubApi),
+                    Comparison::LocalNewer,
+                    None,
+                    true,
+                    None,
+                ),
+            },
+            // 4. Secure 未就绪：两组件零出站
+            ComponentUpdates {
+                chatgpt_desktop: row(
+                    installed("26.1013.4894.0"),
+                    blocked.clone(),
+                    Comparison::Unknown,
+                    None,
+                    false,
+                    None,
+                ),
+                codex_cli: row(
+                    installed("0.162.1"),
+                    blocked,
+                    Comparison::Unknown,
+                    None,
+                    false,
+                    None,
+                ),
+            },
+            // 5. macOS：ChatGPT 暂不支持；CLI 已是最新 / 远端不可达分别见本例与下例
+            ComponentUpdates {
+                chatgpt_desktop: row(
+                    LocalState::UnsupportedPlatform,
+                    RemoteState::UnsupportedPlatform,
+                    Comparison::Unknown,
+                    None,
+                    false,
+                    None,
+                ),
+                codex_cli: row(
+                    installed("0.163.0"),
+                    remote_ok("0.163.0", RemoteSource::GithubApi),
+                    Comparison::UpToDate,
+                    None,
+                    true,
+                    None,
+                ),
+            },
+            // 6. 外部实例直连：ChatGPT 已是最新、CLI 远端不可达且无缓存
+            ComponentUpdates {
+                chatgpt_desktop: row(
+                    installed("26.1013.4894.0"),
+                    remote_ok("26.1013.4894.0", RemoteSource::DesktopReleaseFeed),
+                    Comparison::UpToDate,
+                    None,
+                    false,
+                    Some("代理为外部实例，模式未知，已直连"),
+                ),
+                codex_cli: row(
+                    installed("0.0.0"),
+                    RemoteState::Unreachable {
+                        detail: "github api 连接失败".into(),
+                    },
+                    Comparison::Unknown,
+                    None,
+                    false,
+                    Some("代理为外部实例，模式未知，已直连"),
+                ),
+            },
+        ]
+    }
+
+    #[test]
+    fn serialization_matches_frontend_contract_fixture() {
+        let fixture = contract_fixture();
+        let cases = fixture.as_array().expect("夹具须为数组");
+        let expected = contract_cases();
+        assert_eq!(cases.len(), expected.len(), "夹具条目数不一致");
+        for (index, (case, value)) in cases.iter().zip(&expected).enumerate() {
+            assert_eq!(&to(value), case, "第 {} 条契约不一致", index + 1);
+        }
+    }
 }
