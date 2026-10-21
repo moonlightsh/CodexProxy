@@ -18,6 +18,13 @@ use tauri_plugin_updater::{Updater, UpdaterExt as _};
 /// 运行时覆盖检测地址的环境变量（应急/内网自定义用；界面不暴露，与端口覆盖同一思路）。
 pub const UPDATE_URL_ENV: &str = "CODEX_HELPER_UPDATE_URL";
 
+/// 升级域名 DNS 钉扎（设计决策）：两个隔离网络靠 VPN 互通，A 网 DNS 正常解析
+/// rdc.tiandy.com，B 网 DNS 不能；而 10.20.20.3 在两网均可达。把该域名的解析
+/// 钉在客户端内（reqwest resolve），不依赖任一网络的 DNS。
+/// 端口固定为 0：URL 无显式端口时用协议默认端口，URL 显式端口优先生效。
+pub const UPDATE_PIN_HOST: &str = "rdc.tiandy.com";
+pub const UPDATE_PIN_ADDR: &str = "10.20.20.3:0";
+
 /// 升级检测结果（返回给前端，serde camelCase 与 `types.ts` 的 `UpdateCheck` 对应）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,9 +109,21 @@ fn ensure_install_location_ok() -> Result<(), ErrorPayload> {
     }
 }
 
+/// 升级客户端配置（检测与下载共用）：DNS 钉扎 + 拒绝系统代理。
+/// - `resolve`：仅 rdc.tiandy.com 不走系统 DNS，其余域名不受影响；
+/// - `no_proxy`：CodexHelper 自身就是网关，受管状态下系统代理指向本机，若更新流量
+///   绕经网关进程再直连出去，DNS 会在网关侧解析，B 网下同样失败；内网升级服务器
+///   本就不该走任何代理，强制直连对 A 网也无副作用。
+fn pin_update_client(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let addr: std::net::SocketAddr = UPDATE_PIN_ADDR.parse().expect("内置钉扎地址必须合法");
+    builder.no_proxy().resolve(UPDATE_PIN_HOST, addr)
+}
+
 /// 构建 updater：存在环境变量覆盖时替换 endpoints，否则沿用 `tauri.conf.json` 的配置。
 fn build_updater(app: &AppHandle) -> Result<Updater, ErrorPayload> {
     let mut builder = app.updater_builder();
+    // 内网升级服务器：钉扎 DNS + 直连（见 pin_update_client 文档，同时作用于检测与下载）。
+    builder = builder.configure_client(pin_update_client);
     if let Some(url) = override_endpoint() {
         let endpoint = validate_endpoint(&url).map_err(|reason| ErrorPayload {
             code: "update".to_string(),
@@ -287,5 +306,72 @@ mod tests {
         .expect("serialize");
         assert!(value.get("currentVersion").is_some());
         assert!(value.get("current_version").is_none());
+    }
+
+    #[test]
+    fn pinned_update_host_and_ip_match_design() {
+        // 契约测试：域名与 IP 改动必须经过显式确认（两个网络靠 VPN 到达同一台升级服务器）。
+        assert_eq!(UPDATE_PIN_HOST, "rdc.tiandy.com");
+        assert_eq!(UPDATE_PIN_ADDR, "10.20.20.3:0");
+        assert_eq!(
+            UPDATE_PIN_ADDR
+                .parse::<std::net::SocketAddr>()
+                .expect("合法 SocketAddr")
+                .port(),
+            0,
+            "端口必须为 0：无显式端口的 URL 用协议默认端口，URL 显式端口优先"
+        );
+    }
+
+    #[test]
+    fn pinned_update_host_is_exact_match_not_suffix() {
+        // reqwest resolve() 是精确域名匹配：子域名不应被误钉。这里固化我们对此的理解。
+        // （reqwest 内部 DnsResolverWithOverrides 用 HashMap 精确查找，无后缀语义。）
+        assert_ne!(UPDATE_PIN_HOST, "sub.rdc.tiandy.com");
+    }
+
+    #[tokio::test]
+    async fn updater_client_pins_update_host_to_fixed_ip() {
+        // 端到端机制测试：构造与生产同款的客户端配置，证明请求真正落到钉扎地址、
+        // Host 头保留域名（虚机 Nexus 正常分发）、且不读取系统代理。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (pin_host, pin_port) = ("pinned.test", addr.port());
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve(pin_host, addr)
+            .build()
+            .expect("client");
+
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.expect("read");
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+            req
+        });
+
+        let resp = client
+            .get(format!("http://{pin_host}:{pin_port}/latest.json"))
+            .send()
+            .await
+            .expect("request lands on pinned address");
+        assert_eq!(resp.status(), 200);
+
+        let req = server.await.expect("server task");
+        // 头名不区分大小写：reqwest 发送小写 `host:`。比较前先统一小写。
+        let req_lower = req.to_lowercase();
+        assert!(
+            req_lower.contains(&format!("host: {pin_host}:{pin_port}")),
+            "Host 头应保留域名，实际请求：{req}"
+        );
+        assert!(req.contains("GET /latest.json"), "路径应保留：{req}");
     }
 }

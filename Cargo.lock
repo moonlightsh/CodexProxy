@@ -599,6 +599,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "helper-core",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "tauri",
