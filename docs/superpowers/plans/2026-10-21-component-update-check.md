@@ -194,28 +194,28 @@ export interface ComponentUpdates { chatgptDesktop: ComponentUpdate; codexCli: C
   - `COMPONENT_CHECK_TIMEOUT_SECS: u64 = 15`、`COMPONENT_CHECK_MAX_BODY_BYTES: usize = 256 * 1024`
 - `component_updates.rs` 模块头注释（交付物，原文要点必须出现）：设计文档路径；“门禁的本进程放行对进程内**任何**经本地代理端口（默认 17891）的客户端生效，门禁本身不校验目标；约定进程内只有组件检测把本地代理当代理使用，新增进程内代理客户端须评审”；检测 URL 全部来自 `consts` 编译期常量；检测全程无凭据。
 
-- [ ] **Step 1: 写失败测试**（`component_updates.rs` 内 `#[cfg(test)] mod tests`）
+- [x] **Step 1: 写失败测试**（`component_updates.rs` 内 `#[cfg(test)] mod tests`）
 
 `https_scheme_sends_tls_client_hello`（`#[tokio::test]`）：本地 `tokio::net::TcpListener::bind("127.0.0.1:0")`，spawn 任务 accept 后读首 3 字节；用 `reqwest::Client::builder().no_proxy().timeout(2s).build()` GET `https://127.0.0.1:<port>/`（结果忽略）；accept 与读取整体套 `tokio::time::timeout(3s)`，超时即断言失败；断言读到的首字节 `== 0x16`、第二字节 `== 0x03`（TLS 握手记录）。
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 Run: `cargo test -p helper-core --lib component_updates::tests::https_scheme_sends_tls_client_hello`
 Expected: FAIL（未启用 TLS 时 reqwest 不建连，accept 侧读不到字节或超时）
 
-- [ ] **Step 3: 改 workspace reqwest feature、devenv 可见性、consts 常量、模块头注释**
+- [x] **Step 3: 改 workspace reqwest feature、devenv 可见性、consts 常量、模块头注释**
 
-- [ ] **Step 4: 跑绿 + 依赖复核**
+- [x] **Step 4: 跑绿 + 依赖复核**
 
 Run: `cargo test -p helper-core --lib component_updates && cargo tree -p helper-core -i native-tls`
 Expected: PASS；`cargo tree` 输出中 `native-tls` 被 `reqwest v0.12.28` 引用。`git diff Cargo.lock` 只出现 reqwest 0.12.28 依赖列表新增 `hyper-tls`/`native-tls`/`tokio-native-tls` 等既有包；若出现新的 `[[package]]` 条目，停下报告（可能违反“不新增依赖”）。
 
-- [ ] **Step 5: 回归 devenv + clippy**
+- [x] **Step 5: 回归 devenv + clippy**
 
 Run: `cargo test -p helper-core --test devenv && cargo clippy -p helper-core --all-targets -- -D warnings`
 Expected: PASS（这几项在 devenv 内已有调用点，提升可见性不会引入 dead_code；不得新增任何 `allow`）
 
-- [ ] **Step 6: Commit**（`feat(core): reqwest 启用 native-tls，devenv 探测能力开放给组件检测`）
+- [x] **Step 6: Commit**（`feat(core): reqwest 启用 native-tls，devenv 探测能力开放给组件检测`）
 
 ### Task C2: 数据结构、序列化与纯函数（解析 / 比较 / 白名单）
 
@@ -240,7 +240,7 @@ Expected: PASS（这几项在 devenv 内已有调用点，提升可见性不会�
   - `fn parse_cli_version(output: &str) -> Option<String>`：找到 `codex-cli ` 之后第一个空白分隔词，须 `compare_semver(v, v).is_some()`
   - `struct VersionCache { pub latest_version: String, pub checked_at: String }` 与 `fn parse_version_cache(body: &[u8]) -> Option<VersionCache>`：读 `latest_version` / `last_checked_at`；`latest_version` 须 semver 合法；`checked_at` 去掉小数秒（`2026-10-16T05:53:49.254443Z` → `2026-10-16T05:53:49Z`）；任何失败 → `None`
 
-- [ ] **Step 1: 写失败测试**（同文件 tests 模块，下列每个一个 `#[test]`）
+- [x] **Step 1: 写失败测试**（同文件 tests 模块，下列每个一个 `#[test]`）
 
 - `serializes_design_example_exactly`：按契约构造 §4.1 示例两组件值，`serde_json::to_value` 后 `assert_eq!` 契约 JSON（`serde_json::json!` 字面量），并断言 `chatgptDesktop.remote` 无 `fallbackFrom` 键
 - `unit_variants_serialize_as_kind_objects`：`NotInstalled`→`{"kind":"notInstalled"}`、`NotRegisteredForUser`→`{"kind":"notRegisteredForUser"}`、`LocalState::UnsupportedPlatform` 与 `RemoteState::UnsupportedPlatform`→`{"kind":"unsupportedPlatform"}`、`ProbeFailed{detail:"x"}`→`{"kind":"probeFailed","detail":"x"}`、`Blocked{detail:"y"}`→`{"kind":"blocked","detail":"y"}`、`RemoteSource::GithubRedirect`→`{"kind":"githubRedirect"}`、`Comparison::LocalNewer`→`"localNewer"`
@@ -263,19 +263,19 @@ Expected: PASS（这几项在 devenv 内已有调用点，提升可见性不会�
 - `cli_version_parses_codex_cli_line`：`"codex-cli 0.162.1\n"` → `Some("0.162.1")`；`"codex-cli 0.164.0-alpha.2"` → `Some("0.164.0-alpha.2")`；`"codex-cli 0.0.0"` → `Some("0.0.0")`；`"0.162.1"`、`"codex-cli"`、`"codex-cli x.y"` → `None`
 - `version_cache_parses_real_file_and_ignores_garbage`：§4.3 实测内容 → `latest_version == "0.163.0"`、`checked_at == "2026-10-16T05:53:49Z"`；无小数秒的 `"2026-10-16T05:53:49Z"` 原样；缺 `latest_version` / `latest_version: "abc"` / 非 JSON → `None`
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 Run: `cargo test -p helper-core --lib component_updates`
 Expected: 编译失败（类型/函数未定义）——按“先声明类型与 `todo!()` 签名再跑”的方式让其编译通过后 FAIL（panic `not yet implemented`）
 
-- [ ] **Step 3: 实现上述类型与函数**（不引入 regex/semver crate）
+- [x] **Step 3: 实现上述类型与函数**（不引入 regex/semver crate）
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 Run: `cargo test -p helper-core --lib component_updates && cargo clippy -p helper-core --all-targets -- -D warnings`
 Expected: PASS
 
-- [ ] **Step 5: Commit**（`feat(core): 组件更新检查的数据结构、解析与版本比较纯函数`）
+- [x] **Step 5: Commit**（`feat(core): 组件更新检查的数据结构、解析与版本比较纯函数`）
 
 ### Task C3: 网络路径决策纯函数 + client 构建
 
@@ -310,7 +310,7 @@ Expected: PASS
 
   `build_client`：共同 `.use_native_tls().timeout(timeout).redirect(Policy::none()).user_agent(concat!("codex-helper/", env!("CARGO_PKG_VERSION")))`；`ViaProxy` 加 `.proxy(Proxy::all(proxy_url)?)`（不调用 `no_proxy()`——`.proxy()` 显式设置后不读环境变量）；`Direct` 加 `.no_proxy()`。构建失败返回 `None`（调用方按 `Unreachable{"无法创建 HTTP 客户端"}` 处理）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 - `secure_running_goes_via_proxy`：`Status { mode: Secure, proxy: { state: Running, port: 17891 }, ..Default }` → `ViaProxy { "http://127.0.0.1:17891" }`；端口取 `status.proxy.port`（再用 port 23456 断言跟随）
 - `secure_not_running_is_blocked`：Secure + Stopped → `Blocked{"Secure 代理未就绪（代理未运行）"}`；`secure.active = true` 但 state Stopped 仍 Blocked（证明不看 active）
@@ -319,13 +319,13 @@ Expected: PASS
 - `legacy_with_stale_secure_active_still_follows_mode`：Legacy + `secure.active = true` + Stopped → Direct（mode 优先）
 - `blocked_builds_no_client`：`build_client(&Blocked{..}, 15s).is_none()`；`ViaProxy`/`Direct` → `Some`
 
-- [ ] **Step 2: 跑红** — Run: `cargo test -p helper-core --lib component_updates::tests` Expected: FAIL（未定义 / todo!）
+- [x] **Step 2: 跑红** — Run: `cargo test -p helper-core --lib component_updates::tests` Expected: FAIL（未定义 / todo!）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
-- [ ] **Step 4: 跑绿** — Run: 同上 + `cargo clippy -p helper-core --all-targets -- -D warnings` Expected: PASS
+- [x] **Step 4: 跑绿** — Run: 同上 + `cargo clippy -p helper-core --all-targets -- -D warnings` Expected: PASS
 
-- [ ] **Step 5: Commit**（`feat(core): 组件检测按 Manager 状态决定经代理/直连/零出站`）
+- [x] **Step 5: Commit**（`feat(core): 组件检测按 Manager 状态决定经代理/直连/零出站`）
 
 ### Task C4: 本地版本探测（Codex CLI / ChatGPT Desktop）
 
@@ -349,7 +349,7 @@ Expected: PASS
   - `probe_chatgpt_desktop`（`cfg(windows)`）：程序用绝对路径 `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`（`SystemRoot` 缺失时用 `C:\Windows`；不经 PATH 查找，防 PATH 劫持），参数 `["-NoProfile", "-NonInteractive", "-Command", "Get-AppxPackage -Name OpenAI.Codex | ForEach-Object { $_.Version }"]`，环境 `SearchEnv::system()`，`run` 的 `Err` → `ProbeFailed`，退出码非 0 → `ProbeFailed { detail: "Get-AppxPackage 执行失败（退出码 N）" }`，否则 `parse_appx_output(stdout)`。
   - `SystemProbe::codex_cli`：`SearchEnv::system()`；macOS 上经 `with_login_shell_path(env, &pick_login_shell(std::env::var_os("SHELL").as_deref()), Duration::from_secs(consts::LOGIN_SHELL_TIMEOUT_SECS))` 合并登录 shell PATH，再 `probe_codex_cli`。`SystemProbe { timeout: Duration::from_secs(consts::DEVENV_PROBE_TIMEOUT_SECS) }`（C13）。
 
-- [ ] **Step 1: 写失败测试**（`tests/component_updates.rs`，`#[cfg(unix)]` 的用例写在 `mod unix_probe`，假命令写法照抄 `tests/devenv.rs::script`）
+- [x] **Step 1: 写失败测试**（`tests/component_updates.rs`，`#[cfg(unix)]` 的用例写在 `mod unix_probe`，假命令写法照抄 `tests/devenv.rs::script`）
 
 - `cli_probe_reads_first_codex_on_path`：两个临时目录各放一个 `codex`，第一个输出 `codex-cli 0.162.1`、第二个输出 `codex-cli 9.9.9`；`probe_codex_cli(&SearchEnv::new(path, vec![]), 10s)` → `Installed{"0.162.1"}`
 - `cli_probe_reads_version_from_stderr`：脚本 `echo 'codex-cli 0.163.0' >&2; exit 1` → `Installed{"0.163.0"}`
@@ -361,13 +361,13 @@ Expected: PASS
 
 Windows 真实 `Get-AppxPackage` 不做自动化（CI 机器未装 ChatGPT），列入 Task I1 真机验收。
 
-- [ ] **Step 2: 跑红** — Run: `cargo test -p helper-core --test component_updates` Expected: 编译失败 → 补 `todo!()` 签名后 FAIL
+- [x] **Step 2: 跑红** — Run: `cargo test -p helper-core --test component_updates` Expected: 编译失败 → 补 `todo!()` 签名后 FAIL
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
-- [ ] **Step 4: 跑绿 + Windows 编译检查** — Run: `cargo test -p helper-core --test component_updates && scripts/check-windows.sh` Expected: PASS（check-windows 覆盖 `cfg(windows)` 分支编译）
+- [x] **Step 4: 跑绿 + Windows 编译检查** — Run: `cargo test -p helper-core --test component_updates && scripts/check-windows.sh` Expected: PASS（check-windows 覆盖 `cfg(windows)` 分支编译）
 
-- [ ] **Step 5: Commit**（`feat(core): 组件本地版本探测（Get-AppxPackage / codex --version）`）
+- [x] **Step 5: Commit**（`feat(core): 组件本地版本探测（Get-AppxPackage / codex --version）`）
 
 ### Task C5: `check_all` 编排与远端请求（wiremock）
 
@@ -405,7 +405,7 @@ Windows 真实 `Get-AppxPackage` 不做自动化（CI 机器未装 ChatGPT），
   失败链文案：API 段 `github api 403 限流` / `github api 429 限流` / `github api 返回 HTTP <code>` / `github api <类别>` / `github api 响应无效：<原因>`；302 段以 `；302 回退失败：` 接 `缺少 Location` / `tag 格式不符` / `HTTP <code>` / `<类别>`。`download_url` 仅在 `UpdateAvailable` 时为 `release_page_url(format!("rust-v{version}"))`。
 - 日志：结束时一次 `log::event("component_updates.checked", json!({ "network": "viaProxy"|"direct"|"blocked", "chatgpt_local": <kind>, "chatgpt_remote": <kind>, "chatgpt_version": <远端版本或 null>, "cli_local": <kind>, "cli_remote": <kind>, "cli_version": <远端版本或 null> }))`；不记 URL、响应体、detail。
 
-- [ ] **Step 1: 写失败测试**（`tests/component_updates.rs`；`FakeProbe { desktop: LocalState, cli: LocalState, calls: Arc<AtomicUsize> }`；`ctx()` 辅助：`Direct{None}`、timeout 2s、endpoints 指向 `MockServer::uri()` 下 `/codex-app-prod/windows-release.json`、`/repos/openai/codex/releases/latest`、`/openai/codex/releases/latest`，`codex_home` 为临时目录，`desktop_supported = true`）
+- [x] **Step 1: 写失败测试**（`tests/component_updates.rs`；`FakeProbe { desktop: LocalState, cli: LocalState, calls: Arc<AtomicUsize> }`；`ctx()` 辅助：`Direct{None}`、timeout 2s、endpoints 指向 `MockServer::uri()` 下 `/codex-app-prod/windows-release.json`、`/repos/openai/codex/releases/latest`、`/openai/codex/releases/latest`，`codex_home` 为临时目录，`desktop_supported = true`）
 
 ChatGPT：
 - `desktop_feed_ok_up_to_date`：本地 `26.1013.4894.0` + 实测夹具 → `remote == Ok{"26.1013.4894.0", DesktopReleaseFeed, None}`、`UpToDate`、`download_url == None`
@@ -436,13 +436,13 @@ CLI：
 - `one_component_failure_does_not_affect_other`：feed 404 + API 200 → ChatGPT `Unreachable`、CLI `Ok`
 - `requests_carry_no_credentials`：检查结束后遍历收到的请求：无 `authorization`、`cookie`、`proxy-authorization` 头；`user-agent` 以 `codex-helper/` 开头
 
-- [ ] **Step 2: 跑红** — Run: `cargo test -p helper-core --test component_updates` Expected: FAIL（`check_all` 为 `todo!()`）
+- [x] **Step 2: 跑红** — Run: `cargo test -p helper-core --test component_updates` Expected: FAIL（`check_all` 为 `todo!()`）
 
-- [ ] **Step 3: 实现 `check_all` 与远端请求私有函数**（`fetch_desktop(client, ctx) -> (RemoteState, Option<String>)`、`fetch_cli(client, ctx) -> RemoteState`、`read_capped(response, cap) -> Result<Vec<u8>, String>` 等私有名由实现者定）
+- [x] **Step 3: 实现 `check_all` 与远端请求私有函数**（`fetch_desktop(client, ctx) -> (RemoteState, Option<String>)`、`fetch_cli(client, ctx) -> RemoteState`、`read_capped(response, cap) -> Result<Vec<u8>, String>` 等私有名由实现者定）
 
-- [ ] **Step 4: 跑绿** — Run: `cargo test -p helper-core && cargo clippy -p helper-core --all-targets -- -D warnings` Expected: PASS
+- [x] **Step 4: 跑绿** — Run: `cargo test -p helper-core && cargo clippy -p helper-core --all-targets -- -D warnings` Expected: PASS
 
-- [ ] **Step 5: Commit**（`feat(core): 组件更新检查编排、GitHub 302 回退与本地缓存兜底`）
+- [x] **Step 5: Commit**（`feat(core): 组件更新检查编排、GitHub 302 回退与本地缓存兜底`）
 
 ### Task C6: Tauri 命令 `check_component_updates`
 
@@ -461,17 +461,17 @@ CLI：
   ```
   `component_check_context` = `CheckContext::production(network_path_for(status), PathBuf::from(&status.codex_home))`；命令体 = `status().await` → `component_check_context` → `Ok(check_all(&ctx).await)`。**恒返回 `Ok`**（失败已编码进各组件状态，实施偏差 D1）。
 
-- [ ] **Step 1: 写失败测试**（`commands.rs` 现有 `mod tests`）
+- [x] **Step 1: 写失败测试**（`commands.rs` 现有 `mod tests`）
 
 `component_context_follows_status_snapshot`：`Status { mode: Secure, proxy: ProxyStatus { state: Stopped, port: 17891 }, codex_home: "/tmp/cuc-home".into(), ..Default::default() }` → `ctx.network` 为 `Blocked`、`ctx.codex_home == PathBuf::from("/tmp/cuc-home")`、`ctx.endpoints == Endpoints::production()`、`ctx.desktop_supported == cfg!(windows)`、`ctx.timeout == Duration::from_secs(15)`；再以 Legacy + Running + port 23456 断言 `ViaProxy{"http://127.0.0.1:23456"}`。
 
-- [ ] **Step 2: 跑红** — Run: `cargo test -p codex-helper component_context` Expected: FAIL（未定义）
+- [x] **Step 2: 跑红** — Run: `cargo test -p codex-helper component_context` Expected: FAIL（未定义）
 
-- [ ] **Step 3: 实现命令与注册**
+- [x] **Step 3: 实现命令与注册**
 
-- [ ] **Step 4: 跑绿 + 门禁** — Run: `cargo test -p codex-helper && cargo clippy --workspace --all-targets -- -D warnings && scripts/check-windows.sh` Expected: PASS
+- [x] **Step 4: 跑绿 + 门禁** — Run: `cargo test -p codex-helper && cargo clippy --workspace --all-targets -- -D warnings && scripts/check-windows.sh` Expected: PASS
 
-- [ ] **Step 5: Commit**（`feat(desktop): 新增 check_component_updates 命令`）
+- [x] **Step 5: Commit**（`feat(desktop): 新增 check_component_updates 命令`）
 
 ---
 
@@ -490,18 +490,18 @@ CLI：
 
 已核实的结论（写进本文件头注释）：`is_peer_socket` 只认与代理 accept 端方向相反的 socket，`unique_owner` 对同 PID 去重，所以“本进程客户端连本进程监听端口”不会被判为多候选；`peer_identity_macos.rs::resolves_self_connection_ipv4` 已用同步 std socket 证明。本任务补的是**组件检测的真实形态**：tokio 监听 + tokio/reqwest 客户端、同进程、重复多次。
 
-- [ ] **Step 1: 写测试**
+- [x] **Step 1: 写测试**
 
 - `tokio_self_connection_resolves_to_own_pid`（`#[tokio::test(flavor = "multi_thread")]`）：`tokio::net::TcpListener::bind("127.0.0.1:0")`，同进程 `TcpStream::connect` 10 次；每次 accept 后在 `spawn_blocking` 里 `system_resolver().resolve(local, peer)` → `Ok` 且 `pid == std::process::id() as i32`
 - `self_connection_with_concurrent_child_spawn`（`#[ignore = "诊断用：观察 fd 继承造成的瞬时多候选"]`）：一个任务循环 `tokio::process::Command::new("/usr/bin/true")`（Windows：`cmd.exe /c exit 0`）`.status()` 50 次，同时另一任务做 50 次上一个用例的自连解析；统计 `Err` 次数并 `eprintln!`，断言为 0
 
-- [ ] **Step 2: 跑测试** — Run: `cargo test -p helper-core --test gate_self_allow && cargo test -p helper-core --test gate_self_allow -- --ignored self_connection_with_concurrent_child_spawn`
+- [x] **Step 2: 跑测试** — Run: `cargo test -p helper-core --test gate_self_allow && cargo test -p helper-core --test gate_self_allow -- --ignored self_connection_with_concurrent_child_spawn`
   Expected: 第一个 PASS——**写完即绿**（现有解析器已满足；它防住的是“解析器改动后把同进程两端判为多候选，使 §7 放行失效”的回归，须在报告列出）；诊断用例的 `Err` 次数写进报告。
 
   若第一个用例失败且报“多个候选所有者”：说明 `is_peer_socket` 方向判定在 tokio/双栈下失效——停下报告，修复思路是在 `peer_identity/mod.rs` 用该四元组补单测并修正比较，属于本通道之外的文件，不擅自改。
   若只有诊断用例出现 `Err`：根因是 spawn 瞬间子进程短暂继承 socket，`unique_owner` 看到两个 PID（fail-closed 的已知代价）。处理：不改解析器语义；组件检测侧由 Task C5 保证“本地探测（spawn）全部结束后才发远端请求”消除自身重叠；真机若仍偶发，记为遗留项（候选方案：在 1s 门禁预算内把复查次数从 2 提到 3），本计划不改。
 
-- [ ] **Step 3: Commit**（`test(gate): 真实 socket 验证同进程连接解析出本进程 PID`）
+- [x] **Step 3: Commit**（`test(gate): 真实 socket 验证同进程连接解析出本进程 PID`）
 
 ### Task G2: 门禁对本进程 PID 放行 + self 放行日志
 
@@ -518,7 +518,7 @@ CLI：
   - proxy.rs：`fn gate_allowed_event(role: &str) -> Option<serde_json::Value>`：`role == ROLE_CODEX_HELPER_SELF` → `Some(json!({ "self": true }))`，否则 `None`；Allow 分支改为 `Some(Decision::Allow { role }) => { if let Some(detail) = gate_allowed_event(&role) { crate::log::event("proxy.gate_allowed", detail); } }`。现有代码没有 `proxy.gate_allowed` 事件，其他角色放行**不新增**日志（实施偏差 D4）。
 - 不改：`resolve_with_retry`（解析失败、超时、多候选照旧 fail-closed）、`GATE_TIMEOUT`、proxy 其余逻辑。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 connection_gate.rs（复用现有 `peer_with` / `policy_allowing` / `temp_image` / `FakeResolver`）：
 - `admit_allows_self_pid_without_policy_or_image`：`pid = std::process::id() as i32`、`image_path = "/nonexistent/self-image"`、策略只批准无关摘要 → `Allow { role: ROLE_CODEX_HELPER_SELF }`
@@ -533,14 +533,14 @@ tests/gate_self_allow.rs（门禁代理：`ConnectionGate::new(system_resolver()
 - `same_process_repeated_requests_all_allowed`：同进程 `TcpStream` 连发 10 次 `GET http://unmatched.example/ping HTTP/1.1` → 每次以 `HTTP/1.1 200` 开头
 - `other_process_through_gated_proxy_still_403`：子进程 `curl`（macOS `/usr/bin/curl`；Windows `%SystemRoot%\System32\curl.exe`）`-s -o <null> -w "%{http_code}" -x http://127.0.0.1:<port> http://unmatched.example/ping` → stdout == `403`、假目标计数 0（§6 回归；**写完即绿**，防放行面扩大到他进程）
 
-- [ ] **Step 2: 跑红** — Run: `cargo test -p helper-core --lib connection_gate gate_allowed_event && cargo test -p helper-core --test gate_self_allow`
+- [x] **Step 2: 跑红** — Run: `cargo test -p helper-core --lib connection_gate gate_allowed_event && cargo test -p helper-core --test gate_self_allow`
   Expected: `admit_allows_self_pid_without_policy_or_image`、`gate_allowed_event_only_for_self` 编译失败/FAIL；两个同进程端到端用例 FAIL（403）；其余如上标注写完即绿
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
-- [ ] **Step 4: 跑绿 + 全量回归** — Run: `cargo test -p helper-core && cargo clippy -p helper-core --all-targets -- -D warnings && scripts/check-windows.sh` Expected: PASS；`tests/proxy.rs::gate::*`、`tests/manager.rs` 的 Secure 用例全部仍绿（它们的假 peer pid 都是 4321、且已核实没有用例依赖“系统解析器 + 本进程自连被拒”）
+- [x] **Step 4: 跑绿 + 全量回归** — Run: `cargo test -p helper-core && cargo clippy -p helper-core --all-targets -- -D warnings && scripts/check-windows.sh` Expected: PASS；`tests/proxy.rs::gate::*`、`tests/manager.rs` 的 Secure 用例全部仍绿（它们的假 peer pid 都是 4321、且已核实没有用例依赖“系统解析器 + 本进程自连被拒”）
 
-- [ ] **Step 5: Commit**（`feat(gate): Secure 门禁对 CodexHelper 本进程放行`）
+- [x] **Step 5: Commit**（`feat(gate): Secure 门禁对 CodexHelper 本进程放行`）
 
 ---
 
@@ -583,7 +583,7 @@ tests/gate_self_allow.rs（门禁代理：`ConnectionGate::new(system_resolver()
   - `componentNetworkText`：任一行 remote 为 blocked → `未发出远端请求（Secure 代理未就绪）`；任一行 viaProxy → `经本地代理检测`；任一行 directReason 非 null → `直连检测：${directReason}`；否则 `直连检测`（判定顺序如列）
   - `componentCheckButton`：checking → `{ text: "检查中…", disabled: true }`；否则 `{ text: "检查组件更新", disabled: false }`
 
-- [ ] **Step 1: 写失败测试**（componentformat.test.ts，夹具 `EXAMPLE: ComponentUpdates` = 契约 JSON 原样（tsc 同时校验类型与契约一致），`row(patch)` 辅助）
+- [x] **Step 1: 写失败测试**（componentformat.test.ts，夹具 `EXAMPLE: ComponentUpdates` = 契约 JSON 原样（tsc 同时校验类型与契约一致），`row(patch)` 辅助）
 
 - `契约示例：ChatGPT 已是最新、CLI 缓存兜底有更新`：ChatGPT `badge` `{已是最新, ok}`、`download === null`；CLI `badge.text === "有新版本 v0.163.0"`、`level === "warn"`、`note === "远端不可达（github api 403 限流），以下为 Codex 本地缓存，检查于 2026-10-16T05:53:49Z"`、`download.url === "https://github.com/openai/codex/releases/tag/rust-v0.163.0"`；`componentNetworkText(EXAMPLE) === "经本地代理检测"`
 - `Secure 未就绪：远端为 detail、徽标 bad、网络说明零出站`：两行 remote `{kind:"blocked", detail:"Secure 代理未就绪（代理未运行）"}`、comparison unknown、viaProxy false → `remoteText === "Secure 代理未就绪（代理未运行）"`、`badge {Secure 代理未就绪, bad}`、`componentNetworkText === "未发出远端请求（Secure 代理未就绪）"`
@@ -595,13 +595,13 @@ tests/gate_self_allow.rs（门禁代理：`ConnectionGate::new(system_resolver()
 - `直连说明带原因`：两行 viaProxy false、directReason `代理为外部实例，模式未知，已直连` → `直连检测：代理为外部实例，模式未知，已直连`
 - `检查按钮状态`：`componentCheckButton(true)` / `(false)` deepEqual 上述值
 
-- [ ] **Step 2: 跑红** — Run: `npm --prefix apps/desktop test` Expected: FAIL（模块不存在）
+- [x] **Step 2: 跑红** — Run: `npm --prefix apps/desktop test` Expected: FAIL（模块不存在）
 
-- [ ] **Step 3: 实现 types / api / componentformat**
+- [x] **Step 3: 实现 types / api / componentformat**
 
-- [ ] **Step 4: 跑绿** — Run: `npm --prefix apps/desktop test && npm --prefix apps/desktop run check` Expected: PASS
+- [x] **Step 4: 跑绿** — Run: `npm --prefix apps/desktop test && npm --prefix apps/desktop run check` Expected: PASS
 
-- [ ] **Step 5: Commit**（`feat(desktop): 组件更新检查的类型、命令封装与行视图纯函数`）
+- [x] **Step 5: Commit**（`feat(desktop): 组件更新检查的类型、命令封装与行视图纯函数`）
 
 ### Task F2: 组件版本区块 UI 与 main.ts 接线
 
@@ -621,13 +621,13 @@ tests/gate_self_allow.rs（门禁代理：`ConnectionGate::new(system_resolver()
 - main.ts：`OpKind` 加 `"checkComponentUpdates"`；模块状态 `componentUpdates: ComponentUpdates | null`、`componentCheckedAt: number | null`；`runCheckComponentUpdates()`：已在进行中则返回 → `busy.add` → `render()` → `await api.checkComponentUpdates()` 成功写结果与 `Date.now()`，失败 `messageRegion.show(toErrorPayload(error).message, "error")` 并保留上次结果 → `finally` 删 busy 并 `render()`；`appRoot.append(...)` 中把 `componentPanel.root` 放在 `updatePanel.root` 之后；`render()` 调 `componentPanel.update(...)`。区块**始终显示**（不随 `showUpdatePanel`；平台差异由 Rust 返回的 unsupportedPlatform 表达）。**不在启动或切页时自动检测**（C10）。
 - styles.css：在“更新区”之后加“组件版本区”分节：`.component-region` 同 `.update-region`；`.component-badge-ok|warn|bad` 用现有 `--ok-bg/--ok-fg`、`--warn-*`、`--bad-*` 变量；`.component-url` 等宽、`user-select: all`、`word-break: break-all`；暗色无需额外变量（变量已在 `prefers-color-scheme` 中重定义）。
 
-- [ ] **Step 1: 类型检查先红** — 先在 main.ts 写好 `import { createComponentPanel } from "./componentpanel"` 与调用 → Run: `npm --prefix apps/desktop run check` Expected: FAIL（模块不存在）。本任务是 DOM 胶水，无纯函数新增，不另写 node 测试（视图逻辑已在 F1 覆盖），在报告中说明。
+- [x] **Step 1: 类型检查先红** — 先在 main.ts 写好 `import { createComponentPanel } from "./componentpanel"` 与调用 → Run: `npm --prefix apps/desktop run check` Expected: FAIL（模块不存在）。本任务是 DOM 胶水，无纯函数新增，不另写 node 测试（视图逻辑已在 F1 覆盖），在报告中说明。
 
-- [ ] **Step 2: 实现 componentpanel.ts、main.ts 接线、样式**
+- [x] **Step 2: 实现 componentpanel.ts、main.ts 接线、样式**
 
-- [ ] **Step 3: 跑绿** — Run: `npm --prefix apps/desktop run check && npm --prefix apps/desktop test && npm --prefix apps/desktop run build` Expected: PASS
+- [x] **Step 3: 跑绿** — Run: `npm --prefix apps/desktop run check && npm --prefix apps/desktop test && npm --prefix apps/desktop run build` Expected: PASS
 
-- [ ] **Step 4: Commit**（`feat(desktop): 新增组件版本区块`）
+- [x] **Step 4: Commit**（`feat(desktop): 新增组件版本区块`）
 
 ### Task F3: dev-mock 组件检测场景
 
@@ -638,13 +638,13 @@ tests/gate_self_allow.rs（门禁代理：`ConnectionGate::new(system_resolver()
 - 新 URL 参数 `?components=`（可与 `?scenario=` 组合），取值：`latest`（默认：两组件已是最新、经代理）、`cliUpdate`（CLI `GithubApi` 来源 `0.163.0`、本地 `0.162.1`、updateAvailable、release 页 URL）、`cacheFallback`（即契约示例：CLI 缓存兜底 + 直连原因）、`blocked`（Secure 未就绪：两行 blocked、本地照常）。`status.platform === "macos"` 时 ChatGPT 行改为 local/remote 均 `unsupportedPlatform`、comparison `unknown`。
 - `case "check_component_updates"`：`setTimeout` 800ms 后 resolve（预览“检查中…”），返回值类型标注为 `ComponentUpdates`（tsc 校验与契约一致）；文件头注释的场景列表补上 `?components=`。
 
-- [ ] **Step 1: 先红** — 在 `case` 中先写 `return componentUpdates(componentsKind, status);` 调用 → Run: `npm --prefix apps/desktop run check` Expected: FAIL（函数未定义）
+- [x] **Step 1: 先红** — 在 `case` 中先写 `return componentUpdates(componentsKind, status);` 调用 → Run: `npm --prefix apps/desktop run check` Expected: FAIL（函数未定义）
 
-- [ ] **Step 2: 实现 `function componentUpdates(kind: string, status: Status): ComponentUpdates`**
+- [x] **Step 2: 实现 `function componentUpdates(kind: string, status: Status): ComponentUpdates`**
 
-- [ ] **Step 3: 跑绿 + 产物检查** — Run: `npm --prefix apps/desktop run check && npm --prefix apps/desktop run build && ! grep -r "__CODEX_HELPER_DEV_MOCK__" apps/desktop/dist` Expected: PASS（生产产物不含 mock）。手动：`npm --prefix apps/desktop run dev`，浏览器打开 `?components=cacheFallback`、`?components=blocked`、`?scenario=macos` 目视确认四种状态与“检查中…”。
+- [x] **Step 3: 跑绿 + 产物检查** — Run: `npm --prefix apps/desktop run check && npm --prefix apps/desktop run build && ! grep -r "__CODEX_HELPER_DEV_MOCK__" apps/desktop/dist` Expected: PASS（生产产物不含 mock）。手动：`npm --prefix apps/desktop run dev`，浏览器打开 `?components=cacheFallback`、`?components=blocked`、`?scenario=macos` 目视确认四种状态与“检查中…”。
 
-- [ ] **Step 4: Commit**（`feat(desktop): dev-mock 增加组件检测预览场景`）
+- [x] **Step 4: Commit**（`feat(desktop): dev-mock 增加组件检测预览场景`）
 
 ---
 
@@ -655,17 +655,17 @@ tests/gate_self_allow.rs（门禁代理：`ConnectionGate::new(system_resolver()
 **Files:**
 - 无新文件；只在 core worktree 产生合并提交。接缝问题回到所属通道的文件修复并在该通道分支上提交后重新合并。
 
-- [ ] **Step 1: 合并** — 在 core worktree：`git merge --no-ff pi/cuc-gate -F /tmp/cuc-merge-gate.txt`、`git merge --no-ff pi/cuc-frontend -F /tmp/cuc-merge-frontend.txt`（提交信息 `merge: 合并组件更新检查 gate 通道` / `… frontend 通道`，尾注 `Co-Authored-By: Pi`）。三通道文件不相交，预期无冲突；若冲突，停下报告，不用 `-X ours/theirs` 粗暴解决。
+- [x] **Step 1: 合并** — 在 core worktree：`git merge --no-ff pi/cuc-gate -F /tmp/cuc-merge-gate.txt`、`git merge --no-ff pi/cuc-frontend -F /tmp/cuc-merge-frontend.txt`（提交信息 `merge: 合并组件更新检查 gate 通道` / `… frontend 通道`，尾注 `Co-Authored-By: Pi`）。三通道文件不相交，预期无冲突；若冲突，停下报告，不用 `-X ours/theirs` 粗暴解决。
 
-- [ ] **Step 2: 门禁** — Run: `scripts/gate.sh` Expected: 末行 `== gate passed`
+- [x] **Step 2: 门禁** — Run: `scripts/gate.sh` Expected: 末行 `== gate passed`
 
-- [ ] **Step 3: 契约形状核对**
+- [x] **Step 3: 契约形状核对**
   - Rust：`cargo test -p helper-core --lib component_updates::tests::serializes_design_example_exactly` PASS
   - TS：`componentformat.test.ts` 的 `EXAMPLE` 与 Rust 测试中的 `json!` 字面量逐字段比对（同为契约 JSON 原样）；`dev-mock.ts` 的 `componentUpdates()` 返回值已被 tsc 以 `ComponentUpdates` 校验
   - 命令名：`grep -n "check_component_updates" apps/desktop/src-tauri/src/{commands.rs,main.rs} apps/desktop/src/{api.ts,dev-mock.ts}` 四处都命中
   - 变体名覆盖：Rust 每个 `kind`（installed / notInstalled / notRegisteredForUser / probeFailed / unsupportedPlatform / ok / unreachable / invalid / blocked / desktopReleaseFeed / githubApi / githubRedirect / codexLocalCache）在 `types.ts` 中都有对应字面量；`componentformat.ts` 的 switch 在 `noImplicitReturns` 下穷尽
 
-- [ ] **Step 4: 依赖复核** — Run: `cargo tree -p helper-core -i native-tls && git diff 666cdba -- Cargo.toml apps/desktop/package.json apps/desktop/package-lock.json` Expected: native-tls 被 reqwest 0.12.28 引用；Cargo.toml 仅 reqwest feature 一处变化；package*.json 无变化
+- [x] **Step 4: 依赖复核** — Run: `cargo tree -p helper-core -i native-tls && git diff 666cdba -- Cargo.toml apps/desktop/package.json apps/desktop/package-lock.json` Expected: native-tls 被 reqwest 0.12.28 引用；Cargo.toml 仅 reqwest feature 一处变化；package*.json 无变化
 
 - [ ] **Step 5: 手动验收清单（真机，结果写入报告；无法执行的标“未验证”）**——逐条对应设计 §6：Windows 代理运行两组件结果与线上清单 / GitHub latest 一致、`Get-AppxPackage` 版本与“设置→应用”一致；Legacy 停代理直连或失败原因正确；Secure 停代理时远端“Secure 代理未就绪”且日志无 `component_updates` 之外的出站、“最近连接”无新记录；Secure 运行时检测成功、“最近连接”可见 `persistent.oaistatic.com` / `api.github.com`、日志有 `proxy.gate_allowed {"self":true}`，同时 `curl -x http://127.0.0.1:17891 https://api.github.com` 仍 403；未安装组件的机器显示未安装；macOS CLI 行可用（Finder 启动）、ChatGPT 行“暂不支持（二期）”；`peer_identity_windows` 与 `gate_self_allow` 在 Windows 真机 `-- --ignored` 跑通。
 
