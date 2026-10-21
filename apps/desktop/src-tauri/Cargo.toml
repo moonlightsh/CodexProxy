@@ -31,6 +31,9 @@ tauri-plugin-updater = { version = "2", default-features = false, features = [
   "system-proxy",
   "zip",
 ] }
+# 与 tauri-plugin-updater 内部同版本（其 configure_client 闭包的 ClientBuilder 即此 crate）；
+# 主版本必须一致，否则类型不匹配。workspace 里的 0.12 是 helper-core 用的，不共用。
+reqwest = { version = "0.13", default-features = false }
 
 # 退出前检测 codex.exe：ToolHelp32 进程快照
 [target.'cfg(windows)'.dependencies]
