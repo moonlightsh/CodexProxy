@@ -285,6 +285,12 @@ impl PolicyCache {
         }
         map.insert(key, decision);
     }
+
+    /// 当前条目数（仅测试用：断言某些路径不读写缓存）。
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.lock().expect("PolicyCache 锁中毒").len()
+    }
 }
 
 impl Default for PolicyCache {

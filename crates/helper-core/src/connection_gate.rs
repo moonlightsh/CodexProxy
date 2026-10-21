@@ -361,6 +361,8 @@ mod tests {
                 role: ROLE_CODEX_HELPER_SELF.to_string()
             }
         );
+        // 本进程放行不读写策略缓存（模块约定）：admit 之后缓存仍为空。
+        assert_eq!(gate.cache.lock().expect("门禁缓存锁中毒").len(), 0);
     }
 
     #[test]
