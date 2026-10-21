@@ -1,6 +1,7 @@
 // Tauri 命令封装（与 apps/desktop/src-tauri/src/commands.rs 一一对应）。
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  ComponentUpdates,
   ConnectionRecord,
   DevEnvReport,
   EnableRequest,
@@ -32,6 +33,8 @@ export const api = {
   appVersion: () => invoke<string>("app_version"),
   /** 开发环境检测（只检测、不修改）。 */
   detectDevEnv: () => invoke<DevEnvReport>("detect_dev_env"),
+  /** 组件更新检查（只检测、不下载）：ChatGPT Desktop 与 Codex CLI 的本地/远端版本。 */
+  checkComponentUpdates: () => invoke<ComponentUpdates>("check_component_updates"),
 };
 
 /** 把 invoke 抛出的错误规范化为 ErrorPayload。 */
