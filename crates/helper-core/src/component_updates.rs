@@ -13,14 +13,15 @@
 //! - Secure 模式下代理未就绪时零出站，绝不回退直连（设计 C4）。
 
 use std::cmp::Ordering;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::consts;
 use crate::devenv::{self, SearchEnv};
 use crate::state::ProxyMode;
 use crate::types::{ProxyState, Status};
+use crate::{consts, log};
 
 // ---------------------------------------------------------------------------
 // 数据结构（与 apps/desktop/src/types.ts 一一对应）
@@ -642,6 +643,349 @@ impl LocalProbe for SystemProbe {
         .await;
         probe_codex_cli(&env, self.timeout).await
     }
+}
+
+// ---------------------------------------------------------------------------
+// 编排（设计 §4.1 / §4.2）
+// ---------------------------------------------------------------------------
+
+/// 远端地址（生产取 `consts` 编译期常量；测试改指 wiremock）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoints {
+    pub desktop_feed: String,
+    pub github_api: String,
+    pub github_latest: String,
+}
+
+impl Endpoints {
+    /// 生产地址：全部来自 `consts`。
+    pub fn production() -> Self {
+        Self {
+            desktop_feed: consts::CHATGPT_RELEASE_FEED_URL.to_string(),
+            github_api: consts::CODEX_RELEASES_API_URL.to_string(),
+            github_latest: consts::CODEX_RELEASES_LATEST_URL.to_string(),
+        }
+    }
+}
+
+/// 一次检测的上下文（调用方按 Manager 状态预先算好网络路径）。
+pub struct CheckContext<P: LocalProbe> {
+    pub network: NetworkPath,
+    /// 单请求超时，生产为 `COMPONENT_CHECK_TIMEOUT_SECS`
+    pub timeout: Duration,
+    pub endpoints: Endpoints,
+    pub probe: P,
+    /// 读 `<codex_home>/version.json` 兜底
+    pub codex_home: PathBuf,
+    /// 是否检测 ChatGPT Desktop（生产 `cfg!(windows)`，C8）
+    pub desktop_supported: bool,
+}
+
+impl CheckContext<SystemProbe> {
+    /// 生产上下文：常量地址、15s 请求超时、系统探测（15s 子进程超时）、仅 Windows 检测 ChatGPT。
+    pub fn production(network: NetworkPath, codex_home: PathBuf) -> Self {
+        Self {
+            network,
+            timeout: Duration::from_secs(consts::COMPONENT_CHECK_TIMEOUT_SECS),
+            endpoints: Endpoints::production(),
+            probe: SystemProbe {
+                timeout: Duration::from_secs(consts::DEVENV_PROBE_TIMEOUT_SECS),
+            },
+            codex_home,
+            desktop_supported: cfg!(windows),
+        }
+    }
+}
+
+/// 一次 GET 的结果分类（错误文案只按类别，不含 URL 与响应体）。
+enum Fetch {
+    /// 2xx 且响应体未超上限
+    Body(Vec<u8>),
+    /// 2xx 但响应体超过上限
+    TooLarge,
+    /// 非 2xx：状态码与 `Location` 头
+    Status(u16, Option<String>),
+    /// 网络错误（类别文案）
+    Network(&'static str),
+}
+
+const TOO_LARGE_TEXT: &str = "响应体超过 256 KiB";
+
+fn error_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "超时"
+    } else if error.is_connect() {
+        "连接失败"
+    } else {
+        "网络错误"
+    }
+}
+
+/// GET 并按上限读取响应体（超过即停止读取，不挂起、不 OOM）。
+async fn fetch(client: &reqwest::Client, url: &str, accept: Option<&str>) -> Fetch {
+    let mut request = client.get(url);
+    if let Some(accept) = accept {
+        request = request.header(reqwest::header::ACCEPT, accept);
+    }
+    let mut response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => return Fetch::Network(error_class(&error)),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        return Fetch::Status(status.as_u16(), location);
+    }
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > consts::COMPONENT_CHECK_MAX_BODY_BYTES {
+                    return Fetch::TooLarge;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Fetch::Body(body),
+            Err(error) => return Fetch::Network(error_class(&error)),
+        }
+    }
+}
+
+/// ChatGPT 远端：GET 清单 → 解析 + 白名单。返回远端状态与清单 x64 下载地址。
+async fn fetch_desktop(client: &reqwest::Client, url: &str) -> (RemoteState, Option<String>) {
+    let invalid = |detail: String| (RemoteState::Invalid { detail }, None);
+    let unreachable = |detail: String| (RemoteState::Unreachable { detail }, None);
+    match fetch(client, url, None).await {
+        Fetch::Body(body) => match parse_desktop_feed(&body) {
+            Ok(release) => (
+                RemoteState::Ok {
+                    version: release.version,
+                    source: RemoteSource::DesktopReleaseFeed,
+                    fallback_from: None,
+                },
+                release.download_url,
+            ),
+            Err(reason) => invalid(format!("清单格式无效：{reason}")),
+        },
+        Fetch::TooLarge => invalid(TOO_LARGE_TEXT.to_string()),
+        Fetch::Status(code, _) => unreachable(format!("清单返回 HTTP {code}")),
+        Fetch::Network(class) => unreachable(class.to_string()),
+    }
+}
+
+/// Codex CLI 远端回退链（设计 §2.2 / §4.3，实施偏差 D6/D7）：
+/// API →（仅 403/429）releases/latest 302 → 本地 `version.json` 缓存。
+async fn fetch_cli<P: LocalProbe>(client: &reqwest::Client, ctx: &CheckContext<P>) -> RemoteState {
+    let ok = |tag: &str, source: RemoteSource| RemoteState::Ok {
+        version: tag.trim_start_matches("rust-v").to_string(),
+        source,
+        fallback_from: None,
+    };
+    let mut api_invalid = false;
+    let chain = match fetch(
+        client,
+        &ctx.endpoints.github_api,
+        Some("application/vnd.github+json"),
+    )
+    .await
+    {
+        Fetch::Body(body) => match parse_github_release(&body) {
+            Ok(tag) => return ok(&tag, RemoteSource::GithubApi),
+            Err(reason) => {
+                api_invalid = true;
+                format!("github api 响应无效：{reason}")
+            }
+        },
+        Fetch::TooLarge => {
+            api_invalid = true;
+            format!("github api 响应无效：{TOO_LARGE_TEXT}")
+        }
+        Fetch::Status(code @ (403 | 429), _) => {
+            let limited = format!("github api {code} 限流");
+            match fetch_redirect_tag(client, &ctx.endpoints.github_latest).await {
+                Ok(tag) => return ok(&tag, RemoteSource::GithubRedirect),
+                Err(reason) => format!("{limited}；302 回退失败：{reason}"),
+            }
+        }
+        Fetch::Status(code, _) => format!("github api 返回 HTTP {code}"),
+        Fetch::Network(class) => format!("github api {class}"),
+    };
+    if let Some(cache) = read_version_cache(&ctx.codex_home) {
+        return RemoteState::Ok {
+            version: cache.latest_version,
+            source: RemoteSource::CodexLocalCache {
+                checked_at: cache.checked_at,
+            },
+            fallback_from: Some(chain),
+        };
+    }
+    if api_invalid {
+        RemoteState::Invalid { detail: chain }
+    } else {
+        RemoteState::Unreachable { detail: chain }
+    }
+}
+
+/// releases/latest 不跟随重定向，从 3xx 的 `Location` 末段取 tag。
+async fn fetch_redirect_tag(client: &reqwest::Client, url: &str) -> Result<String, String> {
+    match fetch(client, url, None).await {
+        Fetch::Status(code, location) if (300..400).contains(&code) => {
+            let location = location.ok_or_else(|| "缺少 Location".to_string())?;
+            tag_from_location(&location).ok_or_else(|| "tag 格式不符".to_string())
+        }
+        Fetch::Status(code, _) => Err(format!("HTTP {code}")),
+        Fetch::Body(_) | Fetch::TooLarge => Err("未返回重定向".to_string()),
+        Fetch::Network(class) => Err(class.to_string()),
+    }
+}
+
+/// 读 `<codex_home>/version.json`；读取或解析失败静默忽略。
+///
+/// 文件只有百余字节，同步读取即可（helper-core 未启用 tokio 的 fs feature，不为此新增）。
+fn read_version_cache(codex_home: &std::path::Path) -> Option<VersionCache> {
+    let body = std::fs::read(codex_home.join("version.json")).ok()?;
+    parse_version_cache(&body)
+}
+
+/// 组装单行结果：比较结果由 local + remote 派生；下载入口仅在有更新时给出。
+fn component_row(
+    kind: ComponentKind,
+    local: LocalState,
+    remote: RemoteState,
+    feed_url: Option<String>,
+    via_proxy: bool,
+    direct_reason: Option<&'static str>,
+) -> ComponentUpdate {
+    let comparison = derive_comparison(kind, &local, &remote);
+    let download_url = match (comparison, kind, &remote) {
+        (Comparison::UpdateAvailable, ComponentKind::ChatgptDesktop, _) => feed_url,
+        (Comparison::UpdateAvailable, ComponentKind::CodexCli, RemoteState::Ok { version, .. }) => {
+            Some(release_page_url(&format!("rust-v{version}")))
+        }
+        _ => None,
+    };
+    ComponentUpdate {
+        local,
+        remote,
+        comparison,
+        download_url,
+        via_proxy,
+        direct_reason,
+    }
+}
+
+/// 取序列化后的 `kind`（日志用）。
+fn kind_of<T: Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.get("kind").cloned())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn remote_version(remote: &RemoteState) -> Option<&str> {
+    match remote {
+        RemoteState::Ok { version, .. } => Some(version),
+        _ => None,
+    }
+}
+
+/// 两组件检测。
+///
+/// 顺序（实施偏差 D14）：先并行跑完全部本地探测，再并行发远端请求——避免本进程 spawn 子进程
+/// 与经代理建连重叠（子进程短暂继承 socket 会让门禁看到多候选所有者）。`Blocked` 时不发任何远端
+/// 请求；各组件失败互不影响。日志只记状态类别与版本号，不记 URL、响应体与 detail。
+pub async fn check_all<P: LocalProbe>(ctx: &CheckContext<P>) -> ComponentUpdates {
+    let desktop_local = async {
+        if ctx.desktop_supported {
+            ctx.probe.chatgpt_desktop().await
+        } else {
+            LocalState::UnsupportedPlatform
+        }
+    };
+    let (desktop_local, cli_local) = tokio::join!(desktop_local, ctx.probe.codex_cli());
+
+    let via_proxy = matches!(ctx.network, NetworkPath::ViaProxy { .. });
+    let direct_reason = match ctx.network {
+        NetworkPath::Direct { reason } => reason,
+        _ => None,
+    };
+    let ((desktop_remote, feed_url), cli_remote) = match &ctx.network {
+        NetworkPath::Blocked { detail } => {
+            let blocked = RemoteState::Blocked {
+                detail: (*detail).to_string(),
+            };
+            ((blocked.clone(), None), blocked)
+        }
+        _ => match build_client(&ctx.network, ctx.timeout) {
+            None => {
+                let failed = RemoteState::Unreachable {
+                    detail: "无法创建 HTTP 客户端".to_string(),
+                };
+                ((failed.clone(), None), failed)
+            }
+            Some(client) => {
+                let desktop = async {
+                    if ctx.desktop_supported {
+                        fetch_desktop(&client, &ctx.endpoints.desktop_feed).await
+                    } else {
+                        (RemoteState::UnsupportedPlatform, None)
+                    }
+                };
+                tokio::join!(desktop, fetch_cli(&client, ctx))
+            }
+        },
+    };
+
+    // Blocked 与不支持平台的行未发请求：不标注经代理/直连
+    let sent = |remote: &RemoteState| {
+        !matches!(
+            remote,
+            RemoteState::Blocked { .. } | RemoteState::UnsupportedPlatform
+        )
+    };
+    let desktop_sent = sent(&desktop_remote);
+    let cli_sent = sent(&cli_remote);
+    let result = ComponentUpdates {
+        chatgpt_desktop: component_row(
+            ComponentKind::ChatgptDesktop,
+            desktop_local,
+            desktop_remote,
+            feed_url,
+            via_proxy && desktop_sent,
+            direct_reason.filter(|_| desktop_sent),
+        ),
+        codex_cli: component_row(
+            ComponentKind::CodexCli,
+            cli_local,
+            cli_remote,
+            None,
+            via_proxy && cli_sent,
+            direct_reason.filter(|_| cli_sent),
+        ),
+    };
+    let network = match ctx.network {
+        NetworkPath::ViaProxy { .. } => "viaProxy",
+        NetworkPath::Direct { .. } => "direct",
+        NetworkPath::Blocked { .. } => "blocked",
+    };
+    let (desktop, cli) = (&result.chatgpt_desktop, &result.codex_cli);
+    log::event(
+        "component_updates.checked",
+        serde_json::json!({
+            "network": network,
+            "chatgpt_local": kind_of(&desktop.local),
+            "chatgpt_remote": kind_of(&desktop.remote),
+            "chatgpt_version": remote_version(&desktop.remote),
+            "cli_local": kind_of(&cli.local),
+            "cli_remote": kind_of(&cli.remote),
+            "cli_version": remote_version(&cli.remote),
+        }),
+    );
+    result
 }
 
 #[cfg(test)]
