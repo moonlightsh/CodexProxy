@@ -18,6 +18,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::consts;
+use crate::devenv::{self, SearchEnv};
 use crate::state::ProxyMode;
 use crate::types::{ProxyState, Status};
 
@@ -540,6 +541,107 @@ pub fn build_client(path: &NetworkPath, timeout: Duration) -> Option<reqwest::Cl
         NetworkPath::Direct { .. } => builder.no_proxy(),
     };
     builder.build().ok()
+}
+
+// ---------------------------------------------------------------------------
+// 本地版本探测（设计 §4.3）
+// ---------------------------------------------------------------------------
+
+/// 本地探测注入点：生产为 [`SystemProbe`]，测试注入假实现（不发真 spawn）。
+pub trait LocalProbe: Send + Sync {
+    fn chatgpt_desktop(&self) -> impl Future<Output = LocalState> + Send;
+    fn codex_cli(&self) -> impl Future<Output = LocalState> + Send;
+}
+
+/// 生产探测实现。
+#[derive(Debug, Clone)]
+pub struct SystemProbe {
+    /// 单个子进程超时（C13：与 devenv 同源 15s）
+    pub timeout: Duration,
+}
+
+/// Codex CLI 本地版本：PATH 上第一个 `codex` 执行 `--version`（stdout 与 stderr 都看）。
+///
+/// PATH 无命中 → `NotInstalled`；启动失败/超时/无版本号 → `ProbeFailed`。不启动引擎、不读配置。
+pub async fn probe_codex_cli(env: &SearchEnv, timeout: Duration) -> LocalState {
+    let Some(path) = env.find("codex") else {
+        return LocalState::NotInstalled;
+    };
+    match devenv::run(&path, &["--version"], env, timeout).await {
+        Err(error) => LocalState::ProbeFailed {
+            detail: format!("codex --version {error}"),
+        },
+        Ok(output) => match parse_cli_version(&format!("{}\n{}", output.stdout, output.stderr)) {
+            Some(version) => LocalState::Installed { version },
+            None => LocalState::ProbeFailed {
+                detail: format!(
+                    "codex --version 没有输出版本号（{}）",
+                    devenv::exit_text(output.code)
+                ),
+            },
+        },
+    }
+}
+
+/// `Get-AppxPackage` 的 PowerShell 参数：管道式输出每行一个版本号（设计 §4.3）。
+#[cfg(windows)]
+const APPX_ARGS: [&str; 4] = [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "Get-AppxPackage -Name OpenAI.Codex | ForEach-Object { $_.Version }",
+];
+
+/// ChatGPT Desktop 本地版本（Windows）：子进程运行 `Get-AppxPackage`（非 WinRT）。
+///
+/// PowerShell 用 `%SystemRoot%` 下的绝对路径（不经 PATH 查找，防 PATH 劫持）；沿用 devenv 子进程防护
+/// （CREATE_NO_WINDOW、Job Object、kill_on_drop、超时）。非 Windows 恒为 `UnsupportedPlatform`。
+#[cfg(windows)]
+pub async fn probe_chatgpt_desktop(timeout: Duration) -> LocalState {
+    let root = std::env::var_os("SystemRoot")
+        .filter(|root| !root.is_empty())
+        .map_or_else(
+            || std::path::PathBuf::from(r"C:\Windows"),
+            std::path::PathBuf::from,
+        );
+    let program = root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    match devenv::run(&program, &APPX_ARGS, &SearchEnv::system(), timeout).await {
+        Err(error) => LocalState::ProbeFailed {
+            detail: format!("Get-AppxPackage {error}"),
+        },
+        Ok(output) if !output.success() => LocalState::ProbeFailed {
+            detail: format!(
+                "Get-AppxPackage 执行失败（{}）",
+                devenv::exit_text(output.code)
+            ),
+        },
+        Ok(output) => parse_appx_output(&output.stdout),
+    }
+}
+
+/// 非 Windows：ChatGPT Desktop 不探测（macOS 列二期，C8）。
+#[cfg(not(windows))]
+pub async fn probe_chatgpt_desktop(_timeout: Duration) -> LocalState {
+    LocalState::UnsupportedPlatform
+}
+
+impl LocalProbe for SystemProbe {
+    async fn chatgpt_desktop(&self) -> LocalState {
+        probe_chatgpt_desktop(self.timeout).await
+    }
+
+    /// macOS 必须合并登录 shell PATH，否则 Finder 启动时看不到 Homebrew/npm 安装的 codex。
+    async fn codex_cli(&self) -> LocalState {
+        let env = SearchEnv::system();
+        #[cfg(target_os = "macos")]
+        let env = devenv::with_login_shell_path(
+            env,
+            &devenv::pick_login_shell(std::env::var_os("SHELL").as_deref()),
+            Duration::from_secs(consts::LOGIN_SHELL_TIMEOUT_SECS),
+        )
+        .await;
+        probe_codex_cli(&env, self.timeout).await
+    }
 }
 
 #[cfg(test)]
