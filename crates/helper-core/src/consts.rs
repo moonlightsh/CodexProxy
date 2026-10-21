@@ -118,3 +118,20 @@ pub const LOGIN_SHELL_TIMEOUT_SECS: u64 = 5;
 pub const LOGIN_SHELL_FALLBACK: &str = "/bin/zsh";
 /// macOS 上总是参与查找的常见安装目录（Homebrew：Apple Silicon / Intel）。
 pub const MACOS_EXTRA_PATH_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
+
+/// 组件更新检查（组件更新检查设计 §2）：ChatGPT Desktop 发布源清单（`windows-release.json`）。
+pub const CHATGPT_RELEASE_FEED_URL: &str =
+    "https://persistent.oaistatic.com/codex-app-prod/windows-release.json";
+/// 清单中 `downloadUrl` 的白名单前缀（设计 C9：https + 主机 + 路径前缀）。
+pub const CHATGPT_DOWNLOAD_URL_PREFIX: &str = "https://persistent.oaistatic.com/codex-app-prod/";
+/// Codex CLI 最新 release 的 GitHub API 地址。
+pub const CODEX_RELEASES_API_URL: &str =
+    "https://api.github.com/repos/openai/codex/releases/latest";
+/// GitHub API 限流（403/429）时的回退地址：读取 302 `Location` 末段取 tag。
+pub const CODEX_RELEASES_LATEST_URL: &str = "https://github.com/openai/codex/releases/latest";
+/// Codex CLI release 页面前缀（后接 tag）。
+pub const CODEX_RELEASE_TAG_URL_PREFIX: &str = "https://github.com/openai/codex/releases/tag/";
+/// 组件更新检查单个 HTTP 请求的超时（秒）。
+pub const COMPONENT_CHECK_TIMEOUT_SECS: u64 = 15;
+/// 组件更新检查响应体上限（字节）：超出即判清单无效，防超大或无限流响应。
+pub const COMPONENT_CHECK_MAX_BODY_BYTES: usize = 256 * 1024;
