@@ -13,10 +13,13 @@
 //! - Secure 模式下代理未就绪时零出站，绝不回退直连（设计 C4）。
 
 use std::cmp::Ordering;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::consts;
+use crate::state::ProxyMode;
+use crate::types::{ProxyState, Status};
 
 // ---------------------------------------------------------------------------
 // 数据结构（与 apps/desktop/src/types.ts 一一对应）
@@ -463,6 +466,80 @@ fn strip_fraction_seconds(time: &str) -> String {
     let rest = &time[dot + 1..];
     let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
     format!("{}{}", &time[..dot], &rest[digits..])
+}
+
+// ---------------------------------------------------------------------------
+// 网络路径决策（设计 C4 / §4.2）
+// ---------------------------------------------------------------------------
+
+/// 本次检测的网络路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkPath {
+    /// 经本地代理；`proxy_url` 固定为 `http://127.0.0.1:<port>`（不用 localhost，避免解析到 ::1）
+    ViaProxy { proxy_url: String },
+    /// 直连；`reason` 为展示给用户的直连原因
+    Direct { reason: Option<&'static str> },
+    /// Secure 未就绪：远端探测整体跳过（零出站）
+    Blocked { detail: &'static str },
+}
+
+/// Secure 未就绪文案：一般情形。
+const BLOCKED_NOT_RUNNING: &str = "Secure 代理未就绪（代理未运行）";
+/// Secure 未就绪文案：端口被外部进程占用（External 或 blocked_reason == port_occupied）。
+const BLOCKED_PORT_OCCUPIED: &str = "Secure 代理未就绪（端口被外部进程占用）";
+/// Legacy + External 的直连原因。
+const DIRECT_EXTERNAL: &str = "代理为外部实例，模式未知，已直连";
+/// Legacy + Stopped 的直连原因。
+const DIRECT_STOPPED: &str = "本地代理未运行，已直连";
+
+/// 按 Manager 状态快照决定网络路径（C4）。
+///
+/// 只看 `status.mode`（状态文件模式）与 `status.proxy.state`，Secure 下再看 `secure.blocked_reason`
+/// 选文案；**不读 `secure.active`**——Secure 被阻断时 state 为 Stopped，按 active 判定会错误直连。
+/// Secure 模式下非 Running 一律零出站，绝不直连。
+pub fn network_path_for(status: &Status) -> NetworkPath {
+    let via_proxy = || NetworkPath::ViaProxy {
+        proxy_url: format!("http://127.0.0.1:{}", status.proxy.port),
+    };
+    match (status.mode, status.proxy.state) {
+        (_, ProxyState::Running) => via_proxy(),
+        (ProxyMode::Secure, ProxyState::External) => NetworkPath::Blocked {
+            detail: BLOCKED_PORT_OCCUPIED,
+        },
+        (ProxyMode::Secure, ProxyState::Stopped) => NetworkPath::Blocked {
+            detail: if status.secure.blocked_reason.as_deref() == Some("port_occupied") {
+                BLOCKED_PORT_OCCUPIED
+            } else {
+                BLOCKED_NOT_RUNNING
+            },
+        },
+        (ProxyMode::Legacy, ProxyState::External) => NetworkPath::Direct {
+            reason: Some(DIRECT_EXTERNAL),
+        },
+        (ProxyMode::Legacy, ProxyState::Stopped) => NetworkPath::Direct {
+            reason: Some(DIRECT_STOPPED),
+        },
+    }
+}
+
+/// 按网络路径构建 HTTP 客户端；`Blocked` 或构建失败返回 None。
+///
+/// 共同：native-tls、整体超时、不跟随重定向（302 回退显式读 `Location`）、固定 User-Agent、
+/// 不带任何凭据。经代理时显式 `.proxy()`（不读环境变量代理）；直连时 `.no_proxy()`。
+pub fn build_client(path: &NetworkPath, timeout: Duration) -> Option<reqwest::Client> {
+    let builder = reqwest::Client::builder()
+        .use_native_tls()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("codex-helper/", env!("CARGO_PKG_VERSION")));
+    let builder = match path {
+        NetworkPath::Blocked { .. } => return None,
+        NetworkPath::ViaProxy { proxy_url } => {
+            builder.proxy(reqwest::Proxy::all(proxy_url.as_str()).ok()?)
+        }
+        NetworkPath::Direct { .. } => builder.no_proxy(),
+    };
+    builder.build().ok()
 }
 
 #[cfg(test)]
@@ -978,5 +1055,118 @@ mod tests {
         request.abort();
         assert_eq!(head[0], 0x16, "首字节应为 TLS 握手记录类型");
         assert_eq!(head[1], 0x03, "第二字节应为 TLS 主版本号");
+    }
+
+    fn status(mode: ProxyMode, state: ProxyState, port: u16) -> Status {
+        Status {
+            mode,
+            proxy: crate::types::ProxyStatus { state, port },
+            ..Default::default()
+        }
+    }
+
+    const NOT_RUNNING: &str = "Secure 代理未就绪（代理未运行）";
+    const PORT_OCCUPIED: &str = "Secure 代理未就绪（端口被外部进程占用）";
+
+    #[test]
+    fn secure_running_goes_via_proxy() {
+        assert_eq!(
+            network_path_for(&status(ProxyMode::Secure, ProxyState::Running, 17891)),
+            NetworkPath::ViaProxy {
+                proxy_url: "http://127.0.0.1:17891".into()
+            }
+        );
+        assert_eq!(
+            network_path_for(&status(ProxyMode::Secure, ProxyState::Running, 23456)),
+            NetworkPath::ViaProxy {
+                proxy_url: "http://127.0.0.1:23456".into()
+            }
+        );
+    }
+
+    #[test]
+    fn secure_not_running_is_blocked() {
+        let blocked = NetworkPath::Blocked {
+            detail: NOT_RUNNING,
+        };
+        let mut st = status(ProxyMode::Secure, ProxyState::Stopped, 17891);
+        assert_eq!(network_path_for(&st), blocked);
+        // 证明不看 secure.active
+        st.secure.active = true;
+        assert_eq!(network_path_for(&st), blocked);
+    }
+
+    #[test]
+    fn secure_external_or_port_occupied_is_blocked() {
+        let occupied = NetworkPath::Blocked {
+            detail: PORT_OCCUPIED,
+        };
+        assert_eq!(
+            network_path_for(&status(ProxyMode::Secure, ProxyState::External, 17891)),
+            occupied
+        );
+        let mut st = status(ProxyMode::Secure, ProxyState::Stopped, 17891);
+        st.secure.blocked_reason = Some("port_occupied".into());
+        assert_eq!(network_path_for(&st), occupied);
+        st.secure.blocked_reason = Some("bad_signature".into());
+        assert_eq!(
+            network_path_for(&st),
+            NetworkPath::Blocked {
+                detail: NOT_RUNNING
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_paths() {
+        assert_eq!(
+            network_path_for(&status(ProxyMode::Legacy, ProxyState::Running, 17891)),
+            NetworkPath::ViaProxy {
+                proxy_url: "http://127.0.0.1:17891".into()
+            }
+        );
+        assert_eq!(
+            network_path_for(&status(ProxyMode::Legacy, ProxyState::External, 17891)),
+            NetworkPath::Direct {
+                reason: Some("代理为外部实例，模式未知，已直连")
+            }
+        );
+        assert_eq!(
+            network_path_for(&status(ProxyMode::Legacy, ProxyState::Stopped, 17891)),
+            NetworkPath::Direct {
+                reason: Some("本地代理未运行，已直连")
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_with_stale_secure_active_still_follows_mode() {
+        let mut st = status(ProxyMode::Legacy, ProxyState::Stopped, 17891);
+        st.secure.active = true;
+        assert_eq!(
+            network_path_for(&st),
+            NetworkPath::Direct {
+                reason: Some("本地代理未运行，已直连")
+            }
+        );
+    }
+
+    #[test]
+    fn blocked_builds_no_client() {
+        let timeout = Duration::from_secs(15);
+        assert!(
+            build_client(
+                &NetworkPath::Blocked {
+                    detail: NOT_RUNNING
+                },
+                timeout
+            )
+            .is_none()
+        );
+        let via = NetworkPath::ViaProxy {
+            proxy_url: "http://127.0.0.1:17891".into(),
+        };
+        assert!(build_client(&via, timeout).is_some());
+        assert!(build_client(&NetworkPath::Direct { reason: None }, timeout).is_some());
     }
 }
