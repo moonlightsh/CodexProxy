@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod downloads;
 mod events;
 mod lifecycle;
 mod process;
@@ -53,6 +54,7 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::new(manager, handle))
         .manage(lifecycle::Lifecycle::default())
+        .manage(helper_core::component_downloads::DownloadManager::default())
         .setup(move |app| {
             let _ = setup_handle.set(app.handle().clone());
             tray::build(app)?;
@@ -77,6 +79,8 @@ fn main() {
             commands::get_reconcile_report,
             commands::detect_dev_env,
             commands::check_component_updates,
+            downloads::download_component,
+            downloads::cancel_component_download,
             update::check_update,
             update::install_update,
             update::app_version,

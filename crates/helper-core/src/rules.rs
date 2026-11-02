@@ -9,6 +9,9 @@ use crate::consts;
 
 /// 精确域名（来自 BlackMatrix7 OpenAI Clash 规则 2025-06-06 域名类快照）。
 pub const EXACT_DOMAINS: &[&str] = &[
+    // GitHub Release 文件重定向：组件下载的每一跳都必须经上游代理。
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
     "browser-intake-datadoghq.com",
     "chat.openai.com.cdn.cloudflare.net",
     "openai-api.arkoselabs.com",
@@ -234,7 +237,7 @@ mod tests {
 
     #[test]
     fn rule_snapshot_counts_and_no_duplicates() {
-        assert_eq!(EXACT_DOMAINS.len(), 7);
+        assert_eq!(EXACT_DOMAINS.len(), 9);
         assert_eq!(DOMAIN_SUFFIXES.len(), 25);
         assert_eq!(KEYWORDS.len(), 1);
 

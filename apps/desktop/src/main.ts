@@ -8,6 +8,8 @@ import { api, toErrorPayload } from "./api";
 import { createBannerRegion } from "./banners";
 import { catalogConfirmMessageForPath, confirmCatalogRemoval } from "./catalogconfirm";
 import { createComponentPanel } from "./componentpanel";
+import { updateDownloadProgress, type ComponentDownloadState } from "./componentdownload";
+import type { ComponentId } from "./componentformat";
 import { withNewConnection, truncateConnections } from "./connections";
 import { createConnectionsListRegion } from "./connectionslist";
 import { createDevEnvPanel } from "./devenvpanel";
@@ -75,6 +77,7 @@ async function main(): Promise<void> {
   // 组件更新检查（ChatGPT Desktop / Codex CLI）：最近一次检测结果与完成时间；仅手动触发（设计 C10）。
   let componentUpdates: ComponentUpdates | null = null;
   let componentCheckedAt: number | null = null;
+  const componentDownloads: Partial<Record<ComponentId, ComponentDownloadState>> = {};
   const busy = new Set<OpKind>();
 
   const messageRegion = createMessageRegion();
@@ -139,6 +142,8 @@ async function main(): Promise<void> {
     onCheck: () => {
       void runCheckComponentUpdates();
     },
+    onDownload: (component, version) => { void runComponentDownload(component, version); },
+    onCancel: (component) => { void cancelComponentDownload(component); },
   });
 
   const title = el("h1", { class: "app-title" }, ["CodexHelper"]);
@@ -212,11 +217,52 @@ async function main(): Promise<void> {
       available: updateAvailable,
       installLocationOk: status?.installLocationOk ?? true,
     });
+    renderComponentPanel();
+  }
+
+  // 高频进度只更新组件区，避免反复重建其他区域的按钮或打断交互。
+  function renderComponentPanel(): void {
     componentPanel.update({
       checking: busy.has("checkComponentUpdates"),
       result: componentUpdates,
       checkedAt: componentCheckedAt,
+      downloads: componentDownloads,
+      proxyReady: status?.proxy.state === "running",
     });
+  }
+
+  async function runComponentDownload(component: ComponentId, version: string): Promise<void> {
+    if (Object.values(componentDownloads).some((task) => task?.kind === "downloading")) return;
+    const id = crypto.randomUUID();
+    componentDownloads[component] = { kind: "downloading", id, receivedBytes: 0, totalBytes: null, started: false, cancelling: false };
+    renderComponentPanel();
+    try {
+      const result = await api.downloadComponent({ id, component, version }, (progress) => {
+        componentDownloads[component] = updateDownloadProgress(componentDownloads[component], id, progress);
+        renderComponentPanel();
+      });
+      componentDownloads[component] = { kind: "completed", version, path: result.path };
+    } catch (error) {
+      const payload = toErrorPayload(error);
+      componentDownloads[component] = payload.code === "downloadCancelled" ? { kind: "cancelled" } : { kind: "failed", message: payload.message };
+    } finally {
+      renderComponentPanel();
+    }
+  }
+
+  async function cancelComponentDownload(component: ComponentId): Promise<void> {
+    const task = componentDownloads[component];
+    if (task?.kind !== "downloading" || !task.started || task.cancelling) return;
+    try {
+      const accepted = await api.cancelComponentDownload(task.id);
+      const current = componentDownloads[component];
+      if (accepted && current?.kind === "downloading" && current.id === task.id) {
+        componentDownloads[component] = { ...current, cancelling: true };
+        renderComponentPanel();
+      }
+    } catch (error) {
+      messageRegion.show(toErrorPayload(error).message, "error");
+    }
   }
 
   function renderGateway(): void {

@@ -25,8 +25,8 @@ export interface ComponentRowView {
 const UNSUPPORTED_TEXT = "暂不支持（二期）";
 
 const DOWNLOAD_HINTS: Record<ComponentId, string> = {
-  chatgptDesktop: "请通过离线包管线更新（离线安装还需 ChatGPT-License.xml）。官方安装包地址：",
-  codexCli: "请通过离线包管线更新 Codex CLI。发布页：",
+  chatgptDesktop: "可通过代理下载安装包，完成后自行安装（离线安装还需 ChatGPT-License.xml）。官方地址：",
+  codexCli: "可通过代理下载当前平台的压缩包，完成后自行解压安装。发布页：",
 };
 
 export function componentRowViewState(id: ComponentId, row: ComponentUpdate): ComponentRowView {

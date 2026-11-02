@@ -62,7 +62,7 @@ test("契约示例：ChatGPT 已是最新、CLI 缓存兜底有更新", () => {
   assert.equal(cli.badge.level, "warn");
   assert.equal(cli.note, "远端不可达（github api 403 限流），以下为 Codex 本地缓存，检查于 2026-10-16T05:53:49Z");
   assert.equal(cli.download?.url, "https://github.com/openai/codex/releases/tag/rust-v0.163.0");
-  assert.equal(cli.download?.hint, "请通过离线包管线更新 Codex CLI。发布页：");
+  assert.ok(cli.download?.hint.includes("通过代理下载"));
 
   assert.equal(componentNetworkText(EXAMPLE), "经本地代理检测");
 });
@@ -150,7 +150,7 @@ test("本地较新不提示下载", () => {
   assert.equal(view.download, null);
 });
 
-test("ChatGPT 有更新引导离线包管线", () => {
+test("ChatGPT 有更新提示代理下载及离线安装许可证", () => {
   const url = "https://persistent.oaistatic.com/codex-app-prod/releases/26.1013.4894.0/ChatGPT-x64.msix";
   const view = componentRowViewState(
     "chatgptDesktop",
@@ -163,7 +163,7 @@ test("ChatGPT 有更新引导离线包管线", () => {
   );
   assert.equal(view.badge.text, "有新版本 v26.1013.4894.0");
   assert.ok(view.download?.hint.includes("ChatGPT-License.xml"));
-  assert.equal(view.download?.hint, "请通过离线包管线更新（离线安装还需 ChatGPT-License.xml）。官方安装包地址：");
+  assert.ok(view.download?.hint.includes("通过代理下载"));
   assert.equal(view.download?.url, url);
 });
 
