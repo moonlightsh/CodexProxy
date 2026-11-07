@@ -1,7 +1,10 @@
 // Tauri 命令封装（与 apps/desktop/src-tauri/src/commands.rs 一一对应）。
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   ComponentUpdates,
+  DownloadProgress,
+  DownloadRequest,
+  DownloadResult,
   ConnectionRecord,
   DevEnvReport,
   EnableRequest,
@@ -35,6 +38,10 @@ export const api = {
   detectDevEnv: () => invoke<DevEnvReport>("detect_dev_env"),
   /** 组件更新检查（只检测、不下载）：ChatGPT Desktop 与 Codex CLI 的本地/远端版本。 */
   checkComponentUpdates: () => invoke<ComponentUpdates>("check_component_updates"),
+  /** 下载官方组件文件；网络始终经代理，不安装。 */
+  downloadComponent: (request: DownloadRequest, onProgress: (progress: DownloadProgress) => void) =>
+    invoke<DownloadResult>("download_component", { request, onProgress: new Channel<DownloadProgress>(onProgress) }),
+  cancelComponentDownload: (id: string) => invoke<boolean>("cancel_component_download", { id }),
 };
 
 /** 把 invoke 抛出的错误规范化为 ErrorPayload。 */

@@ -60,6 +60,16 @@ export interface SaveKeyRequest {
 }
 
 export type ErrorCode =
+  | "downloadCancelled"
+  | "downloadRequest"
+  | "downloadProxy"
+  | "downloadBusy"
+  | "downloadPlatform"
+  | "downloadSource"
+  | "downloadNetwork"
+  | "downloadSize"
+  | "downloadFile"
+  | "downloadTimeout"
   | "emptyKey"
   | "invalidKeyChars"
   | "keyRejected"
@@ -187,6 +197,23 @@ export interface ComponentUpdate {
 export interface ComponentUpdates {
   chatgptDesktop: ComponentUpdate;
   codexCli: ComponentUpdate;
+}
+
+export interface DownloadRequest {
+  id: string;
+  component: "chatgptDesktop" | "codexCli";
+  version: string;
+}
+
+export interface DownloadProgress {
+  receivedBytes: number;
+  totalBytes: number | null;
+}
+
+export interface DownloadResult {
+  path: string;
+  fileName: string;
+  receivedBytes: number;
 }
 
 /** Rust → 前端事件名 */

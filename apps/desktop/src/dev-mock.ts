@@ -13,6 +13,9 @@ import type {
   ComponentUpdates,
   ConnectionRecord,
   DevEnvReport,
+  DownloadProgress,
+  DownloadRequest,
+  DownloadResult,
   EnableRequest,
   ErrorPayload,
   ReconcileReport,
@@ -67,6 +70,7 @@ function baseStatus(): Status {
  * `?scenario=macos`（macOS：显示升级区与卸载前提示）、`?scenario=transient`（macOS 从临时位置运行，
  * 禁用安装按钮并提示）、`?scenario=other`（不支持的平台：隐藏升级区）。
  * 组件版本区另用 `?components=`（latest / cliUpdate / cacheFallback / blocked）选择检测结果，见 componentUpdates()。
+ * `?download=failed` 模拟下载失败；默认显示进度、支持取消并返回示例路径，不写磁盘。
  * Key 录入区里输入 `bad` 模拟 keyRejected，输入 `slow` 模拟 gatewayUnavailable。
  */
 function applyScenario(status: Status, scenario: string): Status {
@@ -293,10 +297,46 @@ export function installDevMock(): void {
     throw payload;
   };
 
+  let activeDownload: { id: string; cancel: () => void } | null = null;
   mockIPC(
     (cmd, rawArgs) => {
       const args = (rawArgs ?? {}) as Record<string, unknown>;
       switch (cmd) {
+        case "download_component": {
+          if (status.proxy.state !== "running") return reject({ code: "downloadProxy", message: "请先启用本地代理，再下载组件（不会回退直连）" });
+          if (activeDownload) return reject({ code: "downloadBusy", message: "已有下载正在进行" });
+          const request = args.request as DownloadRequest;
+          const channel = args.onProgress as { onmessage: (progress: DownloadProgress) => void };
+          return new Promise<DownloadResult>((resolve, rejectDownload) => {
+            let received = 0;
+            const total = 20 * 1024 * 1024;
+            const timer = window.setInterval(() => {
+              received += 1024 * 1024;
+              channel.onmessage({ receivedBytes: received, totalBytes: total });
+              if (new URLSearchParams(location.search).get("download") === "failed" && received >= total / 4) {
+                window.clearInterval(timer);
+                activeDownload = null;
+                rejectDownload({ code: "downloadNetwork", message: "代理连接失败（仅预览用）" });
+              } else if (received >= total) {
+                window.clearInterval(timer);
+                activeDownload = null;
+                const fileName = request.component === "codexCli" ? "codex-x86_64-pc-windows-msvc.exe.zip" : `ChatGPT-${request.version}-x64.msix`;
+                resolve({ path: `C:\\Users\\Demo\\Downloads\\CodexHelper\\${fileName}`, fileName, receivedBytes: received });
+              }
+            }, 200);
+            activeDownload = { id: request.id, cancel: () => {
+              window.clearInterval(timer);
+              activeDownload = null;
+              rejectDownload({ code: "downloadCancelled", message: "下载已取消" });
+            } };
+            channel.onmessage({ receivedBytes: 0, totalBytes: total });
+          });
+        }
+        case "cancel_component_download": {
+          if (!activeDownload || activeDownload.id !== args.id) return false;
+          activeDownload.cancel();
+          return true;
+        }
         case "get_status":
         case "refresh_status":
           return status;

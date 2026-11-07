@@ -5,6 +5,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   gate:
     strategy:
@@ -51,3 +54,32 @@ jobs:
 
       - name: 前端单元测试
         run: npm --prefix apps/desktop test
+
+      # push 通过门禁后提供可手动安装的 Windows 测试包；不创建 Release，
+      # 不生成/发布 updater 产物，也不需要访问签名私钥或内网部署凭据。
+      - name: 构建 Windows 凭据程序及 sidecar
+        if: runner.os == 'Windows' && github.event_name == 'push'
+        shell: bash
+        run: |
+          cargo build --release -p codex-helper-credential
+          mkdir -p apps/desktop/src-tauri/binaries
+          cp target/release/codex-helper-credential.exe \
+            apps/desktop/src-tauri/binaries/codex-helper-credential-x86_64-pc-windows-msvc.exe
+
+      - name: 构建 Windows NSIS 测试安装包
+        if: runner.os == 'Windows' && github.event_name == 'push'
+        working-directory: apps/desktop
+        shell: bash
+        run: >-
+          npx tauri build --ci
+          --config src-tauri/tauri.bundle.conf.json
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: 上传 Windows 测试安装包
+        if: runner.os == 'Windows' && github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodexHelper-windows-x64-${{ github.sha }}
+          path: target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
