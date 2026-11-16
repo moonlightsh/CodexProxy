@@ -51,6 +51,8 @@ export function formatReachabilityLabel(reachability: Reachability): string {
       return "不可达";
     case "unknown":
       return "检测中";
+    case "disabled":
+      return "未启用";
     default:
       return "检测中";
   }
@@ -63,6 +65,8 @@ export function reachabilityLevel(reachability: Reachability): StatusLevel {
     case "unreachable":
       return "bad";
     case "unknown":
+      return "warn";
+    case "disabled":
       return "warn";
     default:
       return "warn";

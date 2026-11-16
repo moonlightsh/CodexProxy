@@ -44,13 +44,15 @@ test("formatLocalProxyAddr 拼接回环地址", () => {
   assert.equal(formatLocalProxyAddr(17891), "127.0.0.1:17891");
 });
 
-test("formatReachabilityLabel / reachabilityLevel 覆盖三态", () => {
+test("formatReachabilityLabel / reachabilityLevel 覆盖四态", () => {
   assert.equal(formatReachabilityLabel("reachable"), "可达");
   assert.equal(formatReachabilityLabel("unreachable"), "不可达");
   assert.equal(formatReachabilityLabel("unknown"), "检测中");
+  assert.equal(formatReachabilityLabel("disabled"), "未启用");
   assert.equal(reachabilityLevel("reachable"), "ok");
   assert.equal(reachabilityLevel("unreachable"), "bad");
   assert.equal(reachabilityLevel("unknown"), "warn");
+  assert.equal(reachabilityLevel("disabled"), "warn");
 });
 
 test("formatConfigManagedLabel 三态：已接管 / 未接管 / 部分接管", () => {
