@@ -433,7 +433,11 @@ mod tests {
             "model_provider = \"managed_gateway\"\n\n[model_providers.managed_gateway]\nname = \"Managed Gateway\"\n",
         )
         .unwrap();
-        std::fs::write(paths.env_file(), codex_env::render_block(17891)).unwrap();
+        std::fs::write(
+            paths.env_file(),
+            codex_env::render_block(17891, consts::GATEWAY_HOST),
+        )
+        .unwrap();
 
         let store = MemoryCredentialStore::with_token("sk-keep-me");
         let mut stdout = Vec::new();
@@ -487,7 +491,7 @@ mod tests {
             paths.env_file(),
             format!(
                 "# 用户自己的变量\nFOO=bar\n\n{}",
-                codex_env::render_block(17891)
+                codex_env::render_block(17891, consts::GATEWAY_HOST)
             ),
         )
         .unwrap();

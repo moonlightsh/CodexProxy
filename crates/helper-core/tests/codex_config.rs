@@ -42,13 +42,19 @@ impl Sandbox {
 
     /// 模拟一次启用：记录原值后校正。
     fn enable(&self) -> PreviousConfig {
-        let previous = codex_config::inspect(&self.config, COMMAND)
+        let previous = codex_config::inspect(&self.config, COMMAND, consts::GATEWAY_BASE_URL)
             .unwrap()
             .previous();
-        let outcome = codex_config::apply_managed(&self.config, &self.backup, COMMAND).unwrap();
+        let outcome = codex_config::apply_managed(
+            &self.config,
+            &self.backup,
+            COMMAND,
+            consts::GATEWAY_BASE_URL,
+        )
+        .unwrap();
         assert!(outcome.changed);
         assert!(
-            codex_config::inspect(&self.config, COMMAND)
+            codex_config::inspect(&self.config, COMMAND, consts::GATEWAY_BASE_URL)
                 .unwrap()
                 .fully_managed
         );
@@ -159,8 +165,13 @@ fn consecutive_apply_is_idempotent_for_every_fixture() {
         sandbox.enable();
         let enabled = sandbox.read();
         std::fs::remove_file(&sandbox.backup).unwrap();
-        let outcome =
-            codex_config::apply_managed(&sandbox.config, &sandbox.backup, COMMAND).unwrap();
+        let outcome = codex_config::apply_managed(
+            &sandbox.config,
+            &sandbox.backup,
+            COMMAND,
+            consts::GATEWAY_BASE_URL,
+        )
+        .unwrap();
         assert!(!outcome.changed, "{name}");
         assert_eq!(sandbox.read(), enabled, "{name}");
         assert!(!sandbox.backup.exists(), "{name}");
@@ -236,7 +247,8 @@ fn restore_keeps_user_changes_made_while_enabled() {
         .replace("trust_level = \"trusted\"", "trust_level = \"untrusted\"")
         + "\n[model_providers.added]\nname = \"Added\"\n\n[plugins]\nenabled = true\n";
     assert_eq!(sandbox.read(), expected);
-    let inspection = codex_config::inspect(&sandbox.config, COMMAND).unwrap();
+    let inspection =
+        codex_config::inspect(&sandbox.config, COMMAND, consts::GATEWAY_BASE_URL).unwrap();
     assert!(!inspection.has_managed_residue());
     assert_eq!(inspection.model_provider.as_deref(), Some("custom"));
 }
@@ -254,14 +266,20 @@ fn reapply_after_drift_keeps_user_changes_and_restore_is_still_exact() {
         .replace("http://10.20.30.61:8080", "http://evil:1")
         + "\n[tui]\nnotifications = true\n";
     sandbox.write(&drifted);
-    let outcome = codex_config::apply_managed(&sandbox.config, &sandbox.backup, COMMAND).unwrap();
+    let outcome = codex_config::apply_managed(
+        &sandbox.config,
+        &sandbox.backup,
+        COMMAND,
+        consts::GATEWAY_BASE_URL,
+    )
+    .unwrap();
     assert!(outcome.changed);
     assert_eq!(std::fs::read_to_string(&sandbox.backup).unwrap(), drifted);
     let text = sandbox.read();
     assert!(text.contains("model_provider = \"managed_gateway\"   # 原 provider\n"));
     assert!(text.contains("[tui]\nnotifications = true\n"));
     assert!(
-        codex_config::inspect(&sandbox.config, COMMAND)
+        codex_config::inspect(&sandbox.config, COMMAND, consts::GATEWAY_BASE_URL)
             .unwrap()
             .fully_managed
     );
@@ -295,7 +313,8 @@ fn residue_cleanup_matches_restore_without_previous_values() {
             codex_config::remove_residue(&sandbox.config).unwrap(),
             "{name}"
         );
-        let inspection = codex_config::inspect(&sandbox.config, COMMAND).unwrap();
+        let inspection =
+            codex_config::inspect(&sandbox.config, COMMAND, consts::GATEWAY_BASE_URL).unwrap();
         assert!(!inspection.has_managed_residue(), "{name}");
         // 残留清理不碰 model_catalog_json、也无从得知原 model_provider：其余内容应与原文一致
         let doc = parse(&sandbox.read());
@@ -355,7 +374,7 @@ fn managed_valued_keys_are_absorbed_only_when_residue_present() {
         "sandbox_mode = \"workspace-write\"\n",
     );
     let sandbox = Sandbox::with(residue);
-    let previous = codex_config::inspect(&sandbox.config, COMMAND)
+    let previous = codex_config::inspect(&sandbox.config, COMMAND, consts::GATEWAY_BASE_URL)
         .unwrap()
         .previous();
     assert_eq!(previous.model_provider, None);
@@ -424,7 +443,7 @@ fn residue_cleanup_drops_managed_valued_approval_keys_keeps_user_values() {
 fn inspect_reports_structure_errors_without_writing() {
     let text = "model = \"o3\"\n\n[model_providers.managed_gateway]\nauth = [\"x\"]\n";
     let sandbox = Sandbox::with(text);
-    match codex_config::inspect(&sandbox.config, COMMAND) {
+    match codex_config::inspect(&sandbox.config, COMMAND, consts::GATEWAY_BASE_URL) {
         Err(codex_config::ConfigError::NotATable { key }) => {
             assert_eq!(key, "model_providers.managed_gateway.auth")
         }

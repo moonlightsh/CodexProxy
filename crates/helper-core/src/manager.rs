@@ -336,9 +336,12 @@ impl Manager {
             });
         let mut proxy_restarted = false;
         if result.is_err() {
-            let block_remains =
-                codex_env::inspect_file(&options.paths.env_file(), options.proxy_port)
-                    .map_or(true, |inspection| inspection.has_block);
+            let block_remains = codex_env::inspect_file(
+                &options.paths.env_file(),
+                options.proxy_port,
+                consts::GATEWAY_HOST,
+            )
+            .map_or(true, |inspection| inspection.has_block);
             if block_remains {
                 match self.ensure_proxy(&mut ops).await {
                     Ok(_) => proxy_restarted = true,
@@ -531,6 +534,7 @@ impl Manager {
             &config_path,
             &backup_path,
             &self.options.credential_command,
+            consts::GATEWAY_BASE_URL,
         )
         .map_err(|error| step(config_error(error, &config_path)))?;
         undo.config = Some(outcome);
@@ -547,8 +551,12 @@ impl Manager {
         let step = StepError::at("write_env");
         let env_path = paths.env_file();
         let env_before = read_raw(&env_path).map_err(|error| step(io_error(&env_path, error)))?;
-        let changed = codex_env::write_block_to_file(&env_path, self.options.proxy_port)
-            .map_err(|error| step(io_error(&env_path, error)))?;
+        let changed = codex_env::write_block_to_file(
+            &env_path,
+            self.options.proxy_port,
+            consts::GATEWAY_HOST,
+        )
+        .map_err(|error| step(io_error(&env_path, error)))?;
         if changed {
             undo.env = Some(env_before);
         }
@@ -697,8 +705,12 @@ impl Manager {
         if !snapshot.state.enabled {
             // 对结构宽松的残留判定（与一键清理一致）：结构不符的受管节同样提示清理
             let config_residue = codex_config::has_residue(&paths.config_toml()).unwrap_or(false);
-            let env_block = codex_env::inspect_file(&paths.env_file(), self.options.proxy_port)
-                .is_ok_and(|inspection| inspection.has_block);
+            let env_block = codex_env::inspect_file(
+                &paths.env_file(),
+                self.options.proxy_port,
+                consts::GATEWAY_HOST,
+            )
+            .is_ok_and(|inspection| inspection.has_block);
             return Ok(if config_residue || env_block {
                 ReconcileOutcome::ResidueFound
             } else {
@@ -728,12 +740,17 @@ impl Manager {
         };
 
         // 幂等重做第 4–6 步，不记录原值
-        codex_config::apply_managed(&config_path, &paths.config_backup(), &command)
-            .map_err(|error| config_error(error, &config_path))?;
+        codex_config::apply_managed(
+            &config_path,
+            &paths.config_backup(),
+            &command,
+            consts::GATEWAY_BASE_URL,
+        )
+        .map_err(|error| config_error(error, &config_path))?;
         // 端口被他人占用时在这里失败，已存在的 .env 不被改动
         self.ensure_proxy(ops).await?;
         let env_path = paths.env_file();
-        codex_env::write_block_to_file(&env_path, self.options.proxy_port)
+        codex_env::write_block_to_file(&env_path, self.options.proxy_port, consts::GATEWAY_HOST)
             .map_err(|error| io_error(&env_path, error))?;
         Ok(ReconcileOutcome::Applied)
     }
@@ -1250,8 +1267,12 @@ impl Manager {
     /// 检查 config.toml：无法解析、根键类型不符或受管结构不是 table 时返回 `ConfigInvalid`。
     fn inspect_config(&self) -> Result<ConfigInspection, ManagerError> {
         let config_path = self.options.paths.config_toml();
-        codex_config::inspect(&config_path, &self.options.credential_command)
-            .map_err(|error| config_error(error, &config_path))
+        codex_config::inspect(
+            &config_path,
+            &self.options.credential_command,
+            consts::GATEWAY_BASE_URL,
+        )
+        .map_err(|error| config_error(error, &config_path))
     }
 
     /// 是否从临时安装位置运行（仅 macOS；其他平台恒为 false，行为不变）。
@@ -1283,14 +1304,17 @@ impl Manager {
         let key_configured = options.credentials.exists();
 
         let config_path = paths.config_toml();
-        let (inspection, config_error_message) =
-            match codex_config::inspect(&config_path, &self.effective_command()) {
-                Ok(inspection) => (inspection, None),
-                Err(error) => (
-                    ConfigInspection::default(),
-                    Some(config_error(error, &config_path).to_string()),
-                ),
-            };
+        let (inspection, config_error_message) = match codex_config::inspect(
+            &config_path,
+            &self.effective_command(),
+            consts::GATEWAY_BASE_URL,
+        ) {
+            Ok(inspection) => (inspection, None),
+            Err(error) => (
+                ConfigInspection::default(),
+                Some(config_error(error, &config_path).to_string()),
+            ),
+        };
         // inspect 因结构不符报错时，残留改用对结构宽松的判定（与一键清理一致）
         let config_residue = if config_error_message.is_none() {
             inspection.has_managed_residue()
@@ -1298,7 +1322,8 @@ impl Manager {
             codex_config::has_residue(&config_path).unwrap_or(false)
         };
         let env =
-            codex_env::inspect_file(&paths.env_file(), options.proxy_port).unwrap_or_default();
+            codex_env::inspect_file(&paths.env_file(), options.proxy_port, consts::GATEWAY_HOST)
+                .unwrap_or_default();
         let runtime = *self.runtime();
 
         Status {

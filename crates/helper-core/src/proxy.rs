@@ -953,7 +953,11 @@ async fn handle_connection(mut client: TcpStream, shared: Arc<Shared>) {
         },
     };
 
-    let decision = rules::route_for_host(&target.host);
+    let always_direct = [
+        consts::GATEWAY_HOST.to_string(),
+        consts::SOCKS5_HOST.to_string(),
+    ];
+    let decision = rules::route_for_host(&target.host, &always_direct);
     let connect_started = Instant::now();
     let upstream = connect_upstream(&shared.config, &target, decision).await;
     let mut pending = PendingRecord {

@@ -393,7 +393,10 @@ async fn enable_with_new_key_then_disable_restores_everything() {
     let env = std::fs::read_to_string(sandbox.env()).unwrap();
     assert_eq!(
         env,
-        format!("{USER_ENV}\n{}", codex_env::render_block(sandbox.port))
+        format!(
+            "{USER_ENV}\n{}",
+            codex_env::render_block(sandbox.port, consts::GATEWAY_HOST)
+        )
     );
     assert!(env.contains(&format!("HTTPS_PROXY=http://127.0.0.1:{}", sandbox.port)));
     assert!(env.contains(&format!("ALL_PROXY=http://127.0.0.1:{}", sandbox.port)));
@@ -445,7 +448,7 @@ async fn env_created_by_enable_is_deleted_by_disable() {
     manager.enable(with_key(KEY)).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(sandbox.env()).unwrap(),
-        codex_env::render_block(sandbox.port)
+        codex_env::render_block(sandbox.port, consts::GATEWAY_HOST)
     );
     manager.disable().await.unwrap();
     assert!(!sandbox.env().exists(), "原先不存在的 .env 应被删除");
@@ -1077,7 +1080,10 @@ async fn reconcile_fails_on_foreign_port_without_touching_env() {
         ..Default::default()
     });
     // 已存在的 .env（块端口与当前不同，正常对账会改写它）
-    let env_text = format!("{USER_ENV}\n{}", codex_env::render_block(1));
+    let env_text = format!(
+        "{USER_ENV}\n{}",
+        codex_env::render_block(1, consts::GATEWAY_HOST)
+    );
     sandbox.write_env(&env_text);
 
     let manager = sandbox.manager();
@@ -1158,7 +1164,10 @@ async fn cleanup_without_state_file_removes_managed_residue() {
         "\n[model_providers.managed_gateway]\nname = \"Managed Gateway\"\n",
         "\n[model_providers.managed_gateway.auth]\ncommand = \"x\"\n",
     ));
-    sandbox.write_env(&format!("{USER_ENV}\n{}", codex_env::render_block(17891)));
+    sandbox.write_env(&format!(
+        "{USER_ENV}\n{}",
+        codex_env::render_block(17891, consts::GATEWAY_HOST)
+    ));
 
     let report = manager::cleanup(&sandbox.paths(), sandbox.credentials.as_ref(), false).unwrap();
     assert!(report.env_block_removed && report.config_restored);
@@ -1215,7 +1224,7 @@ async fn cleanup_purges_key_and_is_idempotent() {
     sandbox.write_config(
         "model_provider = \"managed_gateway\"\n\n[model_providers.managed_gateway]\nname = \"Managed Gateway\"\n",
     );
-    sandbox.write_env(&codex_env::render_block(17891));
+    sandbox.write_env(&codex_env::render_block(17891, consts::GATEWAY_HOST));
 
     let first = manager::cleanup(&sandbox.paths(), sandbox.credentials.as_ref(), true).unwrap();
     assert_eq!(
@@ -1275,7 +1284,10 @@ async fn cleanup_treats_corrupt_state_as_missing() {
 async fn cleanup_reports_error_but_finishes_other_steps() {
     let sandbox = Sandbox::new().await;
     sandbox.write_config("model = [\n");
-    sandbox.write_env(&format!("{USER_ENV}\n{}", codex_env::render_block(17891)));
+    sandbox.write_env(&format!(
+        "{USER_ENV}\n{}",
+        codex_env::render_block(17891, consts::GATEWAY_HOST)
+    ));
     sandbox.write_state(&HelperState {
         enabled: true,
         ..Default::default()
@@ -1310,7 +1322,7 @@ async fn cleanup_residue_uses_same_logic_and_stops_proxy() {
     // 停用 + 残留：一键清理后 residue 消失
     sandbox.write_env(&format!(
         "{USER_ENV}{}",
-        codex_env::render_block(sandbox.port)
+        codex_env::render_block(sandbox.port, consts::GATEWAY_HOST)
     ));
     assert!(manager.status().await.residue);
     let status = manager.cleanup_residue().await.unwrap();
@@ -1329,7 +1341,7 @@ async fn cleanup_tolerates_structure_errors_in_residue() {
         sandbox.write_config(&broken);
         sandbox.write_env(&format!(
             "{USER_ENV}{}",
-            codex_env::render_block(sandbox.port)
+            codex_env::render_block(sandbox.port, consts::GATEWAY_HOST)
         ));
         sandbox.write_state(&HelperState {
             enabled: false,
@@ -1827,10 +1839,16 @@ fn production_options_use_fixed_parameters() {
 /// 状态文件仍为停用但留有原值。
 fn simulate_interrupted_enable(sandbox: &Sandbox) {
     sandbox.write_config(USER_CONFIG);
-    codex_config::apply_managed(&sandbox.config(), &sandbox.backup(), COMMAND).unwrap();
+    codex_config::apply_managed(
+        &sandbox.config(),
+        &sandbox.backup(),
+        COMMAND,
+        consts::GATEWAY_BASE_URL,
+    )
+    .unwrap();
     sandbox.write_env(&format!(
         "{USER_ENV}\n{}",
-        codex_env::render_block(sandbox.port)
+        codex_env::render_block(sandbox.port, consts::GATEWAY_HOST)
     ));
     sandbox.write_state(&HelperState {
         enabled: false,

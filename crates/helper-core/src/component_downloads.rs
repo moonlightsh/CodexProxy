@@ -663,14 +663,17 @@ mod tests {
     #[test]
     fn github_asset_hosts_use_upstream_proxy() {
         assert_eq!(
-            route_for_host("release-assets.githubusercontent.com"),
+            route_for_host("release-assets.githubusercontent.com", &[]),
             Route::Socks5
         );
         assert_eq!(
-            route_for_host("objects.githubusercontent.com"),
+            route_for_host("objects.githubusercontent.com", &[]),
             Route::Socks5
         );
-        assert_eq!(route_for_host("evil.githubusercontent.com"), Route::Direct);
+        assert_eq!(
+            route_for_host("evil.githubusercontent.com", &[]),
+            Route::Direct
+        );
     }
 
     fn request(id: &str) -> DownloadRequest {

@@ -5,7 +5,6 @@
 
 use std::path::Path;
 
-use crate::consts;
 use crate::fsutil;
 
 /// 受管块起始标记。
@@ -64,14 +63,15 @@ fn is_managed_key_line(line: &str) -> bool {
 }
 
 /// 受管块的 6 行内容（不含行终止符）：起始标记 + 4 个键 + 结束标记。
-fn block_lines(proxy_port: u16) -> [String; 6] {
+/// `gateway_host` 写入 `NO_PROXY`，IPv6 不带方括号。
+fn block_lines(proxy_port: u16, gateway_host: &str) -> [String; 6] {
     let proxy = format!("http://127.0.0.1:{proxy_port}");
     [
         BEGIN_MARKER.to_string(),
         format!("HTTP_PROXY={proxy}"),
         format!("HTTPS_PROXY={proxy}"),
         format!("ALL_PROXY={proxy}"),
-        format!("NO_PROXY={},127.0.0.1,localhost", consts::GATEWAY_HOST),
+        format!("NO_PROXY={gateway_host},127.0.0.1,localhost"),
         END_MARKER.to_string(),
     ]
 }
@@ -132,22 +132,22 @@ fn scan_and_strip(text: &str, begin: &str, end: &str) -> Vec<String> {
 }
 
 /// 渲染受管块文本（含结尾换行）。
-pub fn render_block(proxy_port: u16) -> String {
-    block_lines(proxy_port).join("\n") + "\n"
+pub fn render_block(proxy_port: u16, gateway_host: &str) -> String {
+    block_lines(proxy_port, gateway_host).join("\n") + "\n"
 }
 
 /// 写入或更新受管块（幂等），块固定在文件末尾。
 ///
 /// 先剥离已存在的本工具受管块（含重复出现的多个块、不完整块），再把全新渲染的块追加到末尾；
 /// 因此端口变化、重复块合并、覆盖用户自定义的同名变量都是这一步的自然结果。
-pub fn upsert_block(existing: &str, proxy_port: u16) -> String {
+pub fn upsert_block(existing: &str, proxy_port: u16, gateway_host: &str) -> String {
     let (has_bom, body) = strip_bom(existing);
     let eol = detect_eol(body);
     let mut kept = scan_and_strip(body, BEGIN_MARKER, END_MARKER);
     if !kept.is_empty() {
         kept.push(String::new()); // 用户内容与受管块之间留一空行
     }
-    kept.extend(block_lines(proxy_port));
+    kept.extend(block_lines(proxy_port, gateway_host));
     let mut out = join_lines(&kept, eol);
     if has_bom && !out.is_empty() {
         out.insert(0, '\u{feff}');
@@ -178,13 +178,14 @@ fn strip_and_render(existing: &str, begin: &str, end: &str) -> String {
 }
 
 /// 检查文本内容。
-pub fn inspect_text(existing: &str, proxy_port: u16) -> EnvInspection {
+pub fn inspect_text(existing: &str, proxy_port: u16, gateway_host: &str) -> EnvInspection {
     let (_, body) = strip_bom(existing);
     // 不完整块（只有起始或结束标记）也算残留：停用状态下的残留检测与旧块警告都不能漏掉它。
     let has_block = has_marker(body, BEGIN_MARKER, END_MARKER);
     let has_legacy_block = has_marker(body, LEGACY_BEGIN_MARKER, LEGACY_END_MARKER);
-    // “块内容等于 render_block(port) 且位于末尾”等价于 upsert 结果与原文一致（幂等）。
-    let block_up_to_date = has_block && upsert_block(existing, proxy_port) == existing;
+    // “块内容等于 render_block(port, gateway_host) 且位于末尾”等价于 upsert 结果与原文一致（幂等）。
+    let block_up_to_date =
+        has_block && upsert_block(existing, proxy_port, gateway_host) == existing;
     EnvInspection {
         exists: true,
         has_block,
@@ -194,17 +195,25 @@ pub fn inspect_text(existing: &str, proxy_port: u16) -> EnvInspection {
 }
 
 /// 检查文件；不存在返回 `exists = false` 的默认值。
-pub fn inspect_file(env_path: &Path, proxy_port: u16) -> std::io::Result<EnvInspection> {
+pub fn inspect_file(
+    env_path: &Path,
+    proxy_port: u16,
+    gateway_host: &str,
+) -> std::io::Result<EnvInspection> {
     match fsutil::read_optional(env_path)? {
-        Some(text) => Ok(inspect_text(&text, proxy_port)),
+        Some(text) => Ok(inspect_text(&text, proxy_port, gateway_host)),
         None => Ok(EnvInspection::default()),
     }
 }
 
 /// 原子写入受管块。返回是否实际写入（内容无变化时不写）。
-pub fn write_block_to_file(env_path: &Path, proxy_port: u16) -> std::io::Result<bool> {
+pub fn write_block_to_file(
+    env_path: &Path,
+    proxy_port: u16,
+    gateway_host: &str,
+) -> std::io::Result<bool> {
     let existing = fsutil::read_optional(env_path)?.unwrap_or_default();
-    let updated = upsert_block(&existing, proxy_port);
+    let updated = upsert_block(&existing, proxy_port, gateway_host);
     if updated == existing {
         return Ok(false);
     }
@@ -261,7 +270,7 @@ mod tests {
 
     #[test]
     fn renders_block_with_proxy_and_no_proxy() {
-        let block = render_block(17891);
+        let block = render_block(17891, crate::consts::GATEWAY_HOST);
         assert!(block.contains("HTTP_PROXY=http://127.0.0.1:17891"));
         assert!(block.contains("HTTPS_PROXY=http://127.0.0.1:17891"));
         assert!(block.contains("ALL_PROXY=http://127.0.0.1:17891"));
@@ -279,12 +288,35 @@ mod tests {
              ALL_PROXY=http://127.0.0.1:17891\n\
              NO_PROXY=10.20.30.61,127.0.0.1,localhost\n\
              # <<< codex-helper managed gateway <<<\n";
-        assert_eq!(render_block(17891), expected);
+        assert_eq!(render_block(17891, crate::consts::GATEWAY_HOST), expected);
+    }
+
+    #[test]
+    fn render_block_uses_supplied_gateway_host() {
+        let block = render_block(17891, "gw.example");
+        assert!(block.contains("NO_PROXY=gw.example,127.0.0.1,localhost"));
+        assert!(!block.contains("10.20.30.61"));
+        assert!(block.contains("HTTP_PROXY=http://127.0.0.1:17891"));
+        assert!(block.contains("HTTPS_PROXY=http://127.0.0.1:17891"));
+        assert!(block.contains("ALL_PROXY=http://127.0.0.1:17891"));
+    }
+
+    #[test]
+    fn mismatched_gateway_host_is_not_up_to_date_and_upsert_rewrites_it() {
+        let text = render_block(17891, "10.20.30.61");
+        let inspection = inspect_text(&text, 17891, "other.example");
+        assert!(inspection.has_block);
+        assert!(!inspection.block_up_to_date);
+        let updated = upsert_block(&text, 17891, "other.example");
+        assert!(updated.contains("NO_PROXY=other.example,127.0.0.1,localhost"));
+        assert!(!updated.contains("10.20.30.61"));
+        assert_eq!(updated.matches(BEGIN_MARKER).count(), 1);
+        assert_eq!(updated.matches(END_MARKER).count(), 1);
     }
 
     #[test]
     fn block_contains_only_four_managed_keys_and_no_credentials() {
-        let block = render_block(17891);
+        let block = render_block(17891, crate::consts::GATEWAY_HOST);
         let inner: Vec<&str> = block
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -305,14 +337,14 @@ mod tests {
 
     #[test]
     fn writes_block_into_empty_file() {
-        let out = upsert_block("", 17891);
-        assert_eq!(out, render_block(17891));
+        let out = upsert_block("", 17891, crate::consts::GATEWAY_HOST);
+        assert_eq!(out, render_block(17891, crate::consts::GATEWAY_HOST));
     }
 
     #[test]
     fn keeps_user_lines_and_appends_block_at_end() {
         let existing = "UNRELATED=value\nAWS_ACCESS_KEY_ID=keep-me\n";
-        let out = upsert_block(existing, 17891);
+        let out = upsert_block(existing, 17891, crate::consts::GATEWAY_HOST);
         assert!(out.starts_with("UNRELATED=value\nAWS_ACCESS_KEY_ID=keep-me\n"));
         // 块必须在末尾，dotenv 后定义胜出
         let block_start = out.find(BEGIN_MARKER).expect("block present");
@@ -322,16 +354,16 @@ mod tests {
 
     #[test]
     fn upsert_is_idempotent() {
-        let once = upsert_block("KEEP=1\n", 17891);
-        let twice = upsert_block(&once, 17891);
+        let once = upsert_block("KEEP=1\n", 17891, crate::consts::GATEWAY_HOST);
+        let twice = upsert_block(&once, 17891, crate::consts::GATEWAY_HOST);
         assert_eq!(once, twice);
         assert_eq!(twice.matches(BEGIN_MARKER).count(), 1);
     }
 
     #[test]
     fn upsert_rewrites_changed_port() {
-        let old = upsert_block("KEEP=1\n", 17891);
-        let new = upsert_block(&old, 18000);
+        let old = upsert_block("KEEP=1\n", 17891, crate::consts::GATEWAY_HOST);
+        let new = upsert_block(&old, 18000, crate::consts::GATEWAY_HOST);
         assert!(new.contains("HTTPS_PROXY=http://127.0.0.1:18000"));
         assert!(!new.contains("17891"));
         assert_eq!(new.matches(BEGIN_MARKER).count(), 1);
@@ -343,8 +375,18 @@ mod tests {
         let legacy = format!(
             "{BEGIN_MARKER}\nHTTP_PROXY=http://127.0.0.1:17891\nHTTPS_PROXY=http://127.0.0.1:17891\nNO_PROXY=10.20.30.61,127.0.0.1,localhost\n{END_MARKER}\n"
         );
-        let out = upsert_block(&format!("KEEP=1\n{legacy}"), 17891);
-        assert_eq!(out, format!("KEEP=1\n\n{}", render_block(17891)));
+        let out = upsert_block(
+            &format!("KEEP=1\n{legacy}"),
+            17891,
+            crate::consts::GATEWAY_HOST,
+        );
+        assert_eq!(
+            out,
+            format!(
+                "KEEP=1\n\n{}",
+                render_block(17891, crate::consts::GATEWAY_HOST)
+            )
+        );
         assert_eq!(out.matches("ALL_PROXY=").count(), 1);
     }
 
@@ -353,10 +395,10 @@ mod tests {
         // 人为构造出两个完整的受管块（例如上次崩溃留下的残留）。
         let existing = format!(
             "KEEP=1\n{a}\nKEEP=2\n{b}\n",
-            a = render_block(1111).trim_end(),
-            b = render_block(2222).trim_end()
+            a = render_block(1111, crate::consts::GATEWAY_HOST).trim_end(),
+            b = render_block(2222, crate::consts::GATEWAY_HOST).trim_end()
         );
-        let out = upsert_block(&existing, 17891);
+        let out = upsert_block(&existing, 17891, crate::consts::GATEWAY_HOST);
         assert_eq!(out.matches(BEGIN_MARKER).count(), 1);
         assert!(out.contains("KEEP=1"));
         assert!(out.contains("KEEP=2"));
@@ -371,7 +413,7 @@ mod tests {
     #[test]
     fn remove_restores_user_content_and_is_idempotent() {
         let existing = "KEEP=1\n";
-        let with_block = upsert_block(existing, 17891);
+        let with_block = upsert_block(existing, 17891, crate::consts::GATEWAY_HOST);
         let removed = remove_block(&with_block);
         assert_eq!(removed, "KEEP=1\n");
         assert_eq!(remove_block(&removed), removed);
@@ -379,7 +421,7 @@ mod tests {
 
     #[test]
     fn remove_yields_empty_when_only_block_present() {
-        let with_block = upsert_block("", 17891);
+        let with_block = upsert_block("", 17891, crate::consts::GATEWAY_HOST);
         assert_eq!(remove_block(&with_block), "");
     }
 
@@ -396,7 +438,7 @@ mod tests {
     #[test]
     fn managed_block_wins_over_user_defined_proxy() {
         let existing = "HTTPS_PROXY=http://user-proxy:9999\n";
-        let out = upsert_block(existing, 17891);
+        let out = upsert_block(existing, 17891, crate::consts::GATEWAY_HOST);
         let user_pos = out.find("http://user-proxy:9999").expect("user line kept");
         let managed_pos = out
             .find("HTTPS_PROXY=http://127.0.0.1:17891")
@@ -408,7 +450,7 @@ mod tests {
     #[test]
     fn managed_block_wins_over_user_defined_all_proxy() {
         let existing = "ALL_PROXY=socks5://user-proxy:1080\n";
-        let out = upsert_block(existing, 17891);
+        let out = upsert_block(existing, 17891, crate::consts::GATEWAY_HOST);
         let user_pos = out
             .find("socks5://user-proxy:1080")
             .expect("user line kept");
@@ -453,7 +495,7 @@ mod tests {
     #[test]
     fn upsert_preserves_crlf_line_ending_when_existing_is_mostly_crlf() {
         let existing = "KEEP=1\r\nKEEP=2\r\n";
-        let out = upsert_block(existing, 17891);
+        let out = upsert_block(existing, 17891, crate::consts::GATEWAY_HOST);
         assert!(out.contains("KEEP=1\r\n"));
         assert!(out.contains(&format!("{BEGIN_MARKER}\r\n")));
         assert!(!out.contains("\n\n")); // 不应混入裸 LF 造成的双空行
@@ -462,9 +504,9 @@ mod tests {
 
     #[test]
     fn upsert_uses_lf_for_new_or_lf_file() {
-        let out = upsert_block("", 17891);
+        let out = upsert_block("", 17891, crate::consts::GATEWAY_HOST);
         assert!(!out.contains('\r'));
-        let out2 = upsert_block("KEEP=1\n", 17891);
+        let out2 = upsert_block("KEEP=1\n", 17891, crate::consts::GATEWAY_HOST);
         assert!(!out2.contains('\r'));
     }
 
@@ -480,7 +522,7 @@ mod tests {
     #[test]
     fn upsert_and_remove_preserve_leading_bom() {
         let existing = "\u{feff}KEEP=1\n";
-        let with_block = upsert_block(existing, 17891);
+        let with_block = upsert_block(existing, 17891, crate::consts::GATEWAY_HOST);
         assert!(with_block.starts_with('\u{feff}'));
         assert!(with_block.contains(BEGIN_MARKER));
 
@@ -491,15 +533,21 @@ mod tests {
     #[test]
     fn bom_does_not_interfere_with_marker_at_start_of_file() {
         // BOM 之后紧跟起始标记本身（无其他用户行）。
-        let existing = format!("\u{feff}{}", upsert_block("", 17891));
-        let inspection = inspect_text(&existing, 17891);
+        let existing = format!(
+            "\u{feff}{}",
+            upsert_block("", 17891, crate::consts::GATEWAY_HOST)
+        );
+        let inspection = inspect_text(&existing, 17891, crate::consts::GATEWAY_HOST);
         assert!(inspection.has_block);
         assert!(inspection.block_up_to_date);
     }
 
     #[test]
     fn remove_of_bom_only_block_returns_empty_without_bom() {
-        let existing = format!("\u{feff}{}", upsert_block("", 17891));
+        let existing = format!(
+            "\u{feff}{}",
+            upsert_block("", 17891, crate::consts::GATEWAY_HOST)
+        );
         assert_eq!(remove_block(&existing), "");
     }
 
@@ -510,7 +558,7 @@ mod tests {
         let legacy = format!(
             "{LEGACY_BEGIN_MARKER}\nHTTPS_PROXY=http://127.0.0.1:9999\n{LEGACY_END_MARKER}\n"
         );
-        let inspection = inspect_text(&legacy, 17891);
+        let inspection = inspect_text(&legacy, 17891, crate::consts::GATEWAY_HOST);
         assert!(inspection.has_legacy_block);
         assert!(!inspection.has_block);
         assert!(!inspection.block_up_to_date);
@@ -521,7 +569,7 @@ mod tests {
         let legacy = format!(
             "{LEGACY_BEGIN_MARKER}\nHTTPS_PROXY=http://127.0.0.1:9999\n{LEGACY_END_MARKER}\n"
         );
-        let with_own = upsert_block(&legacy, 17891);
+        let with_own = upsert_block(&legacy, 17891, crate::consts::GATEWAY_HOST);
         let out = remove_block(&with_own);
         // 本工具的受管块被移除，旧块原样保留。
         assert!(!out.contains(BEGIN_MARKER));
@@ -534,7 +582,7 @@ mod tests {
         let legacy = format!(
             "USER=1\n{LEGACY_BEGIN_MARKER}\nHTTPS_PROXY=http://127.0.0.1:9999\n{LEGACY_END_MARKER}\n"
         );
-        let with_own = upsert_block(&legacy, 17891);
+        let with_own = upsert_block(&legacy, 17891, crate::consts::GATEWAY_HOST);
         let out = remove_legacy_block(&with_own);
         assert!(!out.contains(LEGACY_BEGIN_MARKER));
         assert!(out.contains("USER=1"));
@@ -546,22 +594,22 @@ mod tests {
 
     #[test]
     fn inspect_text_reports_up_to_date_only_when_block_matches_and_trailing() {
-        let up_to_date = upsert_block("KEEP=1\n", 17891);
-        let report = inspect_text(&up_to_date, 17891);
+        let up_to_date = upsert_block("KEEP=1\n", 17891, crate::consts::GATEWAY_HOST);
+        let report = inspect_text(&up_to_date, 17891, crate::consts::GATEWAY_HOST);
         assert!(report.exists);
         assert!(report.has_block);
         assert!(report.block_up_to_date);
         assert!(!report.has_legacy_block);
 
         // 端口不一致：块存在，但内容与当前端口渲染结果不符。
-        let stale = inspect_text(&up_to_date, 18000);
+        let stale = inspect_text(&up_to_date, 18000, crate::consts::GATEWAY_HOST);
         assert!(stale.has_block);
         assert!(!stale.block_up_to_date);
     }
 
     #[test]
     fn inspect_text_no_block_reports_false() {
-        let report = inspect_text("KEEP=1\n", 17891);
+        let report = inspect_text("KEEP=1\n", 17891, crate::consts::GATEWAY_HOST);
         assert!(!report.has_block);
         assert!(!report.block_up_to_date);
         assert!(!report.has_legacy_block);
@@ -573,7 +621,7 @@ mod tests {
     fn inspect_file_missing_file_returns_default() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".env");
-        let report = inspect_file(&path, 17891).unwrap();
+        let report = inspect_file(&path, 17891, crate::consts::GATEWAY_HOST).unwrap();
         assert_eq!(report, EnvInspection::default());
     }
 
@@ -581,15 +629,15 @@ mod tests {
     fn write_block_to_file_creates_parent_dir_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join(".env");
-        assert!(write_block_to_file(&path, 17891).unwrap());
+        assert!(write_block_to_file(&path, 17891, crate::consts::GATEWAY_HOST).unwrap());
         let content = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(content, render_block(17891));
+        assert_eq!(content, render_block(17891, crate::consts::GATEWAY_HOST));
 
         // 内容无变化时不写（第二次返回 false）。
-        assert!(!write_block_to_file(&path, 17891).unwrap());
+        assert!(!write_block_to_file(&path, 17891, crate::consts::GATEWAY_HOST).unwrap());
 
         // 端口变化时才真正重写。
-        assert!(write_block_to_file(&path, 18000).unwrap());
+        assert!(write_block_to_file(&path, 18000, crate::consts::GATEWAY_HOST).unwrap());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("18000"));
     }
@@ -599,7 +647,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".env");
         std::fs::write(&path, "KEEP=1\n").unwrap();
-        assert!(write_block_to_file(&path, 17891).unwrap());
+        assert!(write_block_to_file(&path, 17891, crate::consts::GATEWAY_HOST).unwrap());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.starts_with("KEEP=1\n"));
         assert!(content.contains(BEGIN_MARKER));
@@ -609,7 +657,7 @@ mod tests {
     fn remove_block_from_file_deletes_file_when_only_whitespace_remains() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".env");
-        write_block_to_file(&path, 17891).unwrap();
+        write_block_to_file(&path, 17891, crate::consts::GATEWAY_HOST).unwrap();
         assert!(path.exists());
 
         assert!(remove_block_from_file(&path).unwrap());
@@ -621,7 +669,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".env");
         std::fs::write(&path, "KEEP=1\n").unwrap();
-        write_block_to_file(&path, 17891).unwrap();
+        write_block_to_file(&path, 17891, crate::consts::GATEWAY_HOST).unwrap();
 
         assert!(remove_block_from_file(&path).unwrap());
         assert!(path.exists());
@@ -644,7 +692,7 @@ mod tests {
             "USER=1\n{LEGACY_BEGIN_MARKER}\nHTTPS_PROXY=http://127.0.0.1:9999\n{LEGACY_END_MARKER}\n"
         );
         std::fs::write(&path, legacy).unwrap();
-        write_block_to_file(&path, 17891).unwrap();
+        write_block_to_file(&path, 17891, crate::consts::GATEWAY_HOST).unwrap();
 
         assert!(remove_legacy_block_from_file(&path).unwrap());
         let content = std::fs::read_to_string(&path).unwrap();
@@ -677,13 +725,13 @@ mod tests {
     #[test]
     fn inspect_detects_incomplete_blocks_as_residue() {
         let current = format!("KEEP=1\n{BEGIN_MARKER}\nHTTPS_PROXY=http://127.0.0.1:17891\n");
-        let inspection = inspect_text(&current, 17891);
+        let inspection = inspect_text(&current, 17891, crate::consts::GATEWAY_HOST);
         assert!(inspection.has_block);
         assert!(!inspection.block_up_to_date);
 
         let legacy = format!("{LEGACY_BEGIN_MARKER}\nHTTP_PROXY=http://127.0.0.1:1\n");
-        assert!(inspect_text(&legacy, 17891).has_legacy_block);
+        assert!(inspect_text(&legacy, 17891, crate::consts::GATEWAY_HOST).has_legacy_block);
         let orphan_end = format!("KEEP=1\n{LEGACY_END_MARKER}\n");
-        assert!(inspect_text(&orphan_end, 17891).has_legacy_block);
+        assert!(inspect_text(&orphan_end, 17891, crate::consts::GATEWAY_HOST).has_legacy_block);
     }
 }
