@@ -18,7 +18,7 @@ use helper_core::log;
 use helper_core::manager::Manager;
 use helper_core::types::{
     ConnectionRecord, EnableRequest, ErrorPayload, ManagerError, ReconcileReport, SaveKeyRequest,
-    Status,
+    SetEndpointsOutcome, SetEndpointsRequest, Status,
 };
 use serde_json::json;
 use tauri::AppHandle;
@@ -198,6 +198,44 @@ pub async fn set_autostart(
     }
     let result = state.manager.set_autostart_flag(enabled).await;
     state.finish(result).await
+}
+
+/// 保存模型网关与上游 SOCKS5。解析与警告由 Manager 完成；成功或失败都推送当前状态。
+#[tauri::command]
+pub async fn set_endpoints(
+    state: tauri::State<'_, AppState>,
+    request: SetEndpointsRequest,
+) -> Result<SetEndpointsOutcome, ErrorPayload> {
+    match state.manager.set_endpoints(request).await {
+        Ok(outcome) => {
+            state.publish(&outcome.status);
+            Ok(outcome)
+        }
+        Err(error) => {
+            let status = state.manager.status().await;
+            state.publish(&status);
+            Err(error.into())
+        }
+    }
+}
+
+/// 打开或关闭本地代理。不在命令层再探测可达性，Manager 已在锁内刷新。
+#[tauri::command]
+pub async fn set_proxy_enabled(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<SetEndpointsOutcome, ErrorPayload> {
+    match state.manager.set_proxy_enabled(enabled).await {
+        Ok(outcome) => {
+            state.publish(&outcome.status);
+            Ok(outcome)
+        }
+        Err(error) => {
+            let status = state.manager.status().await;
+            state.publish(&status);
+            Err(error.into())
+        }
+    }
 }
 
 /// 最近连接（最新在前，最多 50 条）。

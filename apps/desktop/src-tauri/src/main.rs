@@ -75,6 +75,8 @@ fn main() {
             commands::cleanup_residue,
             commands::remove_legacy_env_block,
             commands::set_autostart,
+            commands::set_endpoints,
+            commands::set_proxy_enabled,
             commands::recent_connections,
             commands::get_reconcile_report,
             commands::detect_dev_env,
