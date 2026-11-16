@@ -85,10 +85,20 @@ impl AppState {
     /// 改变状态的操作收尾：成功推送返回的状态；失败时操作可能已部分生效（如停用尽力完成其余步骤），
     /// 同样推送实际状态，保证界面与托盘一致，再把错误交给前端。
     async fn finish(&self, result: Result<Status, ManagerError>) -> Result<Status, ErrorPayload> {
+        self.finish_with(result, |status| status).await
+    }
+
+    /// [`Self::finish`] 的通用版：结果里带着状态快照的操作（如 `SetEndpointsOutcome`）由
+    /// `status_of` 取出要推送的状态。
+    async fn finish_with<T>(
+        &self,
+        result: Result<T, ManagerError>,
+        status_of: impl Fn(&T) -> &Status,
+    ) -> Result<T, ErrorPayload> {
         match result {
-            Ok(status) => {
-                self.publish(&status);
-                Ok(status)
+            Ok(value) => {
+                self.publish(status_of(&value));
+                Ok(value)
             }
             Err(error) => {
                 let status = self.manager.status().await;
@@ -206,36 +216,22 @@ pub async fn set_endpoints(
     state: tauri::State<'_, AppState>,
     request: SetEndpointsRequest,
 ) -> Result<SetEndpointsOutcome, ErrorPayload> {
-    match state.manager.set_endpoints(request).await {
-        Ok(outcome) => {
-            state.publish(&outcome.status);
-            Ok(outcome)
-        }
-        Err(error) => {
-            let status = state.manager.status().await;
-            state.publish(&status);
-            Err(error.into())
-        }
-    }
+    let result = state.manager.set_endpoints(request).await;
+    state
+        .finish_with(result, |outcome: &SetEndpointsOutcome| &outcome.status)
+        .await
 }
 
-/// 打开或关闭本地代理。不在命令层再探测可达性，Manager 已在锁内刷新。
+/// 打开或关闭本地代理。不在命令层再探测可达性，Manager 已经刷新过。
 #[tauri::command]
 pub async fn set_proxy_enabled(
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<SetEndpointsOutcome, ErrorPayload> {
-    match state.manager.set_proxy_enabled(enabled).await {
-        Ok(outcome) => {
-            state.publish(&outcome.status);
-            Ok(outcome)
-        }
-        Err(error) => {
-            let status = state.manager.status().await;
-            state.publish(&status);
-            Err(error.into())
-        }
-    }
+    let result = state.manager.set_proxy_enabled(enabled).await;
+    state
+        .finish_with(result, |outcome: &SetEndpointsOutcome| &outcome.status)
+        .await
 }
 
 /// 最近连接（最新在前，最多 50 条）。

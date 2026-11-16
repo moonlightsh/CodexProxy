@@ -153,6 +153,8 @@ struct Runtime {
 struct EndpointChange {
     old: Endpoints,
     new: Endpoints,
+    /// 本次是否实际改写了 `config.toml` 或 `.env`
+    files_changed: bool,
 }
 
 impl Manager {
@@ -402,6 +404,10 @@ impl Manager {
             )
             .await;
             let mut runtime = self.runtime();
+            // 探测期间端点已被 set_endpoints 换掉：丢弃这份针对旧地址的过期结果。
+            if runtime.endpoints != endpoints {
+                return;
+            }
             runtime.gateway = reachability(gateway);
             runtime.socks5 = Reachability::Disabled;
             return;
@@ -419,6 +425,9 @@ impl Manager {
             ),
         );
         let mut runtime = self.runtime();
+        if runtime.endpoints != endpoints {
+            return;
+        }
         runtime.gateway = reachability(gateway);
         runtime.socks5 = reachability(socks5);
     }
@@ -451,7 +460,16 @@ impl Manager {
             let env_changed = if next.enabled {
                 let gateway_host = self.runtime().endpoints.gateway_host.clone();
                 if enabled {
-                    self.ensure_proxy(&mut ops).await?;
+                    // 代理没起来就不能显示为“已启用”：回滚开关偏好，保持“关闭”且 .env 无受管块。
+                    if let Err(error) = self.ensure_proxy(&mut ops).await {
+                        if let Err(rollback) = save_state(paths, &snapshot.state) {
+                            log::event(
+                                "manager.set_proxy_enabled_rollback_failed",
+                                json!({ "code": rollback.code() }),
+                            );
+                        }
+                        return Err(error);
+                    }
                     self.sync_managed_env(false, &gateway_host)?
                 } else {
                     let changed = self.sync_managed_env(true, &gateway_host)?;
@@ -461,9 +479,10 @@ impl Manager {
             } else {
                 false
             };
-            self.probe_reachability_into_runtime().await;
             (next.enabled, env_changed, was_external)
         };
+        // 网络探测不持操作锁（最长 3 秒，不阻塞启用、停用、退出等操作）。
+        self.probe_reachability_into_runtime().await;
         let mut warnings = Vec::new();
         if managed && env_changed {
             warnings.push(EndpointWarning::RestartCodex);
@@ -484,8 +503,8 @@ impl Manager {
         req: SetEndpointsRequest,
     ) -> Result<SetEndpointsOutcome, ManagerError> {
         let changed = {
-            let _ops = self.ops.lock().await;
-            match self.apply_endpoints_locked(&req).await {
+            let mut ops = self.ops.lock().await;
+            match self.apply_endpoints_locked(&mut ops, &req).await {
                 Ok(changed) => changed,
                 Err(error) => {
                     log::event("manager.set_endpoints", json!({ "code": error.code() }));
@@ -493,27 +512,13 @@ impl Manager {
                 }
             }
         };
-        let Some(changed) = changed else {
-            let endpoints = self.runtime().endpoints.clone();
-            let socks = endpoints.socks5_addr();
-            log::event(
-                "manager.set_endpoints",
-                json!({
-                    "from_gateway": endpoints.gateway_base_url,
-                    "to_gateway": endpoints.gateway_base_url,
-                    "from_socks5": socks,
-                    "to_socks5": socks,
-                }),
-            );
-            return Ok(SetEndpointsOutcome {
-                status: self.build_status(),
-                warnings: Vec::new(),
-            });
-        };
+        // 网络探测不持操作锁（最长 3 秒，不阻塞启用、停用、退出等操作）。
+        self.probe_reachability_into_runtime().await;
 
         let status = self.build_status();
         let mut warnings = Vec::new();
-        if changed.new.gateway_base_url != changed.old.gateway_base_url {
+        let gateway_changed = changed.new.gateway_base_url != changed.old.gateway_base_url;
+        if gateway_changed {
             match self.options.credentials.read() {
                 Ok(Some(secret)) => {
                     match gateway::verify_key_at(
@@ -533,9 +538,10 @@ impl Manager {
                 Ok(None) => {}
                 Err(_) => warnings.push(EndpointWarning::KeyCheckUnavailable),
             }
-            if status.enabled {
-                warnings.push(EndpointWarning::RestartCodex);
-            }
+        }
+        // 网关变了，或本次实际改写了 config.toml / .env（例如上次校正失败后重试）：Codex 需重启。
+        if status.enabled && (gateway_changed || changed.files_changed) {
+            warnings.push(EndpointWarning::RestartCodex);
         }
         let new_socks = changed.new.socks5_addr();
         let old_socks = changed.old.socks5_addr();
@@ -558,11 +564,16 @@ impl Manager {
         Ok(SetEndpointsOutcome { status, warnings })
     }
 
-    /// 锁内步骤 1–5。完全相同则返回 `None`，不写文件。
+    /// 锁内步骤 1–4（可达性探测在锁外）。
+    ///
+    /// 不以“解析结果等于内存端点”为由提前返回：内存端点可能是坏 state 回落后的默认值
+    /// （此时“恢复默认”必须能清掉坏值），也可能是上次校正失败后已生效、但文件未校正的新值
+    /// （此时用同样的值重试必须重新校正）。state 只在内容变化时写；文件校正本身幂等。
     async fn apply_endpoints_locked(
         &self,
+        ops: &mut Ops,
         req: &SetEndpointsRequest,
-    ) -> Result<Option<EndpointChange>, ManagerError> {
+    ) -> Result<EndpointChange, ManagerError> {
         let defaults = &self.options.default_endpoints;
         let gateway_input = req
             .gateway_base_url
@@ -579,9 +590,6 @@ impl Manager {
             }
         })?;
         let old = self.runtime().endpoints.clone();
-        if parsed == old {
-            return Ok(None);
-        }
 
         let paths = &self.options.paths;
         let mut snapshot = read_state(&paths.state_file())?;
@@ -598,11 +606,14 @@ impl Manager {
         } else {
             Some(socks_display)
         };
-        save_state(paths, &next)?;
-        self.runtime().endpoints = parsed.clone();
-        *self.routing.write().unwrap_or_else(PoisonError::into_inner) =
-            Routing::from_endpoints(&parsed);
+        if next != snapshot.state {
+            save_state(paths, &next)?;
+        }
+        if parsed != old {
+            self.install_endpoints(&parsed);
+        }
 
+        let mut files_changed = false;
         if next.enabled {
             let config_path = paths.config_toml();
             let command = if self.transient_install() {
@@ -615,19 +626,34 @@ impl Manager {
             } else {
                 self.options.credential_command.clone()
             };
-            codex_config::apply_managed(
+            let outcome = codex_config::apply_managed(
                 &config_path,
                 &paths.config_backup(),
                 &command,
                 &parsed.gateway_base_url,
             )
             .map_err(|error| config_error(error, &config_path))?;
-            // 代理关闭时删除受管块且不启动代理；开启时只写块（热更新不重启监听）。
-            self.sync_managed_env(next.proxy_disabled, &parsed.gateway_host)?;
+            files_changed |= outcome.changed;
+            // 与对账一致：先确保代理可用，再让 .env 指向它；绝不让 .env 指向无人监听的端口。
+            // 代理已在运行时 ensure_proxy 直接复用（热更新不重启监听）。代理关闭时只删受管块。
+            if !next.proxy_disabled {
+                self.ensure_proxy(ops).await?;
+            }
+            files_changed |= self.sync_managed_env(next.proxy_disabled, &parsed.gateway_host)?;
         }
 
-        self.probe_reachability_into_runtime().await;
-        Ok(Some(EndpointChange { old, new: parsed }))
+        Ok(EndpointChange {
+            old,
+            new: parsed,
+            files_changed,
+        })
+    }
+
+    /// 让新端点同时进入运行时（状态、配置校正、可达性）与代理路由（新连接）。两者必须一起变。
+    fn install_endpoints(&self, endpoints: &Endpoints) {
+        self.runtime().endpoints = endpoints.clone();
+        *self.routing.write().unwrap_or_else(PoisonError::into_inner) =
+            Routing::from_endpoints(endpoints);
     }
 
     /// 最近连接（最新在前，最多 50 条）。
@@ -1535,9 +1561,7 @@ impl Manager {
             Err(_) => return,
         };
         let endpoints = Endpoints::resolve(&state, &self.options.default_endpoints);
-        self.runtime().endpoints = endpoints.clone();
-        *self.routing.write().unwrap_or_else(PoisonError::into_inner) =
-            Routing::from_endpoints(&endpoints);
+        self.install_endpoints(&endpoints);
     }
 
     /// 检查 config.toml：无法解析、根键类型不符或受管结构不是 table 时返回 `ConfigInvalid`。

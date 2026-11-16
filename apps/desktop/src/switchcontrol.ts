@@ -27,6 +27,8 @@ export interface ToggleView {
   onText: string;
   offText: string;
   busyText: string;
+  /** 额外的禁用条件（忙时总是禁用）；缺省为 false */
+  disabled?: boolean;
 }
 
 export interface ToggleControl {
@@ -65,7 +67,7 @@ export function createToggle(handlers: { onChange: (enabled: boolean) => void })
     } else {
       button.removeAttribute("aria-busy");
     }
-    button.disabled = view.busy;
+    button.disabled = view.busy || view.disabled === true;
   };
 
   return { root, update };
@@ -89,12 +91,9 @@ export function createSwitchRegion(handlers: SwitchHandlers): SwitchRegion {
       onText: "已启用",
       offText: "已停用",
       busyText: busyState.enabling ? "启用中…" : "停用中…",
+      // 未配置 Key 且未启用时不能打开受管开关
+      disabled: !(status.enabled || status.keyConfigured),
     });
-    // 未配置 Key 且未启用时不能打开受管开关；createToggle 只按 busy 禁用。
-    const button = toggle.root.querySelector("button");
-    if (button instanceof HTMLButtonElement) {
-      button.disabled = busy || !(status.enabled || status.keyConfigured);
-    }
   };
 
   return { root: toggle.root, update };

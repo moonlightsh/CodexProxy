@@ -3489,3 +3489,138 @@ async fn enable_with_proxy_disabled_skips_env_and_proxy() {
     assert!(!proxy::probe_existing(sandbox.port).await);
     manager.shutdown().await;
 }
+
+// ---- 代码评审回归：set_endpoints / set_proxy_enabled 的边界 ----
+
+/// 静默占用端口（不自识应答）：`probe_existing` 不命中，代理 bind 失败。
+async fn occupy_port_silently(port: u16) -> tokio::task::JoinHandle<()> {
+    let foreign = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("夹具应能占用 sandbox 端口");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = foreign.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer).await;
+            });
+        }
+    })
+}
+
+/// state 里存了无法解析的网关（运行时已回落默认值）：“恢复默认”必须真的清掉它。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_default_clears_unparseable_stored_endpoint() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_state(&HelperState {
+        gateway_base_url: Some("ftp://bad".into()),
+        ..Default::default()
+    });
+    let manager = sandbox.manager();
+    let before = manager.status().await;
+    assert!(before.endpoints_customized, "坏值仍算已自定义，按钮可点");
+    assert_eq!(before.gateway_base_url, sandbox.gateway_url);
+
+    let outcome = manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: None,
+            socks5_addr: None,
+        })
+        .await
+        .expect("恢复默认应成功");
+    assert!(!outcome.status.endpoints_customized);
+    assert_eq!(sandbox.state().unwrap().gateway_base_url, None);
+    manager.shutdown().await;
+}
+
+/// 上次校正 config.toml 失败（state 已是新值）：修好文件后用同样的值重试，必须重新校正。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_same_endpoints_after_failed_apply_rewrites_config() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.expect("启用应成功");
+    sandbox.write_config("model_providers = 1\n");
+    let request = SetEndpointsRequest {
+        gateway_base_url: Some("http://127.0.0.1:9/other".into()),
+        socks5_addr: Some(format!("127.0.0.1:{}", sandbox.socks5_port)),
+    };
+    manager
+        .set_endpoints(request.clone())
+        .await
+        .expect_err("结构不符应失败");
+
+    sandbox.write_config(USER_CONFIG);
+    let outcome = manager
+        .set_endpoints(request)
+        .await
+        .expect("修好文件后重试应成功");
+    let doc: toml_edit::DocumentMut = sandbox.read_config().parse().unwrap();
+    assert_eq!(
+        doc["model_providers"]["managed_gateway"]["base_url"].as_str(),
+        Some("http://127.0.0.1:9/other")
+    );
+    assert!(outcome.status.config_managed);
+    // 网关没变（上次已生效），但本次改写了 config.toml，仍需提示重启 Codex
+    assert_eq!(outcome.warnings, vec![EndpointWarning::RestartCodex]);
+    manager.shutdown().await;
+}
+
+/// 本地代理没在运行且起不来：保存地址不得把 .env 指向无人监听（或被外人占用）的端口。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_endpoints_does_not_point_env_at_dead_proxy() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    {
+        let first = sandbox.manager();
+        first.enable(with_key(KEY)).await.expect("启用应成功");
+        first.shutdown().await;
+    }
+    // 模拟启动对账时代理没起来：.env 里没有受管块，端口被无关程序占用
+    sandbox.write_env(USER_ENV);
+    let foreign = occupy_port_silently(sandbox.port).await;
+    let manager = sandbox.manager();
+
+    let error = manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: Some("http://127.0.0.1:9/other".into()),
+            socks5_addr: Some(format!("127.0.0.1:{}", sandbox.socks5_port)),
+        })
+        .await
+        .expect_err("代理起不来时应报错");
+    assert_eq!(error.code(), "portUnavailable", "{error}");
+    let env = std::fs::read_to_string(sandbox.env()).unwrap_or_default();
+    assert!(
+        !env.contains(codex_env::BEGIN_MARKER),
+        ".env 不应指向死端口"
+    );
+    foreign.abort();
+    manager.shutdown().await;
+}
+
+/// 重新打开代理但端口被占：开关偏好回滚为“关闭”，.env 不写受管块。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enable_proxy_rolls_back_when_port_unavailable() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.expect("启用应成功");
+    manager.set_proxy_enabled(false).await.expect("先关闭代理");
+    let foreign = occupy_port_silently(sandbox.port).await;
+
+    let error = manager
+        .set_proxy_enabled(true)
+        .await
+        .expect_err("端口被占时打开代理应失败");
+    assert_eq!(error.code(), "portUnavailable", "{error}");
+    assert!(sandbox.state().unwrap().proxy_disabled, "偏好应回滚为关闭");
+    let status = manager.status().await;
+    assert!(!status.proxy_enabled);
+    let env = std::fs::read_to_string(sandbox.env()).unwrap_or_default();
+    assert!(!env.contains(codex_env::BEGIN_MARKER));
+    foreign.abort();
+    manager.shutdown().await;
+}
