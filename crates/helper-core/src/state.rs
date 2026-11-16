@@ -49,6 +49,8 @@ pub struct HelperState {
     pub gateway_base_url: Option<String>,
     /// 用户配置的上游 SOCKS5 地址（host:port）；None = 使用默认值
     pub socks5_addr: Option<String>,
+    /// 用户关闭了本地代理（缺省 false = 开启）
+    pub proxy_disabled: bool,
 }
 
 impl HelperState {
@@ -159,6 +161,7 @@ mod tests {
             secure_blocked_reason: Some("policy_expired".into()),
             gateway_base_url: None,
             socks5_addr: None,
+            proxy_disabled: false,
         };
         save(&path, &state).unwrap();
         let loaded = load(&path).unwrap().unwrap();
@@ -386,5 +389,32 @@ mod tests {
         assert!(text.contains("\"socks5_addr\""));
         assert!(!text.contains("gatewayBaseUrl"));
         assert!(!text.contains("socks5Addr"));
+    }
+
+    /// 旧状态文件没有代理开关时，缺省为开启（proxy_disabled == false）。
+    #[test]
+    fn old_state_json_defaults_proxy_disabled_to_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, r#"{"enabled": true}"#).unwrap();
+        let state = load(&path).unwrap().unwrap();
+        assert!(!state.proxy_disabled);
+        assert!(state.enabled);
+    }
+
+    /// proxy_disabled 以 snake_case 往返。
+    #[test]
+    fn proxy_disabled_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state = HelperState {
+            proxy_disabled: true,
+            ..Default::default()
+        };
+        save(&path, &state).unwrap();
+        let loaded = load(&path).unwrap().unwrap();
+        assert!(loaded.proxy_disabled);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"proxy_disabled\": true"));
     }
 }

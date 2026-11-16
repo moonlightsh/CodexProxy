@@ -387,8 +387,25 @@ impl Manager {
     }
 
     /// 按当前 `runtime.endpoints` 探测网关与 SOCKS5。探测期间不持短锁。
+    /// 代理开关关闭时不连接 SOCKS5，把可达性记为 `Disabled`。
     async fn probe_reachability_into_runtime(&self) {
         let endpoints = self.runtime().endpoints.clone();
+        let proxy_disabled = match read_state(&self.options.paths.state_file()) {
+            Ok(snapshot) => snapshot.state.proxy_disabled,
+            Err(_) => false,
+        };
+        if proxy_disabled {
+            let gateway = gateway::tcp_reachable(
+                &endpoints.gateway_host,
+                endpoints.gateway_port,
+                gateway::TCP_PROBE_TIMEOUT,
+            )
+            .await;
+            let mut runtime = self.runtime();
+            runtime.gateway = reachability(gateway);
+            runtime.socks5 = Reachability::Disabled;
+            return;
+        }
         let (gateway, socks5) = tokio::join!(
             gateway::tcp_reachable(
                 &endpoints.gateway_host,
@@ -404,6 +421,60 @@ impl Manager {
         let mut runtime = self.runtime();
         runtime.gateway = reachability(gateway);
         runtime.socks5 = reachability(socks5);
+    }
+
+    /// 打开或关闭本地代理。偏好写入 state；受管开启时才启动/停止代理并写或删 `.env`。
+    pub async fn set_proxy_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<SetEndpointsOutcome, ManagerError> {
+        let (managed, env_changed, was_external) = {
+            let mut ops = self.ops.lock().await;
+            let paths = &self.options.paths;
+            let mut snapshot = read_state(&paths.state_file())?;
+            quarantine_corrupt_state(paths, &mut snapshot);
+            if enabled == !snapshot.state.proxy_disabled {
+                return Ok(SetEndpointsOutcome {
+                    status: self.build_status(),
+                    warnings: Vec::new(),
+                });
+            }
+            if !enabled
+                && (snapshot.state.mode == ProxyMode::Secure || self.mode() == ProxyMode::Secure)
+            {
+                return Err(ManagerError::SecureRequiresProxy);
+            }
+            let was_external = self.proxy_state() == ProxyState::External;
+            let mut next = snapshot.state.clone();
+            next.proxy_disabled = !enabled;
+            save_state(paths, &next)?;
+            let env_changed = if next.enabled {
+                let gateway_host = self.runtime().endpoints.gateway_host.clone();
+                if enabled {
+                    self.ensure_proxy(&mut ops).await?;
+                    self.sync_managed_env(false, &gateway_host)?
+                } else {
+                    let changed = self.sync_managed_env(true, &gateway_host)?;
+                    self.stop_proxy(&mut ops).await;
+                    changed
+                }
+            } else {
+                false
+            };
+            self.probe_reachability_into_runtime().await;
+            (next.enabled, env_changed, was_external)
+        };
+        let mut warnings = Vec::new();
+        if managed && env_changed {
+            warnings.push(EndpointWarning::RestartCodex);
+        }
+        if !enabled && was_external {
+            warnings.push(EndpointWarning::ExternalProxy);
+        }
+        Ok(SetEndpointsOutcome {
+            status: self.build_status(),
+            warnings,
+        })
     }
 
     /// 保存网关与上游 SOCKS5。非法输入不落盘；配置校正失败时保留已写入的 state。
@@ -468,7 +539,11 @@ impl Manager {
         }
         let new_socks = changed.new.socks5_addr();
         let old_socks = changed.old.socks5_addr();
-        if status.proxy.state == ProxyState::External && new_socks != old_socks {
+        // 设计 §3.3：只有代理开关开着、且本地代理是外部实例时，SOCKS5 变更才提示 ExternalProxy。
+        if status.proxy_enabled
+            && status.proxy.state == ProxyState::External
+            && new_socks != old_socks
+        {
             warnings.push(EndpointWarning::ExternalProxy);
         }
         log::event(
@@ -547,13 +622,8 @@ impl Manager {
                 &parsed.gateway_base_url,
             )
             .map_err(|error| config_error(error, &config_path))?;
-            let env_path = paths.env_file();
-            codex_env::write_block_to_file(
-                &env_path,
-                self.options.proxy_port,
-                &parsed.gateway_host,
-            )
-            .map_err(|error| io_error(&env_path, error))?;
+            // 代理关闭时删除受管块且不启动代理；开启时只写块（热更新不重启监听）。
+            self.sync_managed_env(next.proxy_disabled, &parsed.gateway_host)?;
         }
 
         self.probe_reachability_into_runtime().await;
@@ -712,24 +782,23 @@ impl Manager {
         .map_err(|error| step(config_error(error, &config_path)))?;
         undo.config = Some(outcome);
 
-        // 5. 启动代理并自检（先启代理再写 .env，避免 .env 指向无人监听的端口）
-        let before = self.proxy_state();
-        let started = self
-            .ensure_proxy(ops)
-            .await
-            .map_err(StepError::at("start_proxy"))?;
-        undo.proxy = Some(ProxyUndo { before, started });
-
-        // 6. 写 .env 受管块
+        // 5–6. 代理开启：先启动再写 .env。代理关闭：不启动，删掉已有受管块。
         let step = StepError::at("write_env");
         let env_path = paths.env_file();
         let env_before = read_raw(&env_path).map_err(|error| step(io_error(&env_path, error)))?;
-        let changed = codex_env::write_block_to_file(
-            &env_path,
-            self.options.proxy_port,
-            &endpoints.gateway_host,
-        )
-        .map_err(|error| step(io_error(&env_path, error)))?;
+        let changed = if next.proxy_disabled {
+            self.sync_managed_env(true, &endpoints.gateway_host)
+                .map_err(step)?
+        } else {
+            let before = self.proxy_state();
+            let started = self
+                .ensure_proxy(ops)
+                .await
+                .map_err(StepError::at("start_proxy"))?;
+            undo.proxy = Some(ProxyUndo { before, started });
+            self.sync_managed_env(false, &endpoints.gateway_host)
+                .map_err(step)?
+        };
         if changed {
             undo.env = Some(env_before);
         }
@@ -918,12 +987,34 @@ impl Manager {
             &endpoints.gateway_base_url,
         )
         .map_err(|error| config_error(error, &config_path))?;
-        // 端口被他人占用时在这里失败，已存在的 .env 不被改动
-        self.ensure_proxy(ops).await?;
-        let env_path = paths.env_file();
-        codex_env::write_block_to_file(&env_path, self.options.proxy_port, &endpoints.gateway_host)
-            .map_err(|error| io_error(&env_path, error))?;
+        if snapshot.state.proxy_disabled {
+            // 不复用端口上的外部实例，也不启动本进程代理。
+            self.sync_managed_env(true, &endpoints.gateway_host)?;
+            if ops.proxy.is_some() {
+                self.stop_proxy(ops).await;
+            }
+        } else {
+            // 端口被他人占用时在这里失败，已存在的 .env 不被改动
+            self.ensure_proxy(ops).await?;
+            self.sync_managed_env(false, &endpoints.gateway_host)?;
+        }
         Ok(ReconcileOutcome::Applied)
+    }
+
+    /// 受管开启时按代理开关写或删 `.env`。返回文件是否有改动。不启动或停止代理。
+    fn sync_managed_env(
+        &self,
+        proxy_disabled: bool,
+        gateway_host: &str,
+    ) -> Result<bool, ManagerError> {
+        let env_path = self.options.paths.env_file();
+        let changed = if proxy_disabled {
+            codex_env::remove_block_from_file(&env_path)
+        } else {
+            codex_env::write_block_to_file(&env_path, self.options.proxy_port, gateway_host)
+        }
+        .map_err(|error| io_error(&env_path, error))?;
+        Ok(changed)
     }
 
     // ---- 代理 ----
@@ -1119,6 +1210,9 @@ impl Manager {
         let paths = &self.options.paths;
         let mut snapshot = read_state(&paths.state_file())?;
         quarantine_corrupt_state(paths, &mut snapshot);
+        if snapshot.state.proxy_disabled {
+            return Err(ManagerError::SecureRequiresProxy);
+        }
 
         // 1. 读取并解析注册包（读文件失败 → Io）
         let bundle_bytes = std::fs::read(bundle_path).map_err(|error| ManagerError::Io {
@@ -1518,6 +1612,7 @@ impl Manager {
             update_supported: cfg!(any(windows, target_os = "macos")),
             install_location_ok: !self.transient_install(),
             enabled: state.enabled,
+            proxy_enabled: !state.proxy_disabled,
             key_configured,
             needs_key: state.enabled && !key_configured,
             proxy: ProxyStatus {
@@ -1531,7 +1626,11 @@ impl Manager {
             gateway_base_url: runtime.endpoints.gateway_base_url.clone(),
             endpoints_customized: state.gateway_base_url.is_some() || state.socks5_addr.is_some(),
             config_managed: inspection.fully_managed,
-            env_managed: env.block_up_to_date,
+            env_managed: if state.enabled && state.proxy_disabled {
+                !env.has_block
+            } else {
+                env.block_up_to_date
+            },
             residue: !state.enabled && (config_residue || env.has_block),
             legacy_env_block: env.has_legacy_block,
             model_catalog_json: inspection.model_catalog_json,

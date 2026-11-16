@@ -315,6 +315,8 @@ mod tests {
                 state: ProxyState::Running,
                 port: 23456,
             },
+            // 开关缺省为关；这条用例要的是“代理在跑且开关开着”。
+            proxy_enabled: true,
             ..Default::default()
         };
         assert_eq!(

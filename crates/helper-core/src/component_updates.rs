@@ -507,29 +507,39 @@ const DIRECT_STOPPED: &str = "本地代理未运行，已直连";
 
 /// 按 Manager 状态快照决定网络路径（C4）。
 ///
-/// 只看 `status.mode`（状态文件模式）与 `status.proxy.state`，Secure 下再看 `secure.blocked_reason`
-/// 选文案；**不读 `secure.active`**——Secure 被阻断时 state 为 Stopped，按 active 判定会错误直连。
-/// Secure 模式下非 Running 一律零出站，绝不直连。
+/// 先看 `status.mode`：Secure 且非 Running 一律阻断，不因 `proxy_enabled` 为假而直连。
+/// Legacy 在代理开关关闭时返回单独的直连原因。**不读 `secure.active`**。
 pub fn network_path_for(status: &Status) -> NetworkPath {
-    let via_proxy = || NetworkPath::ViaProxy {
-        proxy_url: format!("http://127.0.0.1:{}", status.proxy.port),
-    };
-    match (status.mode, status.proxy.state) {
-        (_, ProxyState::Running) => via_proxy(),
-        (ProxyMode::Secure, ProxyState::External) => NetworkPath::Blocked {
-            detail: BLOCKED_PORT_OCCUPIED,
-        },
-        (ProxyMode::Secure, ProxyState::Stopped) => NetworkPath::Blocked {
-            detail: if status.secure.blocked_reason.as_deref() == Some("port_occupied") {
-                BLOCKED_PORT_OCCUPIED
-            } else {
-                BLOCKED_NOT_RUNNING
+    if status.mode == ProxyMode::Secure {
+        return match status.proxy.state {
+            ProxyState::Running => NetworkPath::ViaProxy {
+                proxy_url: format!("http://127.0.0.1:{}", status.proxy.port),
             },
+            ProxyState::External => NetworkPath::Blocked {
+                detail: BLOCKED_PORT_OCCUPIED,
+            },
+            ProxyState::Stopped => NetworkPath::Blocked {
+                detail: if status.secure.blocked_reason.as_deref() == Some("port_occupied") {
+                    BLOCKED_PORT_OCCUPIED
+                } else {
+                    BLOCKED_NOT_RUNNING
+                },
+            },
+        };
+    }
+    if !status.proxy_enabled {
+        return NetworkPath::Direct {
+            reason: Some("本地代理未开启，已直连"),
+        };
+    }
+    match status.proxy.state {
+        ProxyState::Running => NetworkPath::ViaProxy {
+            proxy_url: format!("http://127.0.0.1:{}", status.proxy.port),
         },
-        (ProxyMode::Legacy, ProxyState::External) => NetworkPath::Direct {
+        ProxyState::External => NetworkPath::Direct {
             reason: Some(DIRECT_EXTERNAL),
         },
-        (ProxyMode::Legacy, ProxyState::Stopped) => NetworkPath::Direct {
+        ProxyState::Stopped => NetworkPath::Direct {
             reason: Some(DIRECT_STOPPED),
         },
     }
@@ -1556,6 +1566,8 @@ mod tests {
         Status {
             mode,
             proxy: crate::types::ProxyStatus { state, port },
+            // Default 的 proxy_enabled 是 false；既有用例表示“开关开着”。
+            proxy_enabled: true,
             ..Default::default()
         }
     }
@@ -1630,6 +1642,37 @@ mod tests {
             network_path_for(&status(ProxyMode::Legacy, ProxyState::Stopped, 17891)),
             NetworkPath::Direct {
                 reason: Some("本地代理未运行，已直连")
+            }
+        );
+    }
+
+    /// 代理开关关闭时走自己的直连原因；Secure 未运行仍阻断，不因开关而直连。
+    #[test]
+    fn proxy_switch_off_is_direct_with_its_own_reason() {
+        let stopped = status(ProxyMode::Legacy, ProxyState::Stopped, 17891);
+        assert_eq!(
+            network_path_for(&stopped),
+            NetworkPath::Direct {
+                reason: Some("本地代理未运行，已直连")
+            }
+        );
+        let mut off = stopped;
+        off.proxy_enabled = false;
+        let off_reason = "本地代理未开启，已直连";
+        assert_eq!(
+            network_path_for(&off),
+            NetworkPath::Direct {
+                reason: Some(off_reason)
+            }
+        );
+        assert_ne!(off_reason, "本地代理未运行，已直连");
+
+        let mut secure = status(ProxyMode::Secure, ProxyState::Stopped, 17891);
+        secure.proxy_enabled = false;
+        assert_eq!(
+            network_path_for(&secure),
+            NetworkPath::Blocked {
+                detail: "Secure 代理未就绪（代理未运行）"
             }
         );
     }

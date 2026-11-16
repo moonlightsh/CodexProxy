@@ -33,6 +33,8 @@ pub enum Reachability {
     Unknown,
     Reachable,
     Unreachable,
+    /// 用户关闭了本地代理，不探测 SOCKS5
+    Disabled,
 }
 
 /// 本地代理运行状态。
@@ -101,6 +103,8 @@ pub struct Status {
     pub install_location_ok: bool,
     /// 受管模式开关（状态文件 `enabled`）
     pub enabled: bool,
+    /// 本地代理开关（状态文件 `proxy_disabled` 取反；缺省开启）
+    pub proxy_enabled: bool,
     /// 凭据是否已保存（不回显 Key）
     pub key_configured: bool,
     /// 已启用但凭据缺失（fail-closed，需要录入 Key）
@@ -291,6 +295,9 @@ pub enum ManagerError {
         field: &'static str,
         message: String,
     },
+    /// Secure 已激活时不能关闭本地代理，代理关闭时也不能激活 Secure。
+    #[error("Secure 模式需要本地代理，请先停用 Secure")]
+    SecureRequiresProxy,
 }
 
 impl ManagerError {
@@ -313,6 +320,7 @@ impl ManagerError {
             Self::SecurePortOccupied { .. } => "securePortOccupied",
             Self::PolicyVersionRollback { .. } => "policyVersionRollback",
             Self::InvalidEndpoint { .. } => "invalidEndpoint",
+            Self::SecureRequiresProxy => "secureRequiresProxy",
         }
     }
 
@@ -433,6 +441,22 @@ mod tests {
         let status = serde_json::to_value(Status::default()).unwrap();
         assert!(status.get("secure").is_some());
         assert_eq!(status["mode"], "Legacy");
+    }
+
+    #[test]
+    fn reachability_disabled_serializes_as_disabled() {
+        let json = serde_json::to_value(Reachability::Disabled).unwrap();
+        assert_eq!(json, serde_json::Value::String("disabled".into()));
+    }
+
+    #[test]
+    fn secure_requires_proxy_has_stable_code() {
+        let error = ManagerError::SecureRequiresProxy;
+        assert_eq!(error.code(), "secureRequiresProxy");
+        assert_eq!(
+            error.to_string(),
+            "Secure 模式需要本地代理，请先停用 Secure"
+        );
     }
 
     #[test]

@@ -716,6 +716,18 @@ mod tests {
         assert!(!directory.exists());
     }
 
+    /// 代理开关关闭的直连原因仍走现有拒绝，不回退直连下载。
+    #[test]
+    fn disabled_proxy_reason_is_still_rejected() {
+        let error = download_client(&NetworkPath::Direct {
+            reason: Some("本地代理未开启，已直连"),
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "downloadProxy");
+        assert!(error.message.contains("请先启用本地代理"));
+        assert!(error.message.contains("不会回退直连"));
+    }
+
     #[tokio::test]
     async fn proxy_client_reaches_proxy_instead_of_target_host() {
         let proxy = MockServer::start().await;

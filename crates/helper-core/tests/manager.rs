@@ -1811,6 +1811,7 @@ fn manager_futures_are_send() {
     assert_send(&manager.shutdown());
     assert_send(&manager.revoke_managed_config());
     assert_send(&manager.set_endpoints(SetEndpointsRequest::default()));
+    assert_send(&manager.set_proxy_enabled(false));
 }
 
 #[test]
@@ -2925,6 +2926,51 @@ mod secure {
         other.shutdown().await;
         sandbox.assert_no_key_on_disk();
     }
+
+    /// 未激活时可以关掉代理；关掉之后激活被拒。已激活时拒绝关闭，代理保持监听。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn secure_rejects_proxy_off_in_both_directions() {
+        let (sandbox, manager) = secure_sandbox().await;
+        let outcome = manager
+            .set_proxy_enabled(false)
+            .await
+            .expect("尚未激活时关闭代理应成功");
+        assert!(outcome.warnings.is_empty());
+        assert!(sandbox.state().unwrap().proxy_disabled);
+
+        let error = manager
+            .activate_secure(Path::new("/no/such/bundle.json"))
+            .await
+            .expect_err("代理关闭时不得读注册包");
+        assert_eq!(error.code(), "secureRequiresProxy");
+        let status = manager.status().await;
+        assert_eq!(status.mode, ProxyMode::Legacy);
+        assert!(sandbox.state().unwrap().proxy_disabled);
+        manager.shutdown().await;
+
+        let (sandbox, manager) = secure_sandbox().await;
+        assert!(
+            !sandbox
+                .state()
+                .map(|state| state.proxy_disabled)
+                .unwrap_or(false)
+        );
+        let fixture = setup_secure_enrollment(&sandbox, 1).await;
+        let status = manager
+            .activate_secure(&fixture.bundle_path)
+            .await
+            .expect("代理开启时激活应成功");
+        assert!(status.secure.active);
+        let error = manager
+            .set_proxy_enabled(false)
+            .await
+            .expect_err("Secure 激活中不得关闭代理");
+        assert_eq!(error.code(), "secureRequiresProxy");
+        assert!(!sandbox.state().unwrap().proxy_disabled);
+        assert!(proxy::probe_existing(sandbox.port).await);
+        assert_eq!(manager.status().await.mode, ProxyMode::Secure);
+        manager.shutdown().await;
+    }
 }
 
 // ---- 端点保存 ----
@@ -3303,5 +3349,143 @@ async fn set_endpoints_keeps_new_state_when_config_apply_fails() {
         Some("http://127.0.0.1:9/other")
     );
     assert_eq!(sandbox.read_config(), "model_providers = 1\n");
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_proxy_while_managed_removes_env_and_frees_port() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.expect("启用应成功");
+
+    let outcome = manager
+        .set_proxy_enabled(false)
+        .await
+        .expect("关闭代理应成功");
+    let env = std::fs::read_to_string(sandbox.env()).unwrap_or_default();
+    assert!(!env.contains(codex_env::BEGIN_MARKER));
+    assert!(env.contains("FOO=bar"));
+    let doc: toml_edit::DocumentMut = sandbox.read_config().parse().unwrap();
+    assert_eq!(doc["model_provider"].as_str(), Some(consts::PROVIDER_ID));
+    assert_eq!(
+        doc["model_providers"]["managed_gateway"]["base_url"].as_str(),
+        Some(sandbox.gateway_url.as_str())
+    );
+    assert_eq!(outcome.status.proxy.state, ProxyState::Stopped);
+    assert!(!outcome.status.proxy_enabled);
+    assert_eq!(outcome.status.socks5, Reachability::Disabled);
+    assert_ne!(outcome.status.gateway, Reachability::Disabled);
+    assert_eq!(outcome.warnings, vec![EndpointWarning::RestartCodex]);
+    assert!(!proxy::probe_existing(sandbox.port).await);
+    let state = sandbox.state().unwrap();
+    assert!(state.proxy_disabled);
+    assert!(state.enabled);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enable_proxy_while_managed_writes_env_and_listens() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.expect("启用应成功");
+    manager.set_proxy_enabled(false).await.expect("先关闭代理");
+
+    let outcome = manager
+        .set_proxy_enabled(true)
+        .await
+        .expect("重新开启代理应成功");
+    let env = std::fs::read_to_string(sandbox.env()).unwrap();
+    let block = codex_env::render_block(sandbox.port, "127.0.0.1");
+    let no_proxy = block
+        .lines()
+        .find(|line| line.starts_with("NO_PROXY="))
+        .expect("受管块含 NO_PROXY");
+    assert!(env.contains(no_proxy), "{env}");
+    assert!(proxy::probe_existing(sandbox.port).await);
+    assert!(outcome.status.proxy_enabled);
+    assert!(outcome.warnings.contains(&EndpointWarning::RestartCodex));
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn proxy_switch_while_unmanaged_only_writes_state() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let config_before = std::fs::read(sandbox.config()).unwrap();
+    let env_before = std::fs::read(sandbox.env()).unwrap();
+    let manager = sandbox.manager();
+
+    let outcome = manager
+        .set_proxy_enabled(false)
+        .await
+        .expect("未受管时关闭只记偏好");
+    assert!(outcome.warnings.is_empty());
+    assert!(sandbox.state().unwrap().proxy_disabled);
+    assert_eq!(std::fs::read(sandbox.config()).unwrap(), config_before);
+    assert_eq!(std::fs::read(sandbox.env()).unwrap(), env_before);
+    assert!(!proxy::probe_existing(sandbox.port).await);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_with_proxy_disabled_drops_env_block_and_does_not_listen() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    codex_config::apply_managed(
+        &sandbox.config(),
+        &sandbox.backup(),
+        COMMAND,
+        consts::GATEWAY_BASE_URL,
+    )
+    .unwrap();
+    sandbox.write_env(&format!(
+        "{USER_ENV}{}",
+        codex_env::render_block(sandbox.port, "127.0.0.1")
+    ));
+    sandbox.credentials.write(KEY).unwrap();
+    sandbox.write_state(&HelperState {
+        enabled: true,
+        proxy_disabled: true,
+        ..Default::default()
+    });
+
+    let manager = sandbox.manager();
+    let report = manager.reconcile_on_startup().await;
+    assert_eq!(report.outcome, ReconcileOutcome::Applied);
+    let doc: toml_edit::DocumentMut = sandbox.read_config().parse().unwrap();
+    assert_eq!(
+        doc["model_providers"]["managed_gateway"]["base_url"].as_str(),
+        Some(sandbox.gateway_url.as_str())
+    );
+    let env = std::fs::read_to_string(sandbox.env()).unwrap_or_default();
+    assert!(!env.contains(codex_env::BEGIN_MARKER));
+    assert!(!report.status.residue);
+    assert!(report.status.env_managed);
+    assert!(!proxy::probe_existing(sandbox.port).await);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enable_with_proxy_disabled_skips_env_and_proxy() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_state(&HelperState {
+        enabled: false,
+        proxy_disabled: true,
+        ..Default::default()
+    });
+    let manager = sandbox.manager();
+    let status = manager.enable(with_key(KEY)).await.expect("启用应成功");
+    assert!(status.config_managed);
+    let env = std::fs::read_to_string(sandbox.env()).unwrap_or_default();
+    assert!(!env.contains(codex_env::BEGIN_MARKER));
+    assert_eq!(status.proxy.state, ProxyState::Stopped);
+    assert!(!status.proxy_enabled);
+    assert!(!proxy::probe_existing(sandbox.port).await);
     manager.shutdown().await;
 }
