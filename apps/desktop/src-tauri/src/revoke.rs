@@ -298,6 +298,7 @@ mod tests {
         ErrorPayload {
             code: code.to_string(),
             message: format!("{code} 失败"),
+            field: None,
         }
     }
 
@@ -415,6 +416,7 @@ mod tests {
         let e = ErrorPayload {
             code: "io".into(),
             message: "写入 .env 失败".into(),
+            field: None,
         };
         assert_eq!(
             revoke_failure_message(&e),

@@ -277,6 +277,7 @@ fn autostart_error(reason: &str) -> ErrorPayload {
     ErrorPayload {
         code: "internal".to_string(),
         message: format!("开机自启设置失败：{reason}"),
+        field: None,
     }
 }
 

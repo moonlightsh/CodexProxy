@@ -38,6 +38,7 @@ use crate::codex_env;
 use crate::connection_gate::ConnectionGate;
 use crate::consts;
 use crate::credential::{self, CredentialStore, Secret};
+use crate::endpoints::Endpoints;
 use crate::fsutil;
 use crate::gateway;
 use crate::log;
@@ -50,9 +51,9 @@ use crate::proxy::{
 use crate::proxy_identity::{self, EnrollmentBundle};
 use crate::state::{self, HelperState, ProxyMode};
 use crate::types::{
-    CleanupReport, ConnectionRecord, EnableRequest, KeyCheck, ManagerError, ProxyState,
-    ProxyStatus, Reachability, ReconcileOutcome, ReconcileReport, SaveKeyRequest, SecureStatus,
-    Status,
+    CleanupReport, ConnectionRecord, EnableRequest, EndpointWarning, KeyCheck, ManagerError,
+    ProxyState, ProxyStatus, Reachability, ReconcileOutcome, ReconcileReport, SaveKeyRequest,
+    SecureStatus, SetEndpointsOutcome, SetEndpointsRequest, Status,
 };
 use crate::upstream::{SecureUpstream, TlsUpstreamConfig};
 
@@ -66,13 +67,8 @@ pub struct ManagerOptions {
     pub credential_command: String,
     /// 本地代理端口（生产为 `proxy::proxy_port()`）
     pub proxy_port: u16,
-    pub socks5_host: String,
-    pub socks5_port: u16,
-    /// Key 校验使用的网关地址（生产为 `consts::GATEWAY_BASE_URL`）
-    pub gateway_base_url: String,
-    /// 网关可达性检测的主机与端口
-    pub gateway_host: String,
-    pub gateway_port: u16,
+    /// 默认地址。生产为 `Endpoints::default_values()`；测试注入假网关与假 SOCKS5。
+    pub default_endpoints: Endpoints,
     /// 每条代理连接结束后的外部回调（桌面应用用它推送事件）；编排层自身维护环形缓冲
     pub on_record: Option<RecordSink>,
     /// Secure 模式构造门禁时使用的连接所有者解析器工厂（生产为 [`system_resolver`]，
@@ -90,11 +86,7 @@ impl Default for ManagerOptions {
             credentials: Arc::new(crate::credential::MemoryCredentialStore::new()),
             credential_command: String::new(),
             proxy_port: consts::DEFAULT_PROXY_PORT,
-            socks5_host: consts::SOCKS5_HOST.to_string(),
-            socks5_port: consts::SOCKS5_PORT,
-            gateway_base_url: consts::GATEWAY_BASE_URL.to_string(),
-            gateway_host: consts::GATEWAY_HOST.to_string(),
-            gateway_port: consts::GATEWAY_PORT,
+            default_endpoints: Endpoints::default_values(),
             on_record: None,
             secure_resolver: None,
             secure_drain_timeout: None,
@@ -113,11 +105,7 @@ impl ManagerOptions {
             credentials,
             credential_command: paths::credential_command_path()?,
             proxy_port: proxy::proxy_port(),
-            socks5_host: consts::SOCKS5_HOST.to_string(),
-            socks5_port: consts::SOCKS5_PORT,
-            gateway_base_url: consts::GATEWAY_BASE_URL.to_string(),
-            gateway_host: consts::GATEWAY_HOST.to_string(),
-            gateway_port: consts::GATEWAY_PORT,
+            default_endpoints: Endpoints::default_values(),
             on_record,
             secure_resolver: Some(Arc::new(|| system_resolver())),
             secure_drain_timeout: None,
@@ -134,6 +122,8 @@ pub struct Manager {
     runtime: std::sync::Mutex<Runtime>,
     /// 最近连接：代理任务在锁外直接写入
     recent: RecentConnections,
+    /// 进程内唯一的分流快照。保存地址就地更新，下次连接与下次 spawn 都读这把锁。
+    routing: Arc<RwLock<Routing>>,
 }
 
 /// 操作锁保护的状态。不变式：`proxy.is_some()` 时运行时的 `proxy_state == Running`，
@@ -145,7 +135,7 @@ struct Ops {
 }
 
 /// 运行时短锁保护的状态。`proxy_state` 只在持有操作锁时写入；可达性缓存随时可写。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone)]
 struct Runtime {
     proxy_state: ProxyState,
     gateway: Reachability,
@@ -155,15 +145,38 @@ struct Runtime {
     mode: ProxyMode,
     /// 本进程是否持有 Secure 配置的代理句柄（`Status.secure.active` 的数据源之一）。
     secure_handle: bool,
+    /// 当前生效的网关与 SOCKS5。短锁只在拷贝这个值时持有。
+    endpoints: Endpoints,
+}
+
+/// `set_endpoints` 真正改了地址时，锁外校验要用的新旧值。
+struct EndpointChange {
+    old: Endpoints,
+    new: Endpoints,
 }
 
 impl Manager {
     pub fn new(options: ManagerOptions) -> Self {
+        let state = match read_state(&options.paths.state_file()) {
+            Ok(snapshot) if snapshot.corrupt => HelperState::default(),
+            Ok(snapshot) => snapshot.state,
+            Err(_) => HelperState::default(),
+        };
+        let endpoints = Endpoints::resolve(&state, &options.default_endpoints);
+        let routing = Arc::new(RwLock::new(Routing::from_endpoints(&endpoints)));
         Self {
             options,
             ops: Mutex::new(Ops::default()),
-            runtime: std::sync::Mutex::new(Runtime::default()),
+            runtime: std::sync::Mutex::new(Runtime {
+                proxy_state: ProxyState::Stopped,
+                gateway: Reachability::Unknown,
+                socks5: Reachability::Unknown,
+                mode: ProxyMode::Legacy,
+                secure_handle: false,
+                endpoints,
+            }),
             recent: RecentConnections::new(),
+            routing,
         }
     }
 
@@ -250,6 +263,7 @@ impl Manager {
         let mut ops = self.ops.lock().await;
         // 先从状态文件同步内存模式：Secure 模式的对账绝不进入 External 复用（设计 §6.3）。
         self.sync_mode_from_state();
+        self.sync_endpoints_from_state();
         let (outcome, error) = match self.reconcile_locked(&mut ops).await {
             Ok(outcome) => (outcome, None),
             Err(error) => (ReconcileOutcome::Failed, Some(error)),
@@ -336,10 +350,11 @@ impl Manager {
             });
         let mut proxy_restarted = false;
         if result.is_err() {
+            let gateway_host = self.runtime().endpoints.gateway_host.clone();
             let block_remains = codex_env::inspect_file(
                 &options.paths.env_file(),
                 options.proxy_port,
-                consts::GATEWAY_HOST,
+                &gateway_host,
             )
             .map_or(true, |inspection| inspection.has_block);
             if block_remains {
@@ -367,25 +382,182 @@ impl Manager {
     /// 检测网关与 SOCKS5 的 TCP 可达性并缓存结果，返回最新状态。
     pub async fn probe_reachability(&self) -> Status {
         // 网络探测不持任何锁、不等待操作锁；只在写缓存时持运行时短锁。
-        let options = &self.options;
+        self.probe_reachability_into_runtime().await;
+        self.build_status()
+    }
+
+    /// 按当前 `runtime.endpoints` 探测网关与 SOCKS5。探测期间不持短锁。
+    async fn probe_reachability_into_runtime(&self) {
+        let endpoints = self.runtime().endpoints.clone();
         let (gateway, socks5) = tokio::join!(
             gateway::tcp_reachable(
-                &options.gateway_host,
-                options.gateway_port,
+                &endpoints.gateway_host,
+                endpoints.gateway_port,
                 gateway::TCP_PROBE_TIMEOUT
             ),
             gateway::tcp_reachable(
-                &options.socks5_host,
-                options.socks5_port,
+                &endpoints.socks5_host,
+                endpoints.socks5_port,
                 gateway::TCP_PROBE_TIMEOUT
             ),
         );
-        {
-            let mut runtime = self.runtime();
-            runtime.gateway = reachability(gateway);
-            runtime.socks5 = reachability(socks5);
+        let mut runtime = self.runtime();
+        runtime.gateway = reachability(gateway);
+        runtime.socks5 = reachability(socks5);
+    }
+
+    /// 保存网关与上游 SOCKS5。非法输入不落盘；配置校正失败时保留已写入的 state。
+    /// Key 校验在操作锁外进行，失败只产生警告。
+    pub async fn set_endpoints(
+        &self,
+        req: SetEndpointsRequest,
+    ) -> Result<SetEndpointsOutcome, ManagerError> {
+        let changed = {
+            let _ops = self.ops.lock().await;
+            match self.apply_endpoints_locked(&req).await {
+                Ok(changed) => changed,
+                Err(error) => {
+                    log::event("manager.set_endpoints", json!({ "code": error.code() }));
+                    return Err(error);
+                }
+            }
+        };
+        let Some(changed) = changed else {
+            let endpoints = self.runtime().endpoints.clone();
+            let socks = endpoints.socks5_addr();
+            log::event(
+                "manager.set_endpoints",
+                json!({
+                    "from_gateway": endpoints.gateway_base_url,
+                    "to_gateway": endpoints.gateway_base_url,
+                    "from_socks5": socks,
+                    "to_socks5": socks,
+                }),
+            );
+            return Ok(SetEndpointsOutcome {
+                status: self.build_status(),
+                warnings: Vec::new(),
+            });
+        };
+
+        let status = self.build_status();
+        let mut warnings = Vec::new();
+        if changed.new.gateway_base_url != changed.old.gateway_base_url {
+            match self.options.credentials.read() {
+                Ok(Some(secret)) => {
+                    match gateway::verify_key_at(
+                        &changed.new.gateway_base_url,
+                        secret.expose(),
+                        gateway::KEY_CHECK_TIMEOUT,
+                    )
+                    .await
+                    {
+                        KeyCheck::Ok => {}
+                        KeyCheck::Unauthorized => warnings.push(EndpointWarning::KeyRejected),
+                        KeyCheck::ServerError | KeyCheck::TimeoutOrNetwork => {
+                            warnings.push(EndpointWarning::KeyCheckUnavailable);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => warnings.push(EndpointWarning::KeyCheckUnavailable),
+            }
+            if status.enabled {
+                warnings.push(EndpointWarning::RestartCodex);
+            }
         }
-        self.build_status()
+        let new_socks = changed.new.socks5_addr();
+        let old_socks = changed.old.socks5_addr();
+        if status.proxy.state == ProxyState::External && new_socks != old_socks {
+            warnings.push(EndpointWarning::ExternalProxy);
+        }
+        log::event(
+            "manager.set_endpoints",
+            json!({
+                "from_gateway": changed.old.gateway_base_url,
+                "to_gateway": changed.new.gateway_base_url,
+                "from_socks5": old_socks,
+                "to_socks5": new_socks,
+            }),
+        );
+        Ok(SetEndpointsOutcome { status, warnings })
+    }
+
+    /// 锁内步骤 1–5。完全相同则返回 `None`，不写文件。
+    async fn apply_endpoints_locked(
+        &self,
+        req: &SetEndpointsRequest,
+    ) -> Result<Option<EndpointChange>, ManagerError> {
+        let defaults = &self.options.default_endpoints;
+        let gateway_input = req
+            .gateway_base_url
+            .as_deref()
+            .unwrap_or(defaults.gateway_base_url.as_str());
+        let socks_owned = req
+            .socks5_addr
+            .clone()
+            .unwrap_or_else(|| defaults.socks5_addr());
+        let parsed = Endpoints::parse(gateway_input, &socks_owned).map_err(|error| {
+            ManagerError::InvalidEndpoint {
+                field: error.field.as_str(),
+                message: error.message,
+            }
+        })?;
+        let old = self.runtime().endpoints.clone();
+        if parsed == old {
+            return Ok(None);
+        }
+
+        let paths = &self.options.paths;
+        let mut snapshot = read_state(&paths.state_file())?;
+        quarantine_corrupt_state(paths, &mut snapshot);
+        let mut next = snapshot.state.clone();
+        next.gateway_base_url = if parsed.gateway_base_url == defaults.gateway_base_url {
+            None
+        } else {
+            Some(parsed.gateway_base_url.clone())
+        };
+        let socks_display = parsed.socks5_addr();
+        next.socks5_addr = if socks_display == defaults.socks5_addr() {
+            None
+        } else {
+            Some(socks_display)
+        };
+        save_state(paths, &next)?;
+        self.runtime().endpoints = parsed.clone();
+        *self.routing.write().unwrap_or_else(PoisonError::into_inner) =
+            Routing::from_endpoints(&parsed);
+
+        if next.enabled {
+            let config_path = paths.config_toml();
+            let command = if self.transient_install() {
+                match codex_config::managed_command(&config_path)
+                    .map_err(|error| config_error(error, &config_path))?
+                {
+                    Some(previous) => previous,
+                    None => return Err(ManagerError::InstallLocation),
+                }
+            } else {
+                self.options.credential_command.clone()
+            };
+            codex_config::apply_managed(
+                &config_path,
+                &paths.config_backup(),
+                &command,
+                &parsed.gateway_base_url,
+            )
+            .map_err(|error| config_error(error, &config_path))?;
+            let env_path = paths.env_file();
+            codex_env::write_block_to_file(
+                &env_path,
+                self.options.proxy_port,
+                &parsed.gateway_host,
+            )
+            .map_err(|error| io_error(&env_path, error))?;
+        }
+
+        self.probe_reachability_into_runtime().await;
+        Ok(Some(EndpointChange { old, new: parsed }))
     }
 
     /// 最近连接（最新在前，最多 50 条）。
@@ -526,6 +698,7 @@ impl Manager {
 
         // 4. 校正 config.toml（apply_managed 内部先备份再原子写入）
         let step = StepError::at("apply_config");
+        let endpoints = self.runtime().endpoints.clone();
         let config_path = paths.config_toml();
         let backup_path = paths.config_backup();
         undo.backup =
@@ -534,7 +707,7 @@ impl Manager {
             &config_path,
             &backup_path,
             &self.options.credential_command,
-            consts::GATEWAY_BASE_URL,
+            &endpoints.gateway_base_url,
         )
         .map_err(|error| step(config_error(error, &config_path)))?;
         undo.config = Some(outcome);
@@ -554,7 +727,7 @@ impl Manager {
         let changed = codex_env::write_block_to_file(
             &env_path,
             self.options.proxy_port,
-            consts::GATEWAY_HOST,
+            &endpoints.gateway_host,
         )
         .map_err(|error| step(io_error(&env_path, error)))?;
         if changed {
@@ -622,12 +795,9 @@ impl Manager {
         if !credential::is_allowed_token(key) {
             return Err(ManagerError::InvalidKeyChars);
         }
-        let check = gateway::verify_key_at(
-            &self.options.gateway_base_url,
-            key,
-            gateway::KEY_CHECK_TIMEOUT,
-        )
-        .await;
+        let gateway_base_url = self.runtime().endpoints.gateway_base_url.clone();
+        let check =
+            gateway::verify_key_at(&gateway_base_url, key, gateway::KEY_CHECK_TIMEOUT).await;
         log::event(
             "manager.key_check",
             json!({ "result": check, "force": force_save }),
@@ -701,6 +871,7 @@ impl Manager {
         let paths = &self.options.paths;
         let mut snapshot = read_state(&paths.state_file())?;
         quarantine_corrupt_state(paths, &mut snapshot);
+        let endpoints = self.runtime().endpoints.clone();
 
         if !snapshot.state.enabled {
             // 对结构宽松的残留判定（与一键清理一致）：结构不符的受管节同样提示清理
@@ -708,7 +879,7 @@ impl Manager {
             let env_block = codex_env::inspect_file(
                 &paths.env_file(),
                 self.options.proxy_port,
-                consts::GATEWAY_HOST,
+                &endpoints.gateway_host,
             )
             .is_ok_and(|inspection| inspection.has_block);
             return Ok(if config_residue || env_block {
@@ -744,13 +915,13 @@ impl Manager {
             &config_path,
             &paths.config_backup(),
             &command,
-            consts::GATEWAY_BASE_URL,
+            &endpoints.gateway_base_url,
         )
         .map_err(|error| config_error(error, &config_path))?;
         // 端口被他人占用时在这里失败，已存在的 .env 不被改动
         self.ensure_proxy(ops).await?;
         let env_path = paths.env_file();
-        codex_env::write_block_to_file(&env_path, self.options.proxy_port, consts::GATEWAY_HOST)
+        codex_env::write_block_to_file(&env_path, self.options.proxy_port, &endpoints.gateway_host)
             .map_err(|error| io_error(&env_path, error))?;
         Ok(ReconcileOutcome::Applied)
     }
@@ -888,13 +1059,8 @@ impl Manager {
                 external(record);
             }
         });
-        let endpoints = crate::endpoints::Endpoints::parse(
-            &self.options.gateway_base_url,
-            &format!("{}:{}", self.options.socks5_host, self.options.socks5_port),
-        )
-        .expect("测试与生产注入的地址都必须能被解析");
         ProxyConfig {
-            routing: Arc::new(RwLock::new(Routing::from_endpoints(&endpoints))),
+            routing: Arc::clone(&self.routing),
             on_record: Some(sink),
             direct_overrides: None,
             secure_upstream: None,
@@ -1268,13 +1434,26 @@ impl Manager {
         self.set_mode(state.mode);
     }
 
+    /// 再读一次 state 并解析端点。读失败时保留 `new` 已经设好的值。
+    fn sync_endpoints_from_state(&self) {
+        let state = match read_state(&self.options.paths.state_file()) {
+            Ok(snapshot) => snapshot.state,
+            Err(_) => return,
+        };
+        let endpoints = Endpoints::resolve(&state, &self.options.default_endpoints);
+        self.runtime().endpoints = endpoints.clone();
+        *self.routing.write().unwrap_or_else(PoisonError::into_inner) =
+            Routing::from_endpoints(&endpoints);
+    }
+
     /// 检查 config.toml：无法解析、根键类型不符或受管结构不是 table 时返回 `ConfigInvalid`。
     fn inspect_config(&self) -> Result<ConfigInspection, ManagerError> {
         let config_path = self.options.paths.config_toml();
+        let gateway_base_url = self.runtime().endpoints.gateway_base_url.clone();
         codex_config::inspect(
             &config_path,
             &self.options.credential_command,
-            consts::GATEWAY_BASE_URL,
+            &gateway_base_url,
         )
         .map_err(|error| config_error(error, &config_path))
     }
@@ -1307,11 +1486,12 @@ impl Manager {
         };
         let key_configured = options.credentials.exists();
 
+        let runtime = self.runtime().clone();
         let config_path = paths.config_toml();
         let (inspection, config_error_message) = match codex_config::inspect(
             &config_path,
             &self.effective_command(),
-            consts::GATEWAY_BASE_URL,
+            &runtime.endpoints.gateway_base_url,
         ) {
             Ok(inspection) => (inspection, None),
             Err(error) => (
@@ -1325,10 +1505,12 @@ impl Manager {
         } else {
             codex_config::has_residue(&config_path).unwrap_or(false)
         };
-        let env =
-            codex_env::inspect_file(&paths.env_file(), options.proxy_port, consts::GATEWAY_HOST)
-                .unwrap_or_default();
-        let runtime = *self.runtime();
+        let env = codex_env::inspect_file(
+            &paths.env_file(),
+            options.proxy_port,
+            &runtime.endpoints.gateway_host,
+        )
+        .unwrap_or_default();
 
         Status {
             platform_supported: cfg!(any(windows, target_os = "macos")),
@@ -1344,8 +1526,10 @@ impl Manager {
             },
             gateway: runtime.gateway,
             socks5: runtime.socks5,
-            gateway_addr: format!("{}:{}", options.gateway_host, options.gateway_port),
-            socks5_addr: format!("{}:{}", options.socks5_host, options.socks5_port),
+            gateway_addr: runtime.endpoints.gateway_addr(),
+            socks5_addr: runtime.endpoints.socks5_addr(),
+            gateway_base_url: runtime.endpoints.gateway_base_url.clone(),
+            endpoints_customized: state.gateway_base_url.is_some() || state.socks5_addr.is_some(),
             config_managed: inspection.fully_managed,
             env_managed: env.block_up_to_date,
             residue: !state.enabled && (config_residue || env.has_block),

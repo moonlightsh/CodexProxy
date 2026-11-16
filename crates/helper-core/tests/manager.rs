@@ -14,14 +14,15 @@ use helper_core::codex_config;
 use helper_core::codex_env;
 use helper_core::consts;
 use helper_core::credential::{CredentialStore, MemoryCredentialStore};
+use helper_core::endpoints::{self, Endpoints};
 use helper_core::manager::{self, Manager, ManagerOptions};
 use helper_core::paths::HelperPaths;
 use helper_core::proxy::{self, ProxyConfig, RecordSink};
 use helper_core::rules::Route;
 use helper_core::state::{self, HelperState};
 use helper_core::types::{
-    CleanupReport, EnableRequest, ManagerError, ProxyState, ProxyStatus, Reachability,
-    ReconcileOutcome, SaveKeyRequest,
+    CleanupReport, EnableRequest, EndpointWarning, ManagerError, ProxyState, ProxyStatus,
+    Reachability, ReconcileOutcome, SaveKeyRequest, SetEndpointsRequest,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::{method, path};
@@ -197,11 +198,11 @@ impl Sandbox {
             credentials: self.credentials.clone(),
             credential_command: command.to_string(),
             proxy_port: self.port,
-            socks5_host: "127.0.0.1".to_string(),
-            socks5_port: self.socks5_port,
-            gateway_base_url: self.gateway_url.clone(),
-            gateway_host: "127.0.0.1".to_string(),
-            gateway_port: self.gateway.address().port(),
+            default_endpoints: Endpoints::parse(
+                &self.gateway_url,
+                &format!("127.0.0.1:{}", self.socks5_port),
+            )
+            .expect("沙箱地址可解析"),
             on_record: Some(sink),
             secure_resolver: None,
             secure_drain_timeout: None,
@@ -368,7 +369,7 @@ async fn enable_with_new_key_then_disable_restores_everything() {
     assert_eq!(provider["name"].as_str(), Some(consts::PROVIDER_NAME));
     assert_eq!(
         provider["base_url"].as_str(),
-        Some(consts::GATEWAY_BASE_URL)
+        Some(sandbox.gateway_url.as_str())
     );
     assert_eq!(provider["wire_api"].as_str(), Some("responses"));
     assert_eq!(provider["auth"]["command"].as_str(), Some(COMMAND));
@@ -395,7 +396,7 @@ async fn enable_with_new_key_then_disable_restores_everything() {
         env,
         format!(
             "{USER_ENV}\n{}",
-            codex_env::render_block(sandbox.port, consts::GATEWAY_HOST)
+            codex_env::render_block(sandbox.port, "127.0.0.1")
         )
     );
     assert!(env.contains(&format!("HTTPS_PROXY=http://127.0.0.1:{}", sandbox.port)));
@@ -448,7 +449,7 @@ async fn env_created_by_enable_is_deleted_by_disable() {
     manager.enable(with_key(KEY)).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(sandbox.env()).unwrap(),
-        codex_env::render_block(sandbox.port, consts::GATEWAY_HOST)
+        codex_env::render_block(sandbox.port, "127.0.0.1")
     );
     manager.disable().await.unwrap();
     assert!(!sandbox.env().exists(), "原先不存在的 .env 应被删除");
@@ -943,7 +944,7 @@ async fn reconcile_repairs_drift_and_starts_proxy() {
     // 被改动的 base_url、被删除的 .env
     let drifted = sandbox
         .read_config()
-        .replace(consts::GATEWAY_BASE_URL, "http://evil.invalid:1");
+        .replace(&sandbox.gateway_url, "http://evil.invalid:1");
     sandbox.write_config(&drifted);
     std::fs::remove_file(sandbox.env()).unwrap();
 
@@ -953,7 +954,7 @@ async fn reconcile_repairs_drift_and_starts_proxy() {
     assert_eq!(report.error, None);
     assert!(report.status.config_managed && report.status.env_managed);
     assert_eq!(report.status.proxy.state, ProxyState::Running);
-    assert!(sandbox.read_config().contains(consts::GATEWAY_BASE_URL));
+    assert!(sandbox.read_config().contains(&sandbox.gateway_url));
     assert!(!sandbox.read_config().contains("evil.invalid"));
     assert!(proxy::probe_existing(sandbox.port).await);
     // 不记录原值
@@ -1006,7 +1007,7 @@ async fn reconcile_without_key_needs_key_and_touches_nothing() {
     // 制造漂移：对账在缺 Key 时也不能去修它
     let drifted = sandbox
         .read_config()
-        .replace(consts::GATEWAY_BASE_URL, "http://evil.invalid:1");
+        .replace(&sandbox.gateway_url, "http://evil.invalid:1");
     sandbox.write_config(&drifted);
     let before = sandbox.snapshot();
 
@@ -1080,10 +1081,7 @@ async fn reconcile_fails_on_foreign_port_without_touching_env() {
         ..Default::default()
     });
     // 已存在的 .env（块端口与当前不同，正常对账会改写它）
-    let env_text = format!(
-        "{USER_ENV}\n{}",
-        codex_env::render_block(1, consts::GATEWAY_HOST)
-    );
+    let env_text = format!("{USER_ENV}\n{}", codex_env::render_block(1, "127.0.0.1"));
     sandbox.write_env(&env_text);
 
     let manager = sandbox.manager();
@@ -1166,7 +1164,7 @@ async fn cleanup_without_state_file_removes_managed_residue() {
     ));
     sandbox.write_env(&format!(
         "{USER_ENV}\n{}",
-        codex_env::render_block(17891, consts::GATEWAY_HOST)
+        codex_env::render_block(17891, "127.0.0.1")
     ));
 
     let report = manager::cleanup(&sandbox.paths(), sandbox.credentials.as_ref(), false).unwrap();
@@ -1224,7 +1222,7 @@ async fn cleanup_purges_key_and_is_idempotent() {
     sandbox.write_config(
         "model_provider = \"managed_gateway\"\n\n[model_providers.managed_gateway]\nname = \"Managed Gateway\"\n",
     );
-    sandbox.write_env(&codex_env::render_block(17891, consts::GATEWAY_HOST));
+    sandbox.write_env(&codex_env::render_block(17891, "127.0.0.1"));
 
     let first = manager::cleanup(&sandbox.paths(), sandbox.credentials.as_ref(), true).unwrap();
     assert_eq!(
@@ -1286,7 +1284,7 @@ async fn cleanup_reports_error_but_finishes_other_steps() {
     sandbox.write_config("model = [\n");
     sandbox.write_env(&format!(
         "{USER_ENV}\n{}",
-        codex_env::render_block(17891, consts::GATEWAY_HOST)
+        codex_env::render_block(17891, "127.0.0.1")
     ));
     sandbox.write_state(&HelperState {
         enabled: true,
@@ -1322,7 +1320,7 @@ async fn cleanup_residue_uses_same_logic_and_stops_proxy() {
     // 停用 + 残留：一键清理后 residue 消失
     sandbox.write_env(&format!(
         "{USER_ENV}{}",
-        codex_env::render_block(sandbox.port, consts::GATEWAY_HOST)
+        codex_env::render_block(sandbox.port, "127.0.0.1")
     ));
     assert!(manager.status().await.residue);
     let status = manager.cleanup_residue().await.unwrap();
@@ -1341,7 +1339,7 @@ async fn cleanup_tolerates_structure_errors_in_residue() {
         sandbox.write_config(&broken);
         sandbox.write_env(&format!(
             "{USER_ENV}{}",
-            codex_env::render_block(sandbox.port, consts::GATEWAY_HOST)
+            codex_env::render_block(sandbox.port, "127.0.0.1")
         ));
         sandbox.write_state(&HelperState {
             enabled: false,
@@ -1749,6 +1747,8 @@ async fn status_reports_static_fields_and_file_inspection() {
         status.socks5_addr,
         format!("127.0.0.1:{}", sandbox.socks5_port)
     );
+    assert_eq!(status.gateway_base_url, sandbox.gateway_url);
+    assert!(!status.endpoints_customized);
     assert_eq!(status.model_catalog_json.as_deref(), Some(CATALOG_PATH));
     assert_eq!(status.config_error, None);
     assert_eq!(
@@ -1790,11 +1790,8 @@ fn manager_futures_are_send() {
         credentials: Arc::new(MemoryCredentialStore::new()),
         credential_command: COMMAND.into(),
         proxy_port: 1,
-        socks5_host: "127.0.0.1".into(),
-        socks5_port: 1,
-        gateway_base_url: "http://127.0.0.1:1".into(),
-        gateway_host: "127.0.0.1".into(),
-        gateway_port: 1,
+        default_endpoints: Endpoints::parse("http://127.0.0.1:1", "127.0.0.1:1")
+            .expect("测试地址可解析"),
         on_record: None,
         secure_resolver: None,
         secure_drain_timeout: None,
@@ -1813,17 +1810,14 @@ fn manager_futures_are_send() {
     assert_send(&manager.probe_reachability());
     assert_send(&manager.shutdown());
     assert_send(&manager.revoke_managed_config());
+    assert_send(&manager.set_endpoints(SetEndpointsRequest::default()));
 }
 
 #[test]
 fn production_options_use_fixed_parameters() {
     let options = ManagerOptions::production(Arc::new(MemoryCredentialStore::new()), None)
         .expect("生产配置应可解析");
-    assert_eq!(options.gateway_base_url, consts::GATEWAY_BASE_URL);
-    assert_eq!(options.gateway_host, consts::GATEWAY_HOST);
-    assert_eq!(options.gateway_port, consts::GATEWAY_PORT);
-    assert_eq!(options.socks5_host, consts::SOCKS5_HOST);
-    assert_eq!(options.socks5_port, consts::SOCKS5_PORT);
+    assert_eq!(options.default_endpoints, Endpoints::default_values());
     assert_eq!(options.proxy_port, proxy::proxy_port());
     assert!(
         options
@@ -1843,12 +1837,12 @@ fn simulate_interrupted_enable(sandbox: &Sandbox) {
         &sandbox.config(),
         &sandbox.backup(),
         COMMAND,
-        consts::GATEWAY_BASE_URL,
+        &sandbox.gateway_url,
     )
     .unwrap();
     sandbox.write_env(&format!(
         "{USER_ENV}\n{}",
-        codex_env::render_block(sandbox.port, consts::GATEWAY_HOST)
+        codex_env::render_block(sandbox.port, "127.0.0.1")
     ));
     sandbox.write_state(&HelperState {
         enabled: false,
@@ -2178,7 +2172,7 @@ async fn reconcile_from_transient_location_keeps_previous_command() {
     // 制造漂移：base_url 被改、.env 被删
     let drifted = sandbox
         .read_config()
-        .replace(consts::GATEWAY_BASE_URL, "http://evil.invalid:1");
+        .replace(&sandbox.gateway_url, "http://evil.invalid:1");
     sandbox.write_config(&drifted);
     std::fs::remove_file(sandbox.env()).unwrap();
 
@@ -2931,4 +2925,383 @@ mod secure {
         other.shutdown().await;
         sandbox.assert_no_key_on_disk();
     }
+}
+
+// ---- 端点保存 ----
+
+/// 极简 SOCKS5：无认证握手，CONNECT 一律成功，并记录目标。
+async fn spawn_fake_socks5() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind fake socks5");
+    let addr = listener.local_addr().expect("addr");
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_clone = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let seen = Arc::clone(&seen_clone);
+            tokio::spawn(async move {
+                let mut greeting = [0u8; 3];
+                if stream.read_exact(&mut greeting).await.is_err() {
+                    return;
+                }
+                if stream.write_all(&[0x05, 0x00]).await.is_err() {
+                    return;
+                }
+                let mut head = [0u8; 5];
+                if stream.read_exact(&mut head).await.is_err() {
+                    return;
+                }
+                let host_len = usize::from(head[4]);
+                let mut host = vec![0u8; host_len];
+                if stream.read_exact(&mut host).await.is_err() {
+                    return;
+                }
+                let mut port = [0u8; 2];
+                if stream.read_exact(&mut port).await.is_err() {
+                    return;
+                }
+                let target = format!(
+                    "{}:{}",
+                    String::from_utf8_lossy(&host),
+                    u16::from_be_bytes(port)
+                );
+                seen.lock().expect("lock").push(target);
+                let reply = [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80];
+                if stream.write_all(&reply).await.is_err() {
+                    return;
+                }
+                let mut buffer = vec![0u8; 4096];
+                while let Ok(read) = stream.read(&mut buffer).await {
+                    if read == 0 {
+                        break;
+                    }
+                    if stream.write_all(&buffer[..read]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (addr.to_string(), seen)
+}
+
+async fn connect_chatgpt(port: u16) -> String {
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect proxy");
+    client
+        .write_all(b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n")
+        .await
+        .expect("send connect");
+    let mut response = vec![0u8; 128];
+    let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut response))
+        .await
+        .expect("隧道应建立")
+        .expect("read response");
+    String::from_utf8_lossy(&response[..read]).into_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_endpoints_while_enabled_rewrites_config_and_env_and_warns_restart() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.expect("启用应成功");
+    let before = manager.status().await;
+    assert_eq!(before.proxy.state, ProxyState::Running);
+    let port = before.proxy.port;
+
+    let outcome = manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: Some("http://127.0.0.1:9/proxy/".into()),
+            socks5_addr: Some("127.0.0.1:1".into()),
+        })
+        .await
+        .expect("保存应成功");
+
+    let doc: toml_edit::DocumentMut = sandbox.read_config().parse().unwrap();
+    assert_eq!(
+        doc["model_providers"]["managed_gateway"]["base_url"].as_str(),
+        Some("http://127.0.0.1:9/proxy")
+    );
+    let env = std::fs::read_to_string(sandbox.env()).unwrap();
+    assert!(env.contains("NO_PROXY=127.0.0.1,127.0.0.1,localhost"));
+    assert_eq!(outcome.status.gateway_base_url, "http://127.0.0.1:9/proxy");
+    assert_eq!(outcome.status.gateway_addr, "127.0.0.1:9");
+    assert_eq!(outcome.status.socks5_addr, "127.0.0.1:1");
+    assert!(outcome.status.endpoints_customized);
+    assert_eq!(
+        outcome.warnings,
+        vec![
+            EndpointWarning::KeyCheckUnavailable,
+            EndpointWarning::RestartCodex
+        ]
+    );
+    let state = sandbox.state().unwrap();
+    assert_eq!(
+        state.gateway_base_url.as_deref(),
+        Some("http://127.0.0.1:9/proxy")
+    );
+    assert_eq!(state.socks5_addr.as_deref(), Some("127.0.0.1:1"));
+    assert_eq!(outcome.status.proxy.port, port);
+    assert_eq!(outcome.status.proxy.state, ProxyState::Running);
+
+    let log_path = helper_core::log::log_file_path().expect("日志已初始化");
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("http://127.0.0.1:9/proxy"));
+    assert!(!log.contains(KEY));
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_endpoints_hot_swaps_socks5_without_rebind() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.expect("启用应成功");
+    let (first, seen1) = spawn_fake_socks5().await;
+    let (second, seen2) = spawn_fake_socks5().await;
+
+    let outcome = manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: Some(sandbox.gateway_url.clone()),
+            socks5_addr: Some(first),
+        })
+        .await
+        .expect("切到第一个上游");
+    assert!(outcome.warnings.is_empty());
+    assert!(!outcome.warnings.contains(&EndpointWarning::ExternalProxy));
+    assert!(!outcome.warnings.contains(&EndpointWarning::RestartCodex));
+
+    let response = connect_chatgpt(sandbox.port).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+    assert!(
+        seen1
+            .lock()
+            .expect("lock")
+            .contains(&"chatgpt.com:443".to_string())
+    );
+    assert!(seen2.lock().expect("lock").is_empty());
+
+    let outcome = manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: Some(sandbox.gateway_url.clone()),
+            socks5_addr: Some(second),
+        })
+        .await
+        .expect("切到第二个上游");
+    assert_eq!(outcome.status.proxy.port, sandbox.port);
+    assert_eq!(outcome.status.proxy.state, ProxyState::Running);
+    assert!(outcome.warnings.is_empty());
+
+    let response = connect_chatgpt(sandbox.port).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+    assert!(
+        seen2
+            .lock()
+            .expect("lock")
+            .contains(&"chatgpt.com:443".to_string())
+    );
+    assert_eq!(seen1.lock().expect("lock").len(), 1);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_endpoints_key_rejected_still_saves() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.expect("启用应成功");
+
+    let rejected = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&rejected)
+        .await;
+    let url = rejected.uri();
+    let outcome = manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: Some(url.clone()),
+            socks5_addr: Some(format!("127.0.0.1:{}", sandbox.socks5_port)),
+        })
+        .await
+        .expect("401 只产生警告");
+    assert_eq!(
+        outcome.warnings,
+        vec![EndpointWarning::KeyRejected, EndpointWarning::RestartCodex]
+    );
+    assert!(
+        !outcome
+            .warnings
+            .contains(&EndpointWarning::KeyCheckUnavailable)
+    );
+    assert_eq!(outcome.status.gateway_base_url, url);
+    assert_eq!(
+        sandbox.state().unwrap().gateway_base_url.as_deref(),
+        Some(url.as_str())
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_endpoints_invalid_input_changes_nothing() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.expect("启用应成功");
+    let before = sandbox.snapshot();
+    let socks = format!("127.0.0.1:{}", sandbox.socks5_port);
+
+    let error = manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: Some("ftp://bad".into()),
+            socks5_addr: Some(socks.clone()),
+        })
+        .await
+        .expect_err("非法网关");
+    assert_eq!(error.code(), "invalidEndpoint");
+    assert_eq!(error.payload().field.as_deref(), Some("gateway"));
+    assert_eq!(error.payload().message, endpoints::MSG_SCHEME);
+
+    let error = manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: Some(sandbox.gateway_url.clone()),
+            socks5_addr: Some("nope".into()),
+        })
+        .await
+        .expect_err("非法 SOCKS5");
+    assert_eq!(error.code(), "invalidEndpoint");
+    assert_eq!(error.payload().field.as_deref(), Some("socks5"));
+    assert_eq!(error.payload().message, endpoints::MSG_SOCKS_FORM);
+    assert_eq!(sandbox.snapshot(), before);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_endpoints_restore_default_clears_state_fields() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.expect("启用应成功");
+    manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: Some("http://127.0.0.1:9/proxy/".into()),
+            socks5_addr: Some("127.0.0.1:1".into()),
+        })
+        .await
+        .expect("先写入自定义地址");
+
+    let outcome = manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: None,
+            socks5_addr: None,
+        })
+        .await
+        .expect("恢复默认");
+    let state = sandbox.state().unwrap();
+    assert_eq!(state.gateway_base_url, None);
+    assert_eq!(state.socks5_addr, None);
+    assert!(!outcome.status.endpoints_customized);
+    assert_eq!(outcome.status.gateway_base_url, sandbox.gateway_url);
+    let doc: toml_edit::DocumentMut = sandbox.read_config().parse().unwrap();
+    assert_eq!(
+        doc["model_providers"]["managed_gateway"]["base_url"].as_str(),
+        Some(sandbox.gateway_url.as_str())
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_endpoints_survives_manager_restart() {
+    let sandbox = Sandbox::new().await;
+    let manager = sandbox.manager();
+    manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: Some("http://127.0.0.1:9/proxy/".into()),
+            socks5_addr: Some("[::1]:9".into()),
+        })
+        .await
+        .expect("写入自定义地址");
+    manager.shutdown().await;
+
+    let again = Manager::new(sandbox.options_with(COMMAND));
+    let status = again.status().await;
+    assert_eq!(status.gateway_base_url, "http://127.0.0.1:9/proxy");
+    assert_eq!(status.socks5_addr, "[::1]:9");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_endpoints_while_disabled_only_writes_state() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    sandbox.write_env(USER_ENV);
+    let config_before = std::fs::read(sandbox.config()).unwrap();
+    let env_before = std::fs::read(sandbox.env()).unwrap();
+    let manager = sandbox.manager();
+
+    let outcome = manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: Some("https://gw.example/proxy/".into()),
+            socks5_addr: Some("10.1.2.3:1080".into()),
+        })
+        .await
+        .expect("停用时仍可保存");
+    assert!(outcome.warnings.is_empty());
+    assert!(!outcome.status.enabled);
+    assert_eq!(std::fs::read(sandbox.config()).unwrap(), config_before);
+    assert_eq!(std::fs::read(sandbox.env()).unwrap(), env_before);
+    let state = sandbox.state().unwrap();
+    assert_eq!(
+        state.gateway_base_url.as_deref(),
+        Some("https://gw.example/proxy")
+    );
+    assert_eq!(state.socks5_addr.as_deref(), Some("10.1.2.3:1080"));
+}
+
+#[tokio::test]
+async fn set_endpoints_same_value_is_noop() {
+    let sandbox = Sandbox::new().await;
+    let manager = sandbox.manager();
+    let outcome = manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: Some(sandbox.gateway_url.clone()),
+            socks5_addr: Some(format!("127.0.0.1:{}", sandbox.socks5_port)),
+        })
+        .await
+        .expect("相同值应成功");
+    assert!(outcome.warnings.is_empty());
+    assert!(!outcome.status.endpoints_customized);
+    assert!(!sandbox.state_file().exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_endpoints_keeps_new_state_when_config_apply_fails() {
+    let sandbox = Sandbox::new().await;
+    sandbox.write_config(USER_CONFIG);
+    let manager = sandbox.manager();
+    manager.enable(with_key(KEY)).await.expect("启用应成功");
+    sandbox.write_config("model_providers = 1\n");
+
+    let error = manager
+        .set_endpoints(SetEndpointsRequest {
+            gateway_base_url: Some("http://127.0.0.1:9/other".into()),
+            socks5_addr: Some(format!("127.0.0.1:{}", sandbox.socks5_port)),
+        })
+        .await
+        .expect_err("结构不符应失败");
+    assert_eq!(error.code(), "configInvalid");
+    let status = manager.status().await;
+    assert_eq!(status.gateway_base_url, "http://127.0.0.1:9/other");
+    assert!(status.config_error.is_some());
+    assert_eq!(
+        sandbox.state().unwrap().gateway_base_url.as_deref(),
+        Some("http://127.0.0.1:9/other")
+    );
+    assert_eq!(sandbox.read_config(), "model_providers = 1\n");
+    manager.shutdown().await;
 }
