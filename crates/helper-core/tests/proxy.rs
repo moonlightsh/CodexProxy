@@ -20,6 +20,7 @@ use helper_core::proxy::ProxyConfig;
 use helper_core::proxy::ProxyHandle;
 use helper_core::proxy::ProxyStartError;
 use helper_core::proxy::RecordSink;
+use helper_core::proxy::Routing;
 use helper_core::proxy::spawn_with_listener;
 use helper_core::rules::Route;
 use helper_core::types::ConnectionRecord;
@@ -122,11 +123,13 @@ async fn spawn_proxy(socks5: &str) -> u16 {
         .await
         .expect("bind proxy");
     let (host, port) = socks5.rsplit_once(':').expect("socks5 addr");
+    let mut routing = Routing::from_endpoints(&helper_core::endpoints::Endpoints::default_values());
+    routing.socks5_host = host.to_string();
+    routing.socks5_port = port.parse().expect("socks5 port");
     let handle = spawn_with_listener(
         listener,
         ProxyConfig {
-            socks5_host: host.to_string(),
-            socks5_port: port.parse().expect("socks5 port"),
+            routing: Arc::new(std::sync::RwLock::new(routing)),
             ..ProxyConfig::default()
         },
     );
@@ -329,11 +332,86 @@ fn record_sink() -> (RecordSink, Records) {
 
 fn proxy_config(socks5: &str) -> ProxyConfig {
     let (host, port) = socks5.rsplit_once(':').expect("socks5 addr");
+    let mut routing = Routing::from_endpoints(&helper_core::endpoints::Endpoints::default_values());
+    routing.socks5_host = host.to_string();
+    routing.socks5_port = port.parse().expect("socks5 port");
     ProxyConfig {
-        socks5_host: host.to_string(),
-        socks5_port: port.parse().expect("socks5 port"),
+        routing: Arc::new(std::sync::RwLock::new(routing)),
         ..ProxyConfig::default()
     }
+}
+
+/// 更新共享 Routing 后，新连接走新 SOCKS5；监听端口不变，已记下的旧目标不被改写。
+#[tokio::test]
+async fn routing_update_sends_new_connections_to_the_new_socks5() {
+    let (first, seen1) = spawn_fake_socks5().await;
+    let (second, seen2) = spawn_fake_socks5().await;
+
+    let config = proxy_config(&first);
+    let routing = Arc::clone(&config.routing);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind proxy");
+    let handle = spawn_with_listener(listener, config);
+    let port = handle.port();
+
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect proxy");
+    client
+        .write_all(b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n")
+        .await
+        .expect("send connect");
+    let mut response = vec![0u8; 64];
+    let read = client.read(&mut response).await.expect("read response");
+    let text = String::from_utf8_lossy(&response[..read]);
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "expected tunnel established, got: {text}"
+    );
+    assert!(
+        seen1.lock().expect("lock").contains(&"chatgpt.com:443".to_string()),
+        "seen1={:?}",
+        seen1.lock().expect("lock")
+    );
+    assert!(
+        seen2.lock().expect("lock").is_empty(),
+        "seen2={:?}",
+        seen2.lock().expect("lock")
+    );
+
+    {
+        let (host, socks_port) = second.rsplit_once(':').expect("socks5 addr");
+        let mut current = routing
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.socks5_host = host.to_string();
+        current.socks5_port = socks_port.parse().expect("socks5 port");
+    }
+
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect proxy");
+    client
+        .write_all(b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n")
+        .await
+        .expect("send connect");
+    let mut response = vec![0u8; 64];
+    let read = client.read(&mut response).await.expect("read response");
+    let text = String::from_utf8_lossy(&response[..read]);
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "expected tunnel established, got: {text}"
+    );
+    assert!(
+        seen2.lock().expect("lock").contains(&"chatgpt.com:443".to_string()),
+        "seen2={:?}",
+        seen2.lock().expect("lock")
+    );
+    assert_eq!(seen1.lock().expect("lock").len(), 1);
+    assert_eq!(handle.port(), port);
+
+    handle.shutdown().await;
 }
 
 /// 启动一个带记录回调的代理，返回句柄（随测试结束 drop）。

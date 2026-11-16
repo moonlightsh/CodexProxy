@@ -27,7 +27,7 @@
 //!   还原（而不是删除该键），再次启用也保留原记录，用户原来的 provider 不会丢失。
 
 use std::path::Path;
-use std::sync::{Arc, MutexGuard, PoisonError};
+use std::sync::{Arc, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use serde_json::json;
@@ -45,7 +45,7 @@ use crate::paths::{self, HelperPaths};
 use crate::peer_identity::system_resolver;
 use crate::process_policy::{ProcessPolicy, parse_and_verify};
 use crate::proxy::{
-    self, ProxyConfig, ProxyHandle, ProxyStartError, RecentConnections, RecordSink,
+    self, ProxyConfig, ProxyHandle, ProxyStartError, RecentConnections, RecordSink, Routing,
 };
 use crate::proxy_identity::{self, EnrollmentBundle};
 use crate::state::{self, HelperState, ProxyMode};
@@ -888,9 +888,13 @@ impl Manager {
                 external(record);
             }
         });
+        let endpoints = crate::endpoints::Endpoints::parse(
+            &self.options.gateway_base_url,
+            &format!("{}:{}", self.options.socks5_host, self.options.socks5_port),
+        )
+        .expect("测试与生产注入的地址都必须能被解析");
         ProxyConfig {
-            socks5_host: self.options.socks5_host.clone(),
-            socks5_port: self.options.socks5_port,
+            routing: Arc::new(RwLock::new(Routing::from_endpoints(&endpoints))),
             on_record: Some(sink),
             direct_overrides: None,
             secure_upstream: None,
