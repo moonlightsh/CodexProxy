@@ -1,14 +1,17 @@
-# 网关与上游 SOCKS5 地址可配置设计
+# 网关与上游 SOCKS5 地址可配置、本地代理可关闭设计
 
 - 日期：2026-11-16
 - 状态：设计已确认，待实施
-- 范围：把写死的模型网关地址（`http://10.20.30.61:8080`）与上游 SOCKS5 地址（`10.20.30.61:7891`）改为用户可在桌面界面配置的两个独立参数。
+- 范围：
+  - 把写死的模型网关地址（`http://10.20.30.61:8080`）与上游 SOCKS5 地址（`10.20.30.61:7891`）改为用户可在桌面界面配置的两个独立参数；
+  - 新增“启用本地代理”开关：关闭时不启动本地代理、不写 `~/.codex/.env` 受管块（见 §7）。
 - 用户已确认：
   - 网关与 SOCKS5 分开配置；
   - 在桌面应用界面修改，持久化到 `state.json`；
   - 受管模式启用时保存后立即生效；
   - 网关变更后用已存 Key 校验新网关，失败只警告、不阻止保存；
-  - 采用“`Endpoints` 值对象 + 显式参数传递”的实现方案。
+  - 采用“`Endpoints` 值对象 + 显式参数传递”的实现方案；
+  - 代理开关关闭时整体关闭代理（不启动代理、不写 `.env`、不检测 SOCKS5），`config.toml` 接管不受影响。
 
 ## 背景
 
@@ -23,12 +26,15 @@
 
 Secure 模式的上游取自注册包 `server_host`，不在本设计范围内，行为不变。
 
+现状核查（2026-11-16，只读）：mTLS 核心（Task 1–9）已合入主干，但桌面端没有暴露 Secure 激活入口，所有实际用户都在 Legacy 模式。服务端 `aiproxy:/opt/mihomo` 的 `mihomo-auth`（7892，`require-and-verify`）已部署运行，10-20 之后没有客户端流量；旧入口 7891 仍对外监听。
+
 ## 非目标
 
 - 不提供环境变量或命令行覆盖。
 - 不修改 Secure 模式上游（仍取注册包里的值）。
 - 不改分流规则集，不改本地代理端口。
-- 不为 Codex 自动重启：网关变更后只提示用户重启 Codex。
+- 不为 Codex 自动重启：网关变更或代理开关变更后只提示用户重启 Codex。
+- 代理关闭时不提供组件直连下载（沿用现有“请先启用本地代理”拒绝）。
 
 ## 1. 数据模型与校验
 
@@ -168,7 +174,7 @@ pub enum EndpointWarning {
     KeyCheckUnavailable,
     /// 本地代理由外部实例提供，新 SOCKS5 地址不会对它生效
     ExternalProxy,
-    /// 已启用且网关地址发生变化，需要重启 Codex
+    /// 受管已启用，且网关地址或 `.env` 受管块发生变化，需要重启 Codex
     RestartCodex,
 }
 
@@ -191,14 +197,14 @@ Tauri 新增命令 `set_endpoints`，序列化方式与现有命令一致。`Man
 
 1. `Endpoints::parse` 解析输入（`None` 取默认值）。失败返回 `InvalidEndpoint`，什么都不改。
 2. 和当前值完全相同就直接返回当前状态，不带警告。
-3. 原子写入 `state.json`，更新 `runtime.endpoints` 和代理的共享 `Routing`。
+3. 原子写入 `state.json`，更新 `runtime.endpoints`；本地代理运行中时同时更新它的共享 `Routing`（代理关闭时只存值，下次启动代理时使用）。
 4. 如果处于启用状态，复用现有的幂等校正路径，对账 `config.toml`（`base_url`）与 `.env`（`NO_PROXY`），含备份。
 5. 刷新可达性。
 
 释放 ops 锁后（避免 Key 校验超时阻塞其他操作）：
 
 6. 只有网关 URL 变了、并且已存 Key 时，才用新地址调用 `verify_key_at`：401/403 得到 `KeyRejected`，其他失败得到 `KeyCheckUnavailable`。保存结果不受影响。
-7. 网关 URL 变了且处于启用状态时，追加 `RestartCodex`；本地代理为 External 且 SOCKS5 变了时，追加 `ExternalProxy`。
+7. 网关 URL 变了且处于启用状态时，追加 `RestartCodex`；代理开关开启、本地代理为 External 且 SOCKS5 变了时，追加 `ExternalProxy`。
 
 ### 3.4 部分失败
 
@@ -233,7 +239,7 @@ Tauri 新增命令 `set_endpoints`，序列化方式与现有命令一致。`Man
   - `KeyRejected`：「当前 Key 在新网关校验失败（被拒绝），请重新录入 Key」，附「重新录入」按钮，点击调用 `keyPanel.openForm()`；
   - `KeyCheckUnavailable`：「无法连接新网关校验 Key，请检查地址或网络」；
   - `ExternalProxy`：「本地代理由外部实例提供，新 SOCKS5 地址需重启该实例后生效」；
-  - `RestartCodex`：「请重启 Codex 以使用新网关」。
+  - `RestartCodex`：「请重启 Codex 生效」（网关变更与代理开关变更共用）。
 - 状态灯区域直接读新的 `gateway_addr` / `socks5_addr`，不用改。
 - `types.ts`、`api.ts` 补充类型和调用；`dev-mock.ts` 增加 `set_endpoints` 的 mock。
 
@@ -266,4 +272,66 @@ Rust 集成测试（`tests/manager.rs`，用假网关和假 SOCKS5）：
 
 ## 6. 文档同步
 
-- `2026-09-23-codex-helper-design.md` §1.1：网关与 SOCKS5 两行注明“默认值，可在界面修改，见本设计”。
+- `2026-09-23-codex-helper-design.md` §1.1：网关与 SOCKS5 两行注明“默认值，可在界面修改，见本设计”；补一行说明本地代理可由用户关闭。
+
+## 7. 本地代理开关
+
+### 7.1 存储
+
+`HelperState` 新增：
+
+```rust
+/// 用户关闭了本地代理（缺省 false = 开启，旧状态文件行为不变）
+pub proxy_disabled: bool,
+```
+
+字段用否定式，这样 serde 的默认值 `false` 就等于“开启”，不需要自定义 default 函数。
+
+### 7.2 与受管开关的关系
+
+两个开关互相独立：受管开关决定是否接管 `config.toml` 和 `.env`；代理开关只决定接管时要不要启动代理。
+
+| 受管 | 代理 | `config.toml` | `.env` 受管块 | 本地代理 |
+| --- | --- | --- | --- | --- |
+| 开 | 开 | 接管 | 写入 | 运行 |
+| 开 | 关 | 接管 | 不写；已有就删除 | 不启动；已启动就停止 |
+| 关 | 任意 | 还原 | 删除 | 停止 |
+
+受管模式关闭时，代理开关只作为偏好保存在 state 里。
+
+### 7.3 核心改动
+
+- `enable`、`reconcile_locked`、`reconcile_on_startup`：期望的 `.env` 状态和代理状态都按 `proxy_disabled` 计算。代理关闭时，`env_managed` 的判定改为“受管块不存在”。
+- 残留判定（`residue`）：受管开、代理关时，`.env` 受管块不算残留，由对账删除。
+- 新接口：
+
+  ```rust
+  pub async fn set_proxy_enabled(&self, enabled: bool)
+      -> Result<SetEndpointsOutcome, ManagerError>; // 复用 outcome：status + warnings
+  ```
+
+  Tauri 命令 `set_proxy_enabled`。在 ops 锁内依次：值没变直接返回；写 state；受管开时启动或停止代理（复用现有 `ensure_proxy` / 停止路径），写入或删除 `.env` 受管块；刷新可达性。受管开且 `.env` 有变化时追加 `RestartCodex`。关闭时如果代理是 External，停不了它，追加 `ExternalProxy`，`.env` 照样删除。
+- Secure 互斥：Secure 激活状态下拒绝关闭代理，返回新增的 `ManagerError::SecureRequiresProxy`；代理关闭时 `activate_secure` 同样返回这个错误。
+- 可达性：代理关闭时不检测 SOCKS5。`Reachability` 新增 `Disabled` 变体（前端 `types.ts` 同步）。
+- `Status` 新增 `proxy_enabled: bool`。
+- 组件更新检查：`network_path_for` 在代理关闭时返回 `Direct { reason: Some("本地代理未开启，已直连") }`，和现有的“本地代理未运行，已直连”区分开。`network_path_for` 只看 `Status`，通过新增的 `proxy_enabled` 判断。
+- 组件下载：不改，沿用现有 `downloadProxy` 错误“请先启用本地代理，再下载组件（不会回退直连）”。
+
+### 7.4 界面
+
+- “网关设置”区加一个“启用本地代理”开关，复用 `switchcontrol.ts`，调用 `set_proxy_enabled`，`busy` 键为 `"proxy"`。
+- 代理关闭时，SOCKS5 输入框置灰，但仍可修改、保存，值留到下次开启时使用；状态灯显示“未启用”。
+- 警告文案复用 §4 的 `RestartCodex`；关闭代理时的 `ExternalProxy` 改用“本地代理由外部实例提供，需要手动停止该实例”（前端按触发操作选文案）。
+- `SecureRequiresProxy` 显示“Secure 模式需要本地代理，请先停用 Secure”。
+
+### 7.5 测试
+
+- 开 → 关（受管开）：`.env` 受管块被删、代理句柄释放、端口空出来，`config.toml` 不变，带 `RestartCodex`；
+- 关 → 开（受管开）：受管块写回，代理开始监听；
+- 受管关时切换开关：只写 state，不碰文件，不启动代理；
+- 代理关闭状态下启动对账：残留的受管块被删，`residue` 为 false，代理不启动；
+- 代理关闭状态下 `enable`：接管 `config.toml`，不写 `.env`，不启动代理；
+- Secure 互斥的两个方向；
+- 旧 `state.json` 反序列化后 `proxy_disabled == false`；
+- `network_path_for`：代理关闭时返回带新原因的 `Direct`；
+- 前端：代理关闭时 SOCKS5 输入框置灰、状态灯显示“未启用”的判定函数。
