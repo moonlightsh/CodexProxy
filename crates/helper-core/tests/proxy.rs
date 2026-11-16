@@ -370,7 +370,10 @@ async fn routing_update_sends_new_connections_to_the_new_socks5() {
         "expected tunnel established, got: {text}"
     );
     assert!(
-        seen1.lock().expect("lock").contains(&"chatgpt.com:443".to_string()),
+        seen1
+            .lock()
+            .expect("lock")
+            .contains(&"chatgpt.com:443".to_string()),
         "seen1={:?}",
         seen1.lock().expect("lock")
     );
@@ -404,7 +407,10 @@ async fn routing_update_sends_new_connections_to_the_new_socks5() {
         "expected tunnel established, got: {text}"
     );
     assert!(
-        seen2.lock().expect("lock").contains(&"chatgpt.com:443".to_string()),
+        seen2
+            .lock()
+            .expect("lock")
+            .contains(&"chatgpt.com:443".to_string()),
         "seen2={:?}",
         seen2.lock().expect("lock")
     );

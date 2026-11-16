@@ -161,7 +161,7 @@ pub socks5_addr: Option<String>,
 7. `default_values()` 用五个 consts 调 `parse`，`expect` 成功。结果必须是 `gateway_base_url == "http://10.20.30.61:8080"`、`socks5_addr() == "10.20.30.61:7891"`。
 8. `resolve`：某字段为 `None` 时沿用 `defaults` 的对应字段。为 `Some` 时只解析那一项（另一项用 `defaults` 的展示串喂给 `parse`）。解析失败则该项回落 `defaults`，并 `log::event("endpoints.fallback", json!({ "field": "gateway" 或 "socks5", "message": error.message }))`。不把原始输入写进日志。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `endpoints.rs` 底部 `#[cfg(test)] mod tests` 写下面这些测试。此时模块还没加入 `lib.rs`，下一步的编译失败就是红。
 
@@ -206,13 +206,13 @@ pub socks5_addr: Option<String>,
 
 `endpoint_fields_round_trip_as_snake_case`：保存一个两项都是 `Some` 的 state，读回相等；文件文本含 `"gateway_base_url"` 与 `"socks5_addr"`，不含驼峰名。
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 Run: `cargo test -p helper-core --lib endpoints::`
 
 Expected: FAIL，编译错误含 `file not found for module` 或 `cannot find module`（`lib.rs` 还没有 `mod endpoints`）。若先把空模块加进 `lib.rs` 再跑，失败信息应是 `cannot find function` / `cannot find struct` 一类，不能是 PASS。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 按上面的规则实现 `endpoints.rs`。`parse` 先解析网关，再解析 SOCKS5，返回第一个错误。
 
@@ -220,7 +220,7 @@ Expected: FAIL，编译错误含 `file not found for module` 或 `cannot find mo
 
 `state.rs` 增加两个 `Option<String>` 字段。`save_then_load_round_trips` 的结构体字面量补上 `gateway_base_url: None` 与 `socks5_addr: None`（该字面量没有 `..Default`，漏字段会编译失败）。其余已使用 `..Default::default()` 的测试不用改。
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 Run: `cargo test -p helper-core --lib endpoints:: && cargo test -p helper-core --lib state::`
 
@@ -230,7 +230,7 @@ Run: `cargo clippy -p helper-core --all-targets -- -D warnings`
 
 Expected: PASS。不要为新类型加 `allow(dead_code)`；本任务的公开方法都被测试调用到。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/helper-core/src/endpoints.rs crates/helper-core/src/lib.rs crates/helper-core/src/consts.rs crates/helper-core/src/state.rs
@@ -284,7 +284,7 @@ pub fn route_for_host(host: &str, always_direct: &[String]) -> Route;
   - `codex_env.rs` 内部测试、`tests/manager.rs`、`apps/credential` 的 `render_block(port)` 改为 `render_block(port, consts::GATEWAY_HOST)`。期望字符串里的 `NO_PROXY=10.20.30.61,...` 保持不变。
   - `rules.rs` 与 `component_downloads.rs` 里现有 `route_for_host(host)` 改为 `route_for_host(host, &[])`，回环用例因此仍然是 `Direct`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `codex_env.rs`：
 
@@ -302,7 +302,7 @@ pub fn route_for_host(host: &str, always_direct: &[String]) -> Route;
 
 `custom_host_is_direct_only_when_listed`：`route_for_host("api.openai.com", &["api.openai.com".into()]) == Direct`；`route_for_host("API.OpenAI.com.", &["api.openai.com".into()]) == Direct`（大小写与末尾点靠 `normalize_host`）；`route_for_host("api.openai.com", &[]) == Socks5`；`route_for_host("10.20.30.61", &[]) == Direct`（未命中规则，不是函数里的特判）。
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 Run: `cargo test -p helper-core --lib -- codex_env::tests::render_block_uses_supplied_gateway_host codex_env::tests::mismatched_gateway_host_is_not_up_to_date_and_upsert_rewrites_it codex_config::tests::apply_rewrites_base_url_and_inspect_follows_the_same_url rules::tests::custom_host_is_direct_only_when_listed`
 
@@ -310,7 +310,7 @@ Run: `cargo test -p helper-core --lib -- codex_env::tests::render_block_uses_sup
 
 Expected: FAIL，编译错误指向这些新测试调用的参数个数（函数仍是旧签名）。不要在红之前改生产代码。
 
-- [ ] **Step 3: 实现并改完全部调用点**
+- [x] **Step 3: 实现并改完全部调用点**
 
 按接口改三个函数族。`codex_env.rs` 可以去掉 `use crate::consts`，如果文件里再没有别的 consts 引用。`rules.rs` 同样：生产路径不再 `use crate::consts`。
 
@@ -325,7 +325,7 @@ Expected: FAIL，编译错误指向这些新测试调用的参数个数（函数
 
 `Fixture::apply` 内部补上 `consts::GATEWAY_BASE_URL`，这样 `codex_config.rs` 里几十个 `fixture.apply(COMMAND)` 不用逐个改参数。
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 Run: `cargo test -p helper-core --lib codex_env:: && cargo test -p helper-core --lib codex_config:: && cargo test -p helper-core --lib rules:: && cargo test -p helper-core --lib component_downloads:: && cargo test -p helper-core --test codex_config && cargo test -p codex-helper-credential`
 
@@ -335,7 +335,7 @@ Run: `cargo clippy -p helper-core --all-targets -- -D warnings && cargo clippy -
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/helper-core/src/codex_config.rs crates/helper-core/src/codex_env.rs crates/helper-core/src/rules.rs crates/helper-core/src/manager.rs crates/helper-core/src/proxy.rs crates/helper-core/src/component_downloads.rs crates/helper-core/tests/codex_config.rs crates/helper-core/tests/manager.rs apps/credential/src/main.rs apps/credential/tests/cli.rs
@@ -424,7 +424,7 @@ ProxyConfig {
 
 `..Default` 会先做一份默认 `Arc`，再被字段覆盖，这是要的：测试必须拿住自己放进 `ProxyConfig` 的那份 `Arc` 才能热更新。`upstream_tls` 里诱饵地址同样写进 `routing`，`secure_upstream` 保持 `Some`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `tests/proxy.rs` 增加 `routing_update_sends_new_connections_to_the_new_socks5`（`#[tokio::test]`）：
 
@@ -437,17 +437,17 @@ ProxyConfig {
 
 这一步先把测试写上，但 `ProxyConfig` 还没有 `routing` 字段，所以编译失败。
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 Run: `cargo test -p helper-core --test proxy routing_update_sends_new_connections_to_the_new_socks5`
 
 Expected: FAIL，编译错误含 `no field routing` 或 `cannot find struct Routing`。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 按接口改 `proxy.rs`、两处集成测试的 `ProxyConfig` 字面量，以及 `manager.rs` 的 `proxy_config`。`handle_connection` 里删除原来的 `rules::route_for_host(&target.host)` 单参数调用。
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 Run: `cargo test -p helper-core --test proxy && cargo test -p helper-core --test upstream_tls && cargo test -p helper-core --test manager`
 
@@ -457,7 +457,7 @@ Run: `cargo clippy -p helper-core --all-targets -- -D warnings`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/helper-core/src/proxy.rs crates/helper-core/src/manager.rs crates/helper-core/tests/proxy.rs crates/helper-core/tests/upstream_tls.rs
@@ -600,7 +600,7 @@ default_endpoints: Endpoints::parse(
 
 `status` 快照测试里 `gateway_addr` / `socks5_addr` 的期望已经是 `127.0.0.1:端口`，与新的展示函数一致，保持断言，并补上 `gateway_base_url == sandbox.gateway_url`、`endpoints_customized == false`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `tests/manager.rs` 增加下面的测试。它们调用还不存在的 `set_endpoints`，所以下一步编译失败。
 
@@ -637,19 +637,19 @@ default_endpoints: Endpoints::parse(
 
 `set_endpoints_keeps_new_state_when_config_apply_fails`：先启用成功，再把 `config.toml` 改成 `model_providers = 1\n`。`set_endpoints` 到一个合法新 URL 返回 `Err`，`code() == "configInvalid"`。随后 `status().gateway_base_url` 是新 URL，`config_error` 为 `Some`。state 文件里的 `gateway_base_url` 是 `Some(新 URL)`。`config.toml` 内容仍是 `model_providers = 1\n`。
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 Run: `cargo test -p helper-core --test manager set_endpoints`
 
 Expected: FAIL，编译错误含 `cannot find method set_endpoints` 或 `no field default_endpoints`（测试先改了构造，生产结构体还是旧字段时也算红）。不要在看到 PASS 之前写 `set_endpoints` 函数体。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 按接口修改 `types.rs`、`manager.rs`，删除 `gateway.rs` 的 `verify_key`。把 Task 2 留在 manager 里的 consts 参数换成 `runtime.endpoints` 的对应字段。`enable` / `save_key` 的 Key 校验主机就是这个字段，满足设计 §3.5。
 
 `inspect_config` 与 `build_status` 里的 `codex_config::inspect` 同样传入当前 `gateway_base_url`，否则 `config_managed` 会在自定义地址下永远为假。
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 Run: `cargo test -p helper-core --test manager && cargo test -p helper-core --lib types:: && cargo test -p helper-core --lib gateway::`
 
@@ -659,7 +659,7 @@ Run: `cargo clippy -p helper-core --all-targets -- -D warnings`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/helper-core/src/types.rs crates/helper-core/src/manager.rs crates/helper-core/src/gateway.rs crates/helper-core/tests/manager.rs
@@ -797,7 +797,7 @@ pub fn network_path_for(status: &Status) -> NetworkPath {
 
 `manager_futures_are_send` 增加 `set_proxy_enabled(false)`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `state.rs`：`old_state_json_defaults_proxy_disabled_to_false`，内容 `{"enabled": true}`，断言 `proxy_disabled == false`。`proxy_disabled_round_trips`：保存 `proxy_disabled: true`，读回为真，文本含 `"proxy_disabled": true`。`save_then_load_round_trips` 的全字段字面量补 `proxy_disabled: false`。
 
@@ -824,7 +824,7 @@ pub fn network_path_for(status: &Status) -> NetworkPath {
 
 `network_path` 的单元测试已在上面。下载拒绝测试在 `component_downloads.rs`。
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 Run: `cargo test -p helper-core --lib -- state::tests::old_state_json_defaults_proxy_disabled_to_false component_updates::tests::proxy_switch_off_is_direct_with_its_own_reason`
 
@@ -834,13 +834,13 @@ Run: `cargo test -p helper-core --test manager disable_proxy_while_managed_remov
 
 Expected: FAIL。state 测试是编译错误（没有字段 `proxy_disabled`）。manager 测试是 `cannot find method set_proxy_enabled`。`network_path_for` 测试在字段不存在时同样编译失败。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 按接口改 state、types、manager、`network_path_for`。`download_client` 的函数体不动。`set_endpoints` 的步骤 4 改为调用与对账相同的“按 `proxy_disabled` 写或删 `.env`”私有函数，避免两套矩阵。代理关闭时 `set_endpoints` 不启动代理；若本次只改了网关且受管开启、`.env` 从“有块”变成“无块”，警告里的 `RestartCodex` 仍然追加（网关 URL 变了且 enabled）。
 
 `Status` 的 `Default` 会让新的 `proxy_enabled` 为 `false`。`build_status` 必须每次按 state 赋值，不能依赖 `Default`。`component_updates` 的测试辅助函数显式写 `true`。
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 Run: `cargo test -p helper-core --lib state:: && cargo test -p helper-core --lib component_updates::tests::proxy_switch_off_is_direct_with_its_own_reason && cargo test -p helper-core --lib component_updates::tests::legacy_paths && cargo test -p helper-core --lib component_downloads::tests::disabled_proxy_reason_is_still_rejected && cargo test -p helper-core --test manager`
 
@@ -850,7 +850,7 @@ Run: `cargo clippy -p helper-core --all-targets -- -D warnings`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/helper-core/src/state.rs crates/helper-core/src/types.rs crates/helper-core/src/manager.rs crates/helper-core/src/component_updates.rs crates/helper-core/src/component_downloads.rs crates/helper-core/tests/manager.rs
@@ -894,27 +894,27 @@ pub async fn set_proxy_enabled(
 
 `generate_handler!` 在 `commands::set_autostart` 之后加入 `commands::set_endpoints` 与 `commands::set_proxy_enabled`。
 
-- [ ] **Step 1: 写会失败的接线**
+- [x] **Step 1: 写会失败的接线**
 
 只改 `main.rs`：在 `generate_handler!` 里写上 `commands::set_endpoints` 和 `commands::set_proxy_enabled`。先不要在 `commands.rs` 添加函数。
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 Run: `cargo check -p codex-helper`
 
 Expected: FAIL，错误含 `cannot find set_endpoints in commands`（或等价的“找不到函数”）。
 
-- [ ] **Step 3: 实现两个命令**
+- [x] **Step 3: 实现两个命令**
 
 按接口写完整函数。命令层不解析地址、不拼警告文案。
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 Run: `cargo check -p codex-helper`
 
 Expected: PASS，进程退出码 0。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add apps/desktop/src-tauri/src/commands.rs apps/desktop/src-tauri/src/main.rs
@@ -1063,7 +1063,7 @@ proxyEnabled: true,
 - `set_endpoints`：参数 `args.request` 为 `SetEndpointsRequest`。`gatewayBaseUrl` 是空串或只含空白 → reject `{ code: "invalidEndpoint", message: "不能为空", field: "gateway" }`。`socks5Addr` 非空且既不匹配 `/^\S+:\d{1,5}$/` 也不匹配 `/^\[[^\]]+\]:\d{1,5}$/` → reject `{ code: "invalidEndpoint", message: "格式应为 host:port", field: "socks5" }`。`null` 表示该侧恢复默认常量。两边规范化后都等于默认常量时 `endpointsCustomized = false` 且 state 字段按默认显示；否则为真。`gatewayAddr` 用 `URL` 解析：主机含 `:` 时 `[host]:port`，省略端口时 `http` 用 80、`https` 用 443。若 `status.enabled` 且网关 URL 与调用前不同，`warnings` 含 `"restartCodex"`，否则空数组。返回 `{ status, warnings }` 并 `emit(EVENT_STATUS_CHANGED, status)`。
 - `set_proxy_enabled`：`enabled === false` 且查询串 `scenario=secure` 时 reject `{ code: "secureRequiresProxy", message: "Secure 模式需要本地代理，请先停用 Secure" }`。否则 `proxyEnabled = enabled`，`socks5` 在关闭时为 `"disabled"`、开启时保持原值（若原值是 `"disabled"` 则改回 `"unknown"`），`proxy.state` 在开启时为 `"running"`、关闭时为 `"stopped"`。`status.enabled` 为真时 `warnings` 为 `["restartCodex"]`，否则 `[]`。同样 emit。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `endpointformat.test.ts`：
 
@@ -1077,23 +1077,23 @@ proxyEnabled: true,
 
 `format.test.ts` 补 `"disabled"` 分支断言。此时 `Reachability` 还没有 `"disabled"`，或者函数还没导出，测试必须失败。
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 Run: `npm --prefix apps/desktop test`
 
 Expected: FAIL。`endpointformat.test.ts` 因找不到模块失败，或 `format.test.ts` 因 `"disabled"` 不能赋给 `Reachability` 失败。不能是全部 PASS。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 按接口写纯函数、面板、类型、API、main 接线、mock、状态灯、样式，并把 `createSwitchRegion` 改到 `createToggle` 之上。生产代码不在面板里复制一份校验规则。
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 Run: `npm --prefix apps/desktop test && npm --prefix apps/desktop run check`
 
 Expected: PASS。`check` 是 `tsc --noEmit`。测试数量比改动前多出本任务新增的 4 个 `test()`。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add apps/desktop/src/endpointformat.ts apps/desktop/src/endpointformat.test.ts apps/desktop/src/endpointpanel.ts apps/desktop/src/types.ts apps/desktop/src/api.ts apps/desktop/src/main.ts apps/desktop/src/dev-mock.ts apps/desktop/src/statuslights.ts apps/desktop/src/format.ts apps/desktop/src/format.test.ts apps/desktop/src/switchcontrol.ts apps/desktop/src/styles.css
@@ -1127,11 +1127,11 @@ EOF
 
 表格后加一段：“本地代理可由用户关闭。关闭后不启动 `127.0.0.1:17891`、不写 `.env` 受管块；`config.toml` 是否接管仍由受管开关决定。详见 `2026-11-16-configurable-endpoints-design.md`。”本地代理端口、规则、凭据、provider、审批与沙箱这几行原文不动。
 
-- [ ] **Step 1: 修改 §1.1 与 §1.2**
+- [x] **Step 1: 修改 §1.1 与 §1.2**
 
 §1.1 只改标题、两行单元格和表格后的那一段；§1.2 只改上面指定的那一条。
 
-- [ ] **Step 2: 全量门禁**
+- [x] **Step 2: 全量门禁**
 
 Run: `scripts/gate.sh`
 
@@ -1144,13 +1144,13 @@ Expected: 依次打印 `== cargo fmt --check`、`== cargo clippy`、`== cargo te
 3. 点“恢复默认”，两处文件回到 `http://10.20.30.61:8080` 与 `NO_PROXY=10.20.30.61,127.0.0.1,localhost`，状态灯地址回到 `10.20.30.61:8080` 与 `10.20.30.61:7891`。
 4. 关闭“启用本地代理”。`.env` 受管块消失，`config.toml` 的 `model_provider` 仍是 `managed_gateway`，SOCKS5 灯为“未启用”，SOCKS5 输入框仍能打字。再打开开关，受管块回到文件末尾，本地代理灯为“运行中”。
 
-- [ ] **Step 3: 更新设计状态与计划勾选框**
+- [x] **Step 3: 更新设计状态与计划勾选框**
 
 1. `2026-11-16-configurable-endpoints-design.md` 的“状态”行改为如实结果，例如：“已实现，`scripts/gate.sh` 全绿；macOS 手工验证已完成 / 未完成（写明原因）”。只写实际发生的事。
 2. 本计划中已完成的步骤把 `- [ ]` 改为 `- [x]`（包括本 Step 与 Step 4）。没做的步骤保持 `- [ ]`，并在执行记录里说明。
 3. 本计划末尾追加 `## 执行记录`：每个 Task 的提交哈希与标题；门禁结果；手工验证结果；实施中偏离计划的地方及原因。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add docs/superpowers/specs/2026-09-23-codex-helper-design.md docs/superpowers/specs/2026-11-16-configurable-endpoints-design.md docs/superpowers/plans/2026-11-16-configurable-endpoints.md
@@ -1208,3 +1208,28 @@ EOF
 | §7.3 `enable` / `reconcile` / 残留 / `set_proxy_enabled` / Secure 双向互斥 / `Reachability::Disabled` / `proxy_enabled` / `network_path_for` 新原因 / 下载逻辑不改 | Task 5 |
 | §7.4 开关复用 `switchcontrol.ts`、busy `"proxy"`、SOCKS5 置灰仍可编辑、灯显示“未启用”、两条场景化警告、`SecureRequiresProxy` 文案 | Task 7；错误字符串在 Task 5 的 `ManagerError` 显示文本里 |
 | §7.5 开关两个方向、受管关只写 state、对账删残留块、`enable` 不写 `.env`、Secure 双向、旧 state、`network_path_for`、前端置灰与“未启用” | Task 5 与 Task 7 |
+
+## 执行记录
+
+Task 1–7 的勾选依据是本分支上已有、且与各 Task Step 5 文案一致的提交。本会话只执行 Task 8，没有重放前序任务的红绿。
+
+| Task | 提交 | 标题 |
+| --- | --- | --- |
+| 1 | `1f49a6aa11ddb9d2a09e571a658e8e8ba356ceb9` | feat(core): 增加端点值对象与 state 中的网关、SOCKS5 字段 |
+| 2 | `5a96c6613a47ab4ae929879c93d5d44d58a0832f` | feat(core): 配置、环境块与分流改为接收显式地址 |
+| 3 | `42d94b4ec5e7a42aa6ea66abf8f4942c833339da` | feat(core): 本地代理的上游地址改为可热更新的 Routing |
+| 4 | `b7df6948e5f1a9211da18fa4fa659aa7abeeea56` | feat(core): 保存端点时校正受管配置并在锁外校验 Key |
+| 5 | `1be07b56fb3b0450097c86b631be153de9c30cf6` | feat(core): 本地代理可关闭，并与 Secure 模式互斥 |
+| 6 | `e8c80aee400916e6f14346f4bc02daa28be65ec4` | feat(desktop): 暴露设置端点与代理开关命令 |
+| 7 | `4f703706111fe52bddb1b01053411fab1b6e3069` | feat(desktop): 增加网关设置面板与本地代理开关 |
+| 8 | 本提交 | docs: 网关与 SOCKS5 可配置、本地代理可关闭的文档同步与完成记录 |
+
+门禁：第一次 `scripts/gate.sh` 在 `== cargo fmt --check` 失败，diff 仅在 `crates/helper-core/tests/proxy.rs` 的两处 `assert!` 换行。执行 `cargo fmt --all` 后重跑，依次打印 `== cargo fmt --check`、`== cargo clippy`、`== cargo test`、`== windows check`、`== tsc`、`== frontend test`、`== frontend build`，最后一行 `== gate passed`，退出码 0。clippy 含在门禁的 `cargo clippy --workspace --all-targets -- -D warnings` 中，通过。未加 `allow`。
+
+手工验证：未做。Step 2 的四项要求启动 `tauri dev` 并改写本机 `~/.codex/config.toml` 与 `~/.codex/.env`。本次约束禁止修改仓库外文件，因此未启动应用，也没有改这两个文件。Step 2 的勾选只表示门禁命令已通过。
+
+偏离：
+
+- Task 8 没有“先写失败测试”的步骤，验证命令就是 `scripts/gate.sh`。红是第一次门禁的 fmt 失败，绿是格式化后的第二次门禁。没有为文档另写测试。
+- 设计 §6 写“补一行说明本地代理可由用户关闭”，没有给出原文。计划指定表格后的一段，并要求本地代理端口、规则、凭据、provider、审批与沙箱各行原文不动。按计划原文写入，没有新增表格行。
+- 为通过 fmt，同一提交包含 `crates/helper-core/tests/proxy.rs` 的 rustfmt，该文件不在 Task 8 的文件列表里。只改了换行，没有改断言。

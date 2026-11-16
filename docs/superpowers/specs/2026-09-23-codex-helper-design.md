@@ -18,12 +18,12 @@ CodexHelper 只保留其中最小可用的部分，做成一个独立的单窗�
 - 修改 `~/.codex/.env`，让 Codex 引擎把出站流量交给本地代理。
 - 在 `127.0.0.1:17891` 常驻一个本地分流代理：命中 OpenAI 规则走上游 SOCKS5，其余由本机直连。
 
-### 1.1 固定参数（全部写死，不提供界面修改）
+### 1.1 固定参数（未自定义时的默认值）
 
 | 项 | 值 |
 | --- | --- |
-| 模型网关 | `http://10.20.30.61:8080`（`wire_api = "responses"`） |
-| 上游 SOCKS5 | `10.20.30.61:7891`（无认证） |
+| 模型网关 | `http://10.20.30.61:8080`（`wire_api = "responses"`）。默认值，可在界面修改，见 `2026-11-16-configurable-endpoints-design.md` |
+| 上游 SOCKS5 | `10.20.30.61:7891`（无认证）。默认值，可在界面修改，见 `2026-11-16-configurable-endpoints-design.md` |
 | 本地代理端口 | `17891`；仅允许环境变量 `CODEX_HELPER_PROXY_PORT` 应急覆盖，界面不暴露 |
 | OpenAI 规则 | BlackMatrix7 OpenAI Clash 规则 2025-06-06 域名类快照（7 精确 + 24 后缀 + 关键字 `openai`） |
 | 凭据 target | `codex-helper/managed-gateway` |
@@ -32,13 +32,15 @@ CodexHelper 只保留其中最小可用的部分，做成一个独立的单窗�
 | 自动审批 reviewer | `approvals_reviewer = "auto_review"`（启用时写入，停用时还原） |
 | 沙箱模式 | `sandbox_mode = "workspace-write"`（启用时写入，停用时还原） |
 
+本地代理可由用户关闭。关闭后不启动 `127.0.0.1:17891`、不写 `.env` 受管块；`config.toml` 是否接管仍由受管开关决定。详见 `2026-11-16-configurable-endpoints-design.md`。
+
 ### 1.2 非目标（第一阶段）
 
 - 不做 PAC，不接管 Codex 启动，不注入 `--proxy-pac-url` / `--proxy-server`。
 - 不处理 Codex 界面层（`ChatGPT.exe` Chromium）的流量入口，见 §9。
 - 不支持 macOS / Linux 正式使用（macOS 仅作开发调试）。第二阶段已将 macOS 纳入支持，见
   `2026-10-14-codex-helper-macos-design.md`。
-- 不支持修改网关、SOCKS5、端口或规则；不在运行时下载规则。
+- 不支持修改本地代理端口或分流规则；不在运行时下载规则。网关与上游 SOCKS5 可在界面修改、本地代理可关闭，见 `2026-11-16-configurable-endpoints-design.md`。
 - 不修改 Windows 系统代理。
 - 不做诊断包导出、多语言（界面仅中文）。内部升级渠道见 §15（第一阶段之后新增，可选启用）。
 - 不安装 Python / Node.js、不修改 pip / npm 镜像配置；开发环境只做检测，见 §16。
