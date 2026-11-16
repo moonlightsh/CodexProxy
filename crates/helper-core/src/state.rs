@@ -45,6 +45,10 @@ pub struct HelperState {
     pub secure_policy_version: Option<u64>,
     /// SecureBlocked 的短原因码（激活/对账失败时写入；成功激活清除）
     pub secure_blocked_reason: Option<String>,
+    /// 用户配置的模型网关 URL；None = 使用默认值
+    pub gateway_base_url: Option<String>,
+    /// 用户配置的上游 SOCKS5 地址（host:port）；None = 使用默认值
+    pub socks5_addr: Option<String>,
 }
 
 impl HelperState {
@@ -153,6 +157,8 @@ mod tests {
             secure_policy_id: Some("policy-a".into()),
             secure_policy_version: Some(7),
             secure_blocked_reason: Some("policy_expired".into()),
+            gateway_base_url: None,
+            socks5_addr: None,
         };
         save(&path, &state).unwrap();
         let loaded = load(&path).unwrap().unwrap();
@@ -348,5 +354,37 @@ mod tests {
         state.clear_previous();
         assert_eq!(state.previous_model_provider, None);
         assert_eq!(state.previous_model_catalog_json, None);
+    }
+
+    /// 旧状态文件没有端点字段时，两个地址都是 None，其余字段保持原样。
+    #[test]
+    fn old_state_json_without_endpoint_fields_deserializes_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, r#"{"enabled": true}"#).unwrap();
+        let state = load(&path).unwrap().unwrap();
+        assert!(state.gateway_base_url.is_none());
+        assert!(state.socks5_addr.is_none());
+        assert!(state.enabled);
+    }
+
+    /// 两个端点字段以 snake_case 往返，文件里不出现驼峰名。
+    #[test]
+    fn endpoint_fields_round_trip_as_snake_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state = HelperState {
+            gateway_base_url: Some("http://example.com/proxy".into()),
+            socks5_addr: Some("127.0.0.1:1".into()),
+            ..Default::default()
+        };
+        save(&path, &state).unwrap();
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded, state);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"gateway_base_url\""));
+        assert!(text.contains("\"socks5_addr\""));
+        assert!(!text.contains("gatewayBaseUrl"));
+        assert!(!text.contains("socks5Addr"));
     }
 }

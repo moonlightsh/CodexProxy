@@ -1,15 +1,17 @@
-//! 固定参数（设计 §1.1）。全部写死，不提供界面修改。
+//! 固定参数（设计 §1.1）。
+//!
+//! 默认地址。用户可在桌面界面修改网关与上游 SOCKS5，见 `docs/superpowers/specs/2026-11-16-configurable-endpoints-design.md`；未自定义时使用这里的值。
 
-/// 模型网关地址（明文 HTTP，`wire_api = "responses"`）。
+/// 模型网关地址（明文 HTTP，`wire_api = "responses"`）。默认值。
 pub const GATEWAY_BASE_URL: &str = "http://10.20.30.61:8080";
-/// 模型网关主机，用于可达性检测与“恒直连”判定。
+/// 模型网关主机，用于可达性检测与“恒直连”判定。默认值。
 pub const GATEWAY_HOST: &str = "10.20.30.61";
-/// 模型网关端口。
+/// 模型网关端口。默认值。
 pub const GATEWAY_PORT: u16 = 8080;
 
-/// 上游 SOCKS5 主机（无认证）。
+/// 上游 SOCKS5 主机（无认证）。默认值。
 pub const SOCKS5_HOST: &str = "10.20.30.61";
-/// 上游 SOCKS5 端口。
+/// 上游 SOCKS5 端口。默认值。
 pub const SOCKS5_PORT: u16 = 7891;
 /// 安全上游端口（独立 mihomo-auth 实例：TLS + mTLS + SOCKS5 用户名密码，设计 §4.1）。
 pub const SOCKS5_AUTH_PORT: u16 = 7892;
