@@ -18,6 +18,7 @@ import { classifyKeyError } from "./errors";
 import { createFooterRegion } from "./footer";
 import { isFirstRun, keySubmitAction, showUpdatePanel, uninstallHint } from "./format";
 import { createKeyPanel } from "./keypanel";
+import { createEndpointPanel } from "./endpointpanel";
 import { createMessageRegion } from "./message";
 import { confirmModal } from "./modal";
 import { createStatusLightsRegion } from "./statuslights";
@@ -53,7 +54,9 @@ type OpKind =
   | "checkUpdate"
   | "installUpdate"
   | "detectDevEnv"
-  | "checkComponentUpdates";
+  | "checkComponentUpdates"
+  | "endpoints"
+  | "proxy";
 
 async function main(): Promise<void> {
   // 开发预览：仅在 DEV 构建且不存在 Tauri 运行时注入时加载；`import.meta.env.DEV`
@@ -114,6 +117,22 @@ async function main(): Promise<void> {
     },
   });
 
+  const endpointPanel = createEndpointPanel({
+    onSave: (gatewayBaseUrl, socks5Addr) => {
+      void saveEndpoints(gatewayBaseUrl, socks5Addr);
+    },
+    onRestoreDefaults: () => {
+      void saveEndpoints(null, null);
+    },
+    onProxyChange: (enabled) => {
+      void changeProxyEnabled(enabled);
+    },
+    onReenterKey: () => {
+      keyPanel.openForm();
+      keyPanel.focusInput();
+    },
+  });
+
   const statusLightsRegion = createStatusLightsRegion();
   const connectionsListRegion = createConnectionsListRegion();
 
@@ -149,19 +168,19 @@ async function main(): Promise<void> {
   const title = el("h1", { class: "app-title" }, ["CodexHelper"]);
   const loading = el("p", { class: "app-loading" }, ["加载中…"]);
   const connectionsTitle = el("h2", { class: "section-title" }, ["最近连接（最多 50 条）"]);
-  // 首次运行（未配置 Key 且未启用）时整体隐藏：只留横幅与 Key 录入区（任务 3.2 要求 2）。
-  // 受管模式开关单独隐藏（首次运行时还没有可切换的对象），状态灯/连接列表/底部一起隐藏。
+  // 首次运行（未配置 Key 且未启用）时隐藏受管开关和状态灯/连接/底部；网关设置保持可见。
   const normalModeRegion = el("div", { class: "normal-mode" }, [
     statusLightsRegion.root,
     connectionsTitle,
     connectionsListRegion.root,
     footerRegion.root,
   ]);
-  // 布局自上而下：横幅 → 受管模式开关 → API Key → 状态灯/连接/底部（任务 3.2 要求 1）。
+  // 布局自上而下：横幅 → 受管模式开关 → API Key → 网关设置 → 状态灯/连接/底部。
   const content = el("div", { class: "app-content" }, [
     bannerRegion.root,
     switchRegion.root,
     keyPanel.root,
+    endpointPanel.root,
     normalModeRegion,
   ]);
   content.hidden = true;
@@ -276,6 +295,7 @@ async function main(): Promise<void> {
 
     bannerRegion.update(status, busy);
     keyPanel.update(status, busy);
+    endpointPanel.update(status, busy);
 
     const firstRun = isFirstRun(status);
     switchRegion.root.hidden = firstRun;
@@ -431,6 +451,54 @@ async function main(): Promise<void> {
     } finally {
       busy.delete("enable");
       render();
+    }
+  }
+
+  async function saveEndpoints(gatewayBaseUrl: string | null, socks5Addr: string | null): Promise<void> {
+    if (busy.has("endpoints")) return;
+    busy.add("endpoints");
+    endpointPanel.clearFeedback();
+    renderGateway();
+    try {
+      const outcome = await api.setEndpoints({ gatewayBaseUrl, socks5Addr });
+      status = outcome.status;
+      endpointPanel.markClean();
+      endpointPanel.showWarnings(outcome.warnings, "endpoints");
+    } catch (error) {
+      const payload = toErrorPayload(error);
+      if (
+        payload.code === "invalidEndpoint" &&
+        (payload.field === "gateway" || payload.field === "socks5")
+      ) {
+        endpointPanel.showFieldError(payload.field, payload.message);
+      } else {
+        messageRegion.show(payload.message, "error");
+      }
+    } finally {
+      busy.delete("endpoints");
+      renderGateway();
+    }
+  }
+
+  async function changeProxyEnabled(enabled: boolean): Promise<void> {
+    if (busy.has("proxy")) return;
+    busy.add("proxy");
+    endpointPanel.clearFeedback();
+    renderGateway();
+    try {
+      const outcome = await api.setProxyEnabled(enabled);
+      status = outcome.status;
+      endpointPanel.showWarnings(outcome.warnings, "proxy");
+    } catch (error) {
+      const payload = toErrorPayload(error);
+      if (payload.code === "secureRequiresProxy") {
+        endpointPanel.showMessage(payload.message);
+      } else {
+        messageRegion.show(payload.message, "error");
+      }
+    } finally {
+      busy.delete("proxy");
+      renderGateway();
     }
   }
 

@@ -18,7 +18,7 @@ use helper_core::log;
 use helper_core::manager::Manager;
 use helper_core::types::{
     ConnectionRecord, EnableRequest, ErrorPayload, ManagerError, ReconcileReport, SaveKeyRequest,
-    Status,
+    SetEndpointsOutcome, SetEndpointsRequest, Status,
 };
 use serde_json::json;
 use tauri::AppHandle;
@@ -85,10 +85,20 @@ impl AppState {
     /// 改变状态的操作收尾：成功推送返回的状态；失败时操作可能已部分生效（如停用尽力完成其余步骤），
     /// 同样推送实际状态，保证界面与托盘一致，再把错误交给前端。
     async fn finish(&self, result: Result<Status, ManagerError>) -> Result<Status, ErrorPayload> {
+        self.finish_with(result, |status| status).await
+    }
+
+    /// [`Self::finish`] 的通用版：结果里带着状态快照的操作（如 `SetEndpointsOutcome`）由
+    /// `status_of` 取出要推送的状态。
+    async fn finish_with<T>(
+        &self,
+        result: Result<T, ManagerError>,
+        status_of: impl Fn(&T) -> &Status,
+    ) -> Result<T, ErrorPayload> {
         match result {
-            Ok(status) => {
-                self.publish(&status);
-                Ok(status)
+            Ok(value) => {
+                self.publish(status_of(&value));
+                Ok(value)
             }
             Err(error) => {
                 let status = self.manager.status().await;
@@ -200,6 +210,30 @@ pub async fn set_autostart(
     state.finish(result).await
 }
 
+/// 保存模型网关与上游 SOCKS5。解析与警告由 Manager 完成；成功或失败都推送当前状态。
+#[tauri::command]
+pub async fn set_endpoints(
+    state: tauri::State<'_, AppState>,
+    request: SetEndpointsRequest,
+) -> Result<SetEndpointsOutcome, ErrorPayload> {
+    let result = state.manager.set_endpoints(request).await;
+    state
+        .finish_with(result, |outcome: &SetEndpointsOutcome| &outcome.status)
+        .await
+}
+
+/// 打开或关闭本地代理。不在命令层再探测可达性，Manager 已经刷新过。
+#[tauri::command]
+pub async fn set_proxy_enabled(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<SetEndpointsOutcome, ErrorPayload> {
+    let result = state.manager.set_proxy_enabled(enabled).await;
+    state
+        .finish_with(result, |outcome: &SetEndpointsOutcome| &outcome.status)
+        .await
+}
+
 /// 最近连接（最新在前，最多 50 条）。
 #[tauri::command]
 pub fn recent_connections(state: tauri::State<'_, AppState>) -> Vec<ConnectionRecord> {
@@ -277,6 +311,7 @@ fn autostart_error(reason: &str) -> ErrorPayload {
     ErrorPayload {
         code: "internal".to_string(),
         message: format!("开机自启设置失败：{reason}"),
+        field: None,
     }
 }
 
@@ -314,6 +349,8 @@ mod tests {
                 state: ProxyState::Running,
                 port: 23456,
             },
+            // 开关缺省为关；这条用例要的是“代理在跑且开关开着”。
+            proxy_enabled: true,
             ..Default::default()
         };
         assert_eq!(

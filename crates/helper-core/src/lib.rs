@@ -14,6 +14,7 @@ pub mod connection_gate;
 pub mod consts;
 pub mod credential;
 pub mod devenv;
+pub mod endpoints;
 pub mod fsutil;
 pub mod gateway;
 pub mod log;

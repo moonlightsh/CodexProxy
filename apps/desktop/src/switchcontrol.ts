@@ -1,4 +1,4 @@
-// 受管模式开关（role=switch，设计 §8）。
+// 开关（role=switch）。受管模式与“启用本地代理”共用 createToggle。
 import { el } from "./dom";
 import type { Status } from "./types";
 
@@ -19,49 +19,82 @@ export interface SwitchRegion {
   update: (status: Status, busyState: SwitchBusyState) => void;
 }
 
-export function createSwitchRegion(handlers: SwitchHandlers): SwitchRegion {
+export interface ToggleView {
+  enabled: boolean;
+  busy: boolean;
+  label: string;
+  ariaLabel: string;
+  onText: string;
+  offText: string;
+  busyText: string;
+  /** 额外的禁用条件（忙时总是禁用）；缺省为 false */
+  disabled?: boolean;
+}
+
+export interface ToggleControl {
+  root: HTMLElement;
+  update: (view: ToggleView) => void;
+}
+
+/** 通用开关。忙时禁用并显示 busyText；点击回调的是切换后的目标状态。 */
+export function createToggle(handlers: { onChange: (enabled: boolean) => void }): ToggleControl {
   const button = el("button", {
     type: "button",
     class: "switch-control",
     role: "switch",
     "aria-checked": "false",
-    "aria-label": "受管模式",
   });
-  const label = el("span", { class: "switch-label" }, ["受管模式"]);
-  const stateText = el("span", { class: "switch-state-text" }, ["已停用"]);
+  const label = el("span", { class: "switch-label" });
+  const stateText = el("span", { class: "switch-state-text" });
   const root = el("div", { class: "switch-row" }, [label, button, stateText]);
 
   let currentEnabled = false;
 
   button.addEventListener("click", () => {
     if (button.disabled) return;
-    if (currentEnabled) {
-      handlers.onTurnOff();
-    } else {
-      handlers.onTurnOn();
-    }
+    handlers.onChange(!currentEnabled);
   });
 
-  const update = (status: Status, busyState: SwitchBusyState) => {
-    currentEnabled = status.enabled;
-    button.setAttribute("aria-checked", String(status.enabled));
-    button.classList.toggle("switch-on", status.enabled);
-    const busy = busyState.enabling || busyState.disabling;
-    stateText.textContent = busyState.enabling
-      ? "启用中…"
-      : busyState.disabling
-        ? "停用中…"
-        : status.enabled
-          ? "已启用"
-          : "已停用";
-    if (busy) {
+  const update = (view: ToggleView) => {
+    currentEnabled = view.enabled;
+    label.textContent = view.label;
+    button.setAttribute("aria-label", view.ariaLabel);
+    button.setAttribute("aria-checked", String(view.enabled));
+    button.classList.toggle("switch-on", view.enabled);
+    stateText.textContent = view.busy ? view.busyText : view.enabled ? view.onText : view.offText;
+    if (view.busy) {
       button.setAttribute("aria-busy", "true");
     } else {
       button.removeAttribute("aria-busy");
     }
-    const canToggle = status.enabled || status.keyConfigured;
-    button.disabled = busy || !canToggle;
+    button.disabled = view.busy || view.disabled === true;
   };
 
   return { root, update };
+}
+
+export function createSwitchRegion(handlers: SwitchHandlers): SwitchRegion {
+  const toggle = createToggle({
+    onChange: (enabled) => {
+      if (enabled) handlers.onTurnOn();
+      else handlers.onTurnOff();
+    },
+  });
+
+  const update = (status: Status, busyState: SwitchBusyState) => {
+    const busy = busyState.enabling || busyState.disabling;
+    toggle.update({
+      enabled: status.enabled,
+      busy,
+      label: "受管模式",
+      ariaLabel: "受管模式",
+      onText: "已启用",
+      offText: "已停用",
+      busyText: busyState.enabling ? "启用中…" : "停用中…",
+      // 未配置 Key 且未启用时不能打开受管开关
+      disabled: !(status.enabled || status.keyConfigured),
+    });
+  };
+
+  return { root: toggle.root, update };
 }

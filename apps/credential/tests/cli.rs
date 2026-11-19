@@ -98,7 +98,7 @@ fn cleanup_reconciles_real_files_in_subprocess() {
     .unwrap();
     std::fs::write(
         codex_home.path().join(".env"),
-        helper_core::codex_env::render_block(17891),
+        helper_core::codex_env::render_block(17891, helper_core::consts::GATEWAY_HOST),
     )
     .unwrap();
 

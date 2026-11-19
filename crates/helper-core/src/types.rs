@@ -33,6 +33,8 @@ pub enum Reachability {
     Unknown,
     Reachable,
     Unreachable,
+    /// 用户关闭了本地代理，不探测 SOCKS5
+    Disabled,
 }
 
 /// 本地代理运行状态。
@@ -101,6 +103,8 @@ pub struct Status {
     pub install_location_ok: bool,
     /// 受管模式开关（状态文件 `enabled`）
     pub enabled: bool,
+    /// 本地代理开关（状态文件 `proxy_disabled` 取反；缺省开启）
+    pub proxy_enabled: bool,
     /// 凭据是否已保存（不回显 Key）
     pub key_configured: bool,
     /// 已启用但凭据缺失（fail-closed，需要录入 Key）
@@ -114,6 +118,10 @@ pub struct Status {
     pub gateway_addr: String,
     /// 展示用：SOCKS5 地址，如 `10.20.30.61:7891`
     pub socks5_addr: String,
+    /// 当前生效的模型网关 URL（完整 URL，用于预填）
+    pub gateway_base_url: String,
+    /// state 里是否保存了自定义网关或 SOCKS5（损坏回落后仍为真，方便恢复默认）
+    pub endpoints_customized: bool,
     /// `config.toml` 已处于受管状态（model_provider 与受管节都正确）
     pub config_managed: bool,
     /// `.env` 受管块存在且内容与当前端口一致
@@ -156,6 +164,36 @@ impl fmt::Debug for EnableRequest {
             .field("confirm_remove_catalog", &self.confirm_remove_catalog)
             .finish()
     }
+}
+
+/// 保存网关与上游 SOCKS5。`None` 表示该侧恢复默认值。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SetEndpointsRequest {
+    pub gateway_base_url: Option<String>,
+    pub socks5_addr: Option<String>,
+}
+
+/// 保存端点后的非致命提示。无字段枚举，序列化为 camelCase 字符串。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EndpointWarning {
+    /// 新网关拒绝了已存 Key（401 / 403）
+    KeyRejected,
+    /// 无法连接新网关完成 Key 校验
+    KeyCheckUnavailable,
+    /// 本地代理由外部实例提供，新 SOCKS5 地址不会对它生效
+    ExternalProxy,
+    /// 受管已启用且网关 URL 变了，需要重启 Codex
+    RestartCodex,
+}
+
+/// `set_endpoints` 的结果：最新状态与警告。保存成功时为 `Ok`，Key 失败只出现在 `warnings`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetEndpointsOutcome {
+    pub status: Status,
+    pub warnings: Vec<EndpointWarning>,
 }
 
 /// 仅保存 / 替换 Key（“重新录入”），不改变启用状态。
@@ -251,6 +289,15 @@ pub enum ManagerError {
     /// 管理策略版本倒退：新注册包策略版本低于已持久化版本（Task 6 交接的回滚防线）。
     #[error("管理策略版本倒退：已见版本 {seen}，新策略版本 {new}，拒绝激活")]
     PolicyVersionRollback { seen: u64, new: u64 },
+    /// 网关或 SOCKS5 输入不合法。`field` 为 `"gateway"` 或 `"socks5"`。
+    #[error("{message}")]
+    InvalidEndpoint {
+        field: &'static str,
+        message: String,
+    },
+    /// Secure 已激活时不能关闭本地代理，代理关闭时也不能激活 Secure。
+    #[error("Secure 模式需要本地代理，请先停用 Secure")]
+    SecureRequiresProxy,
 }
 
 impl ManagerError {
@@ -272,24 +319,33 @@ impl ManagerError {
             Self::SecureActivation { .. } => "secureActivation",
             Self::SecurePortOccupied { .. } => "securePortOccupied",
             Self::PolicyVersionRollback { .. } => "policyVersionRollback",
+            Self::InvalidEndpoint { .. } => "invalidEndpoint",
+            Self::SecureRequiresProxy => "secureRequiresProxy",
         }
     }
 
-    /// 转为给前端的负载。
+    /// 转为给前端的负载。`field` 只在 `InvalidEndpoint` 时出现。
     pub fn payload(&self) -> ErrorPayload {
         ErrorPayload {
             code: self.code().to_string(),
             message: self.to_string(),
+            field: match self {
+                Self::InvalidEndpoint { field, .. } => Some((*field).to_string()),
+                _ => None,
+            },
         }
     }
 }
 
-/// 传给前端的错误：`{ code, message }`。
+/// 传给前端的错误：`{ code, message }`，地址校验失败时另带 `field`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ErrorPayload {
     pub code: String,
     pub message: String,
+    /// `"gateway"` 或 `"socks5"`；其他错误省略
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
 }
 
 impl From<ManagerError> for ErrorPayload {
@@ -324,6 +380,8 @@ mod tests {
         assert!(json.get("updateSupported").is_some());
         assert!(json.get("installLocationOk").is_some());
         assert!(json.get("modelCatalogJson").is_some());
+        assert!(json.get("gatewayBaseUrl").is_some());
+        assert!(json.get("endpointsCustomized").is_some());
         let request: EnableRequest =
             serde_json::from_str(r#"{"key":"k","forceSave":true,"confirmRemoveCatalog":true}"#)
                 .unwrap();
@@ -383,6 +441,22 @@ mod tests {
         let status = serde_json::to_value(Status::default()).unwrap();
         assert!(status.get("secure").is_some());
         assert_eq!(status["mode"], "Legacy");
+    }
+
+    #[test]
+    fn reachability_disabled_serializes_as_disabled() {
+        let json = serde_json::to_value(Reachability::Disabled).unwrap();
+        assert_eq!(json, serde_json::Value::String("disabled".into()));
+    }
+
+    #[test]
+    fn secure_requires_proxy_has_stable_code() {
+        let error = ManagerError::SecureRequiresProxy;
+        assert_eq!(error.code(), "secureRequiresProxy");
+        assert_eq!(
+            error.to_string(),
+            "Secure 模式需要本地代理，请先停用 Secure"
+        );
     }
 
     #[test]

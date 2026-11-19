@@ -111,6 +111,7 @@ pub struct ApplyOutcome {
 pub fn inspect(
     config_path: &Path,
     credential_command: &str,
+    gateway_base_url: &str,
 ) -> Result<ConfigInspection, ConfigError> {
     let loaded = load(config_path)?;
     if loaded.original.is_none() {
@@ -119,7 +120,7 @@ pub fn inspect(
     let doc = &loaded.doc;
     // 在副本上跑一遍校正：结构不符即报错，没有任何改动即“完全受管”，判定标准与 apply_managed 天然一致。
     let mut probe = doc.clone();
-    let fully_managed = !ensure_managed(&mut probe, credential_command)?;
+    let fully_managed = !ensure_managed(&mut probe, credential_command, gateway_base_url)?;
     Ok(ConfigInspection {
         exists: true,
         model_provider: root_string(doc, MODEL_PROVIDER_KEY),
@@ -172,7 +173,8 @@ pub fn managed_command(config_path: &Path) -> Result<Option<String>, ConfigError
 /// - `model_provider = "managed_gateway"`；
 /// - 受管根键 `approval_policy = "on-request"`、`approvals_reviewer = "auto_review"`、
 ///   `sandbox_mode = "workspace-write"`（自定义审批策略；调用方已记录原值）；
-/// - `[model_providers.managed_gateway]`：name / base_url / wire_api；移除 env_key、
+/// - `[model_providers.managed_gateway]`：name / base_url / wire_api；未配置 `supports_websockets`
+///   时默认设为 `true`；移除 env_key、
 ///   experimental_bearer_token、requires_openai_auth；`[...auth]` command = `credential_command`、
 ///   args = ["get", "codex-helper/managed-gateway"]；
 /// - 移除根键 `model_catalog_json`（调用方已确认并记录原值）。
@@ -183,9 +185,10 @@ pub fn apply_managed(
     config_path: &Path,
     backup_path: &Path,
     credential_command: &str,
+    gateway_base_url: &str,
 ) -> Result<ApplyOutcome, ConfigError> {
     let LoadedConfig { original, mut doc } = load(config_path)?;
-    let changed = ensure_managed(&mut doc, credential_command)?;
+    let changed = ensure_managed(&mut doc, credential_command, gateway_base_url)?;
     if changed {
         if let Some(original) = &original {
             fsutil::atomic_write(backup_path, original.as_bytes())?;
@@ -407,7 +410,11 @@ fn edit_existing(
 }
 
 /// 在内存中校正受管内容，返回是否有改动。结构不符（非 table）时返回 `NotATable`。
-fn ensure_managed(doc: &mut DocumentMut, credential_command: &str) -> Result<bool, ConfigError> {
+fn ensure_managed(
+    doc: &mut DocumentMut,
+    credential_command: &str,
+    gateway_base_url: &str,
+) -> Result<bool, ConfigError> {
     let before = doc.to_string();
 
     set_string(doc, MODEL_PROVIDER_KEY, consts::PROVIDER_ID);
@@ -421,8 +428,11 @@ fn ensure_managed(doc: &mut DocumentMut, credential_command: &str) -> Result<boo
     let provider_path = format!("{MODEL_PROVIDERS_KEY}.{}", consts::PROVIDER_ID);
     let provider = child_table(providers, consts::PROVIDER_ID, &provider_path, false)?;
     set_string(provider, "name", consts::PROVIDER_NAME);
-    set_string(provider, "base_url", consts::GATEWAY_BASE_URL);
+    set_string(provider, "base_url", gateway_base_url);
     set_string(provider, "wire_api", consts::PROVIDER_WIRE_API);
+    if !provider.contains_key("supports_websockets") {
+        set_value(provider, "supports_websockets", Value::from(true));
+    }
     // 命令鉴权与 env_key / experimental_bearer_token / requires_openai_auth 互斥
     for key in EXCLUSIVE_AUTH_KEYS {
         provider.remove(key);
@@ -776,7 +786,12 @@ mod tests {
         }
 
         fn apply(&self, command: &str) -> Result<ApplyOutcome, ConfigError> {
-            apply_managed(&self.config, &self.backup, command)
+            apply_managed(
+                &self.config,
+                &self.backup,
+                command,
+                crate::consts::GATEWAY_BASE_URL,
+            )
         }
     }
 
@@ -802,6 +817,54 @@ mod tests {
         assert!(!text.contains("env_key"));
         assert!(!text.contains("experimental_bearer_token"));
         assert!(!text.contains("requires_openai_auth = true"));
+    }
+
+    #[test]
+    fn apply_rewrites_base_url_and_inspect_follows_the_same_url() {
+        let fixture = Fixture::with(concat!(
+            "model_provider = \"managed_gateway\"\n",
+            "approval_policy = \"on-request\"\n",
+            "approvals_reviewer = \"auto_review\"\n",
+            "sandbox_mode = \"workspace-write\"\n",
+            "\n[model_providers.managed_gateway]\n",
+            "name = \"Managed Gateway\"\n",
+            "base_url = \"http://10.20.30.61:8080\"\n",
+            "wire_api = \"responses\"\n",
+            "\n[model_providers.managed_gateway.auth]\n",
+            "command = \"C:\\\\x\\\\codex-helper-credential.exe\"\n",
+            "args = [\"get\", \"codex-helper/managed-gateway\"]\n",
+        ));
+        let outcome = apply_managed(
+            &fixture.config,
+            &fixture.backup,
+            COMMAND,
+            "http://127.0.0.1:9",
+        )
+        .unwrap();
+        assert!(outcome.changed);
+        let doc = fixture.read().parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            doc["model_providers"]["managed_gateway"]["base_url"].as_str(),
+            Some("http://127.0.0.1:9")
+        );
+        assert!(
+            !inspect(&fixture.config, COMMAND, "http://10.20.30.61:8080")
+                .unwrap()
+                .fully_managed
+        );
+        assert!(
+            inspect(&fixture.config, COMMAND, "http://127.0.0.1:9")
+                .unwrap()
+                .fully_managed
+        );
+        let second = apply_managed(
+            &fixture.config,
+            &fixture.backup,
+            COMMAND,
+            "http://127.0.0.1:9",
+        )
+        .unwrap();
+        assert!(!second.changed);
     }
 
     #[test]
@@ -844,7 +907,7 @@ mod tests {
         std::fs::write(&catalog, "[]").unwrap();
         let original = fixture.read();
         assert_eq!(
-            inspect(&fixture.config, COMMAND)
+            inspect(&fixture.config, COMMAND, crate::consts::GATEWAY_BASE_URL)
                 .unwrap()
                 .model_catalog_json
                 .as_deref(),
@@ -862,7 +925,7 @@ mod tests {
     fn no_conflict_returns_none_and_removal_is_noop() {
         let fixture = Fixture::with("model = \"gpt-5.2\"\n");
         assert!(
-            inspect(&fixture.config, COMMAND)
+            inspect(&fixture.config, COMMAND, crate::consts::GATEWAY_BASE_URL)
                 .unwrap()
                 .model_catalog_json
                 .is_none()
@@ -914,7 +977,7 @@ mod tests {
             assert_eq!(fixture.read(), text);
             assert!(!fixture.backup.exists());
             // inspect 与 apply_managed 判定一致：同样报 NotATable（只读，不写入）
-            match inspect(&fixture.config, COMMAND) {
+            match inspect(&fixture.config, COMMAND, crate::consts::GATEWAY_BASE_URL) {
                 Err(ConfigError::NotATable { key }) => assert_eq!(key, expected_key, "{text}"),
                 other => panic!("{text} 的 inspect 应返回 NotATable，实际 {other:?}"),
             }
@@ -939,7 +1002,10 @@ mod tests {
         ];
         for (text, residue) in cases {
             let fixture = Fixture::with(text);
-            assert!(inspect(&fixture.config, COMMAND).is_err(), "{text}");
+            assert!(
+                inspect(&fixture.config, COMMAND, crate::consts::GATEWAY_BASE_URL).is_err(),
+                "{text}"
+            );
             assert_eq!(has_residue(&fixture.config).unwrap(), residue, "{text}");
             // 清理路径对结构宽松：能删的受管内容照删，不因结构不符失败
             assert_eq!(remove_residue(&fixture.config).unwrap(), residue, "{text}");
@@ -957,7 +1023,9 @@ mod tests {
         ] {
             let fixture = Fixture::with(text);
             let errors = [
-                inspect(&fixture.config, COMMAND).map(|_| ()).unwrap_err(),
+                inspect(&fixture.config, COMMAND, crate::consts::GATEWAY_BASE_URL)
+                    .map(|_| ())
+                    .unwrap_err(),
                 fixture.apply(COMMAND).map(|_| ()).unwrap_err(),
                 restore(&fixture.config, &PreviousConfig::default())
                     .map(|_| ())
@@ -982,7 +1050,9 @@ mod tests {
         let text = "model = \"o3\"\n[model_providers.managed_gateway\nexperimental_bearer_token = \"sk-secret-123\"\n";
         let fixture = Fixture::with(text);
         let errors = [
-            inspect(&fixture.config, COMMAND).map(|_| ()).unwrap_err(),
+            inspect(&fixture.config, COMMAND, crate::consts::GATEWAY_BASE_URL)
+                .map(|_| ())
+                .unwrap_err(),
             fixture.apply(COMMAND).map(|_| ()).unwrap_err(),
             restore(&fixture.config, &PreviousConfig::default())
                 .map(|_| ())
@@ -1100,7 +1170,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("nested").join(".codex").join("config.toml");
         let backup = config.with_file_name(consts::CONFIG_BACKUP_FILE_NAME);
-        let outcome = apply_managed(&config, &backup, COMMAND).unwrap();
+        let outcome =
+            apply_managed(&config, &backup, COMMAND, crate::consts::GATEWAY_BASE_URL).unwrap();
         assert!(outcome.changed);
         assert!(config.exists());
         assert!(!backup.exists());
@@ -1210,14 +1281,19 @@ mod tests {
     fn utf8_bom_is_stripped_for_parsing_and_preserved_on_write() {
         let original = "\u{feff}model_provider = \"custom\"\n";
         let fixture = Fixture::with(original);
-        let inspection = inspect(&fixture.config, COMMAND).unwrap();
+        let inspection =
+            inspect(&fixture.config, COMMAND, crate::consts::GATEWAY_BASE_URL).unwrap();
         assert_eq!(inspection.model_provider.as_deref(), Some("custom"));
         let outcome = fixture.apply(COMMAND).unwrap();
         assert_eq!(outcome.original.as_deref(), Some(original));
         let text = fixture.read();
         assert!(text.starts_with("\u{feff}model_provider = \"managed_gateway\"\n"));
         assert_eq!(text.matches('\u{feff}').count(), 1);
-        assert!(inspect(&fixture.config, COMMAND).unwrap().fully_managed);
+        assert!(
+            inspect(&fixture.config, COMMAND, crate::consts::GATEWAY_BASE_URL)
+                .unwrap()
+                .fully_managed
+        );
         assert!(restore(&fixture.config, &inspection.previous()).unwrap());
         assert_eq!(fixture.read(), original);
     }
@@ -1228,7 +1304,7 @@ mod tests {
     fn inspect_missing_file_returns_default() {
         let fixture = Fixture::new();
         assert_eq!(
-            inspect(&fixture.config, COMMAND).unwrap(),
+            inspect(&fixture.config, COMMAND, crate::consts::GATEWAY_BASE_URL).unwrap(),
             ConfigInspection::default()
         );
     }
@@ -1237,7 +1313,7 @@ mod tests {
     fn inspect_reports_values_and_full_management() {
         let fixture =
             Fixture::with("model_provider = \"custom\"\nmodel_catalog_json = \"C:\\\\c.json\"\n");
-        let before = inspect(&fixture.config, COMMAND).unwrap();
+        let before = inspect(&fixture.config, COMMAND, crate::consts::GATEWAY_BASE_URL).unwrap();
         assert!(before.exists);
         assert_eq!(before.model_provider.as_deref(), Some("custom"));
         assert_eq!(before.model_catalog_json.as_deref(), Some("C:\\c.json"));
@@ -1254,7 +1330,7 @@ mod tests {
         );
 
         fixture.apply(COMMAND).unwrap();
-        let after = inspect(&fixture.config, COMMAND).unwrap();
+        let after = inspect(&fixture.config, COMMAND, crate::consts::GATEWAY_BASE_URL).unwrap();
         assert!(after.fully_managed);
         assert!(after.has_managed_provider);
         assert!(after.has_managed_residue());
@@ -1264,9 +1340,13 @@ mod tests {
         assert_eq!(after.previous(), PreviousConfig::default());
         // 安装目录变化：command 不同即不完全受管
         assert!(
-            !inspect(&fixture.config, "D:\\other\\c.exe")
-                .unwrap()
-                .fully_managed
+            !inspect(
+                &fixture.config,
+                "D:\\other\\c.exe",
+                crate::consts::GATEWAY_BASE_URL
+            )
+            .unwrap()
+            .fully_managed
         );
     }
 
@@ -1307,7 +1387,9 @@ mod tests {
             assert_ne!(drift, managed);
             std::fs::write(&fixture.config, &drift).unwrap();
             assert!(
-                !inspect(&fixture.config, COMMAND).unwrap().fully_managed,
+                !inspect(&fixture.config, COMMAND, crate::consts::GATEWAY_BASE_URL)
+                    .unwrap()
+                    .fully_managed,
                 "{drift}"
             );
         }
@@ -1353,7 +1435,8 @@ mod tests {
             sandbox_mode: Some("read-only".into()),
         };
         assert!(restore(&fixture.config, &previous).unwrap());
-        let inspection = inspect(&fixture.config, COMMAND).unwrap();
+        let inspection =
+            inspect(&fixture.config, COMMAND, crate::consts::GATEWAY_BASE_URL).unwrap();
         assert_eq!(inspection.model_provider.as_deref(), Some("custom"));
         assert_eq!(inspection.model_catalog_json.as_deref(), Some("C:\\c.json"));
         assert_eq!(inspection.approval_policy.as_deref(), Some("untrusted"));
@@ -1467,7 +1550,7 @@ mod tests {
         managed.apply(COMMAND).unwrap();
         assert!(has_residue(&managed.config).unwrap());
         assert!(
-            inspect(&managed.config, COMMAND)
+            inspect(&managed.config, COMMAND, crate::consts::GATEWAY_BASE_URL)
                 .unwrap()
                 .has_managed_residue()
         );

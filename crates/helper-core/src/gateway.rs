@@ -11,11 +11,6 @@ pub const KEY_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 /// TCP 可达性检测的连接超时。
 pub const TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// 用固定网关校验 Key：`GET {GATEWAY_BASE_URL}/v1/models`，Bearer 鉴权。
-pub async fn verify_key(key: &str) -> KeyCheck {
-    verify_key_at(crate::consts::GATEWAY_BASE_URL, key, KEY_CHECK_TIMEOUT).await
-}
-
 /// 指定网关地址与超时的校验入口（供测试注入 mock 网关）。
 ///
 /// - 2xx → `Ok`；401 / 403 → `Unauthorized`；5xx → `ServerError`。

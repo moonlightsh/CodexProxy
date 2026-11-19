@@ -11,6 +11,8 @@ import type {
   ErrorPayload,
   ReconcileReport,
   SaveKeyRequest,
+  SetEndpointsOutcome,
+  SetEndpointsRequest,
   Status,
   UpdateCheck,
 } from "./types";
@@ -21,6 +23,10 @@ export const api = {
   enable: (request: EnableRequest) => invoke<Status>("enable", { request }),
   disable: () => invoke<Status>("disable"),
   saveKey: (request: SaveKeyRequest) => invoke<Status>("save_key", { request }),
+  setEndpoints: (request: SetEndpointsRequest) =>
+    invoke<SetEndpointsOutcome>("set_endpoints", { request }),
+  setProxyEnabled: (enabled: boolean) =>
+    invoke<SetEndpointsOutcome>("set_proxy_enabled", { enabled }),
   clearKey: () => invoke<Status>("clear_key"),
   cleanupResidue: () => invoke<Status>("cleanup_residue"),
   removeLegacyEnvBlock: () => invoke<Status>("remove_legacy_env_block"),

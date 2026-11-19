@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use helper_core::credential::Secret;
 use helper_core::proxy::ProxyConfig;
+use helper_core::proxy::Routing;
 use helper_core::proxy::build_socks5_connect_request;
 use helper_core::proxy::spawn_with_listener;
 use helper_core::upstream::SecureUpstream;
@@ -643,11 +644,13 @@ fn spawn_proxy(
     decoy: std::net::SocketAddr,
     secure: SecureUpstream,
 ) -> helper_core::proxy::ProxyHandle {
+    let mut routing = Routing::from_endpoints(&helper_core::endpoints::Endpoints::default_values());
+    routing.socks5_host = decoy.ip().to_string();
+    routing.socks5_port = decoy.port();
     spawn_with_listener(
         listener,
         ProxyConfig {
-            socks5_host: decoy.ip().to_string(),
-            socks5_port: decoy.port(),
+            routing: Arc::new(std::sync::RwLock::new(routing)),
             secure_upstream: Some(Arc::new(secure)),
             ..ProxyConfig::default()
         },

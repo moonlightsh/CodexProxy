@@ -2,7 +2,7 @@
 
 export type Route = "socks5" | "direct";
 export type KeyCheck = "ok" | "unauthorized" | "serverError" | "timeoutOrNetwork";
-export type Reachability = "unknown" | "reachable" | "unreachable";
+export type Reachability = "unknown" | "reachable" | "unreachable" | "disabled";
 export type ProxyState = "stopped" | "running" | "external";
 export type Platform = "windows" | "macos" | "other";
 
@@ -30,6 +30,8 @@ export interface Status {
   /** 安装位置是否正常；macOS 上从 dmg 或 App Translocation 临时位置运行时为 false */
   installLocationOk: boolean;
   enabled: boolean;
+  /** 本地代理开关（缺省开启） */
+  proxyEnabled: boolean;
   keyConfigured: boolean;
   needsKey: boolean;
   proxy: ProxyStatus;
@@ -37,6 +39,10 @@ export interface Status {
   socks5: Reachability;
   gatewayAddr: string;
   socks5Addr: string;
+  /** 当前生效的模型网关 URL，用于预填输入框 */
+  gatewayBaseUrl: string;
+  /** state 里是否保存了自定义网关或 SOCKS5 */
+  endpointsCustomized: boolean;
   configManaged: boolean;
   envManaged: boolean;
   residue: boolean;
@@ -57,6 +63,25 @@ export interface EnableRequest {
 export interface SaveKeyRequest {
   key: string;
   forceSave?: boolean;
+}
+
+/** 保存网关与上游 SOCKS5。`null` 表示该侧恢复默认值。 */
+export interface SetEndpointsRequest {
+  gatewayBaseUrl: string | null;
+  socks5Addr: string | null;
+}
+
+/** 保存端点或切换本地代理后的非致命提示。 */
+export type EndpointWarning =
+  | "keyRejected"
+  | "keyCheckUnavailable"
+  | "externalProxy"
+  | "restartCodex";
+
+/** `set_endpoints` / `set_proxy_enabled` 的结果。 */
+export interface SetEndpointsOutcome {
+  status: Status;
+  warnings: EndpointWarning[];
 }
 
 export type ErrorCode =
@@ -82,11 +107,15 @@ export type ErrorCode =
   | "io"
   | "update"
   | "installLocation"
+  | "invalidEndpoint"
+  | "secureRequiresProxy"
   | "internal";
 
 export interface ErrorPayload {
   code: ErrorCode;
   message: string;
+  /** 地址校验失败时为 `"gateway"` 或 `"socks5"` */
+  field?: "gateway" | "socks5";
 }
 
 export type ReconcileOutcome = "idle" | "residueFound" | "applied" | "needsKey" | "failed";

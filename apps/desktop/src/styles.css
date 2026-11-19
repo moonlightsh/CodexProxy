@@ -417,6 +417,47 @@ input[type="text"]:focus,
   color: var(--warn-fg);
 }
 
+/* ---- 网关设置 ---- */
+
+.endpoint-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--panel-bg);
+}
+
+.endpoint-row,
+.endpoint-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.endpoint-row input {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+}
+
+.endpoint-field-error,
+.endpoint-feedback-error {
+  margin: 0;
+  color: var(--bad-fg);
+}
+
+.endpoint-feedback-warn {
+  margin: 0;
+  color: var(--warn-fg);
+}
+
+/* 只降低不透明度，不禁用指针，关闭代理后仍可修改并保存。 */
+.endpoint-input-muted {
+  opacity: 0.55;
+}
+
 /* ---- 受管模式开关 ---- */
 
 .switch-row {

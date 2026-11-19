@@ -1,5 +1,6 @@
 // 状态灯四行（设计 §8）：颜色 + 文字，不只靠颜色区分。
 import { clear, el } from "./dom";
+import { formatSocks5Light } from "./endpointformat";
 import {
   configManagedLevel,
   formatConfigManagedLabel,
@@ -31,6 +32,7 @@ export function createStatusLightsRegion(): StatusLightsRegion {
 
   const update = (status: Status) => {
     clear(root);
+    const socks5Light = formatSocks5Light(status.proxyEnabled, status.socks5);
     root.append(
       lightRow(
         "本地代理",
@@ -44,12 +46,7 @@ export function createStatusLightsRegion(): StatusLightsRegion {
         formatReachabilityLabel(status.gateway),
         reachabilityLevel(status.gateway),
       ),
-      lightRow(
-        "SOCKS5",
-        status.socks5Addr,
-        formatReachabilityLabel(status.socks5),
-        reachabilityLevel(status.socks5),
-      ),
+      lightRow("SOCKS5", status.socks5Addr, socks5Light.text, socks5Light.level),
       lightRow(
         "Codex 配置",
         "config.toml / .env",

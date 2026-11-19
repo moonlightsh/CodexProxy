@@ -84,6 +84,7 @@ fn ensure_update_supported() -> Result<(), ErrorPayload> {
         Err(ErrorPayload {
             code: "update".to_string(),
             message: "当前平台不支持内部升级，请到 GitHub Release 下载新版本".to_string(),
+            field: None,
         })
     }
 }
@@ -103,6 +104,7 @@ fn ensure_install_location_ok() -> Result<(), ErrorPayload> {
         Err(ErrorPayload {
             code: "update".to_string(),
             message: TRANSIENT_INSTALL_UPDATE_MESSAGE.to_string(),
+            field: None,
         })
     } else {
         Ok(())
@@ -128,6 +130,7 @@ fn build_updater(app: &AppHandle) -> Result<Updater, ErrorPayload> {
         let endpoint = validate_endpoint(&url).map_err(|reason| ErrorPayload {
             code: "update".to_string(),
             message: format!("{UPDATE_URL_ENV} 无效：{reason}"),
+            field: None,
         })?;
         builder = builder
             .endpoints(vec![endpoint])
@@ -143,6 +146,7 @@ fn map_error(context: &str, error: tauri_plugin_updater::Error) -> ErrorPayload 
     ErrorPayload {
         code: "update".to_string(),
         message: format!("{context}：{error}"),
+        field: None,
     }
 }
 
@@ -206,6 +210,7 @@ pub async fn install_update(app: AppHandle, expected_version: String) -> Result<
             return Err(ErrorPayload {
                 code: "update".to_string(),
                 message: "没有可安装的更新（可能已是最新版本）。".to_string(),
+                field: None,
             });
         }
         Err(error) => return Err(map_error("检查更新失败", error)),
@@ -218,6 +223,7 @@ pub async fn install_update(app: AppHandle, expected_version: String) -> Result<
         return Err(ErrorPayload {
             code: "update".to_string(),
             message: "可用版本已变化，请重新检查更新后再安装。".to_string(),
+            field: None,
         });
     }
     log::event(

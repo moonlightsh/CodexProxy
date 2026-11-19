@@ -20,7 +20,9 @@ import type {
   ErrorPayload,
   ReconcileReport,
   SaveKeyRequest,
+  SetEndpointsRequest,
   Status,
+  EndpointWarning,
 } from "./types";
 import { INVALID_KEY_CHARS_MESSAGE } from "./errors";
 import { INSTALL_LOCATION_MESSAGE } from "./format";
@@ -38,6 +40,18 @@ const UPDATE_UNSUPPORTED: ErrorPayload = {
 /** 仅用于验证生产构建未打包本文件的特征字符串。 */
 export const DEV_MOCK_MARKER = "__CODEX_HELPER_DEV_MOCK__";
 
+/** 预览用的默认网关与 SOCKS5，与 consts 一致。 */
+const DEFAULT_GATEWAY_BASE_URL = "http://10.20.30.61:8080";
+const DEFAULT_SOCKS5_ADDR = "10.20.30.61:7891";
+
+/** 展示用网关地址：IPv6 加方括号；省略端口时 http 为 80、https 为 443。 */
+function gatewayAddrFromUrl(value: string): string {
+  const url = new URL(value);
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  const host = url.hostname.includes(":") ? `[${url.hostname}]` : url.hostname;
+  return `${host}:${port}`;
+}
+
 function baseStatus(): Status {
   return {
     platformSupported: true,
@@ -45,6 +59,7 @@ function baseStatus(): Status {
     updateSupported: true,
     installLocationOk: true,
     enabled: false,
+    proxyEnabled: true,
     keyConfigured: false,
     needsKey: false,
     proxy: { state: "stopped", port: 17891 },
@@ -52,6 +67,8 @@ function baseStatus(): Status {
     socks5: "unknown",
     gatewayAddr: "10.20.30.61:8080",
     socks5Addr: "10.20.30.61:7891",
+    gatewayBaseUrl: "http://10.20.30.61:8080",
+    endpointsCustomized: false,
     configManaged: false,
     envManaged: false,
     residue: false,
@@ -432,6 +449,59 @@ export function installDevMock(): void {
           }
           setStatus({ ...status, autostart: Boolean(args.enabled) });
           return status;
+        }
+
+        case "set_endpoints": {
+          const request = args.request as SetEndpointsRequest;
+          if (request.gatewayBaseUrl !== null && request.gatewayBaseUrl.trim() === "") {
+            return reject({ code: "invalidEndpoint", message: "不能为空", field: "gateway" });
+          }
+          if (
+            request.socks5Addr !== null &&
+            request.socks5Addr !== "" &&
+            !/^\S+:\d{1,5}$/.test(request.socks5Addr) &&
+            !/^\[[^\]]+\]:\d{1,5}$/.test(request.socks5Addr)
+          ) {
+            return reject({ code: "invalidEndpoint", message: "格式应为 host:port", field: "socks5" });
+          }
+          const gatewayBaseUrl = request.gatewayBaseUrl ?? DEFAULT_GATEWAY_BASE_URL;
+          const socks5Addr = request.socks5Addr ?? DEFAULT_SOCKS5_ADDR;
+          let gatewayAddr: string;
+          try {
+            gatewayAddr = gatewayAddrFromUrl(gatewayBaseUrl);
+          } catch {
+            return reject({ code: "invalidEndpoint", message: "网关地址无效", field: "gateway" });
+          }
+          const endpointsCustomized =
+            gatewayBaseUrl !== DEFAULT_GATEWAY_BASE_URL || socks5Addr !== DEFAULT_SOCKS5_ADDR;
+          const warnings: EndpointWarning[] =
+            status.enabled && gatewayBaseUrl !== status.gatewayBaseUrl ? ["restartCodex"] : [];
+          setStatus({
+            ...status,
+            gatewayBaseUrl,
+            socks5Addr,
+            gatewayAddr,
+            endpointsCustomized,
+          });
+          return { status, warnings };
+        }
+
+        case "set_proxy_enabled": {
+          const enabled = args.enabled === true;
+          if (!enabled && scenario === "secure") {
+            return reject({
+              code: "secureRequiresProxy",
+              message: "Secure 模式需要本地代理，请先停用 Secure",
+            });
+          }
+          const warnings: EndpointWarning[] = status.enabled ? ["restartCodex"] : [];
+          setStatus({
+            ...status,
+            proxyEnabled: enabled,
+            socks5: enabled ? (status.socks5 === "disabled" ? "unknown" : status.socks5) : "disabled",
+            proxy: { state: enabled ? "running" : "stopped", port: status.proxy.port },
+          });
+          return { status, warnings };
         }
 
         case "check_update":

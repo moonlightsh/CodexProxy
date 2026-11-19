@@ -15,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
@@ -475,18 +475,42 @@ async fn socks5_connect_phase<S: AsyncRead + AsyncWrite + Unpin>(
 /// 连接记录回调。
 pub type RecordSink = Arc<dyn Fn(ConnectionRecord) + Send + Sync>;
 
+/// 一次连接使用的上游与恒直连主机。保存地址时就地更新，不重启监听。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Routing {
+    pub socks5_host: String,
+    pub socks5_port: u16,
+    /// 已规范化的恒直连主机：网关主机在前，SOCKS5 主机在后；两者相同时只保留一份
+    pub always_direct_hosts: Vec<String>,
+}
+
+impl Routing {
+    /// 从端点取出 SOCKS5 与恒直连主机。网关主机始终在列表里。
+    pub fn from_endpoints(endpoints: &crate::endpoints::Endpoints) -> Self {
+        let mut always_direct_hosts = vec![endpoints.gateway_host.clone()];
+        if endpoints.socks5_host != endpoints.gateway_host {
+            always_direct_hosts.push(endpoints.socks5_host.clone());
+        }
+        Self {
+            socks5_host: endpoints.socks5_host.clone(),
+            socks5_port: endpoints.socks5_port,
+            always_direct_hosts,
+        }
+    }
+}
+
 /// 代理运行参数。上游可注入（测试），默认为固定的受管 SOCKS5。
 #[derive(Clone)]
 pub struct ProxyConfig {
-    pub socks5_host: String,
-    pub socks5_port: u16,
+    /// 连接开始时拷贝快照。保存地址只写这把锁，不重启监听。
+    pub routing: Arc<RwLock<Routing>>,
     /// 每条连接结束后调用
     pub on_record: Option<RecordSink>,
     /// 仅供测试：直连时把主机名（规范化后）映射到固定地址，用于验证“命中规则但上游失败时
     /// 目标未收到直连”。生产必须为 `None`；只影响直连路径，不影响分流判定与 SOCKS5 路径。
     pub direct_overrides: Option<Arc<HashMap<String, SocketAddr>>>,
     /// 安全上游（TLS + mTLS + SOCKS5 用户名密码）。`Some` 时命中规则的流量只走它，
-    /// 失败即 502，绝不回退 `socks5_host:socks5_port` 旧入口；`None` 走旧的无认证路径。
+    /// 失败即 502，绝不回退 `routing` 里的无认证 SOCKS5；`None` 走旧的无认证路径。
     pub secure_upstream: Option<Arc<SecureUpstream>>,
     /// 本机进程身份门禁（设计 §6.3）。`Some` 时除自识端点外的每个请求都必须先通过门禁，
     /// 任何失败（解析失败/超时/作用域不符/映像未批准）都回 403 并关闭，零出站；
@@ -497,8 +521,9 @@ pub struct ProxyConfig {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            socks5_host: crate::consts::SOCKS5_HOST.to_string(),
-            socks5_port: crate::consts::SOCKS5_PORT,
+            routing: Arc::new(RwLock::new(Routing::from_endpoints(
+                &crate::endpoints::Endpoints::default_values(),
+            ))),
             on_record: None,
             direct_overrides: None,
             secure_upstream: None,
@@ -509,9 +534,11 @@ impl Default for ProxyConfig {
 
 impl fmt::Debug for ProxyConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let routing = self.routing.read().unwrap_or_else(PoisonError::into_inner);
         f.debug_struct("ProxyConfig")
-            .field("socks5_host", &self.socks5_host)
-            .field("socks5_port", &self.socks5_port)
+            .field("socks5_host", &routing.socks5_host)
+            .field("socks5_port", &routing.socks5_port)
+            .field("always_direct_hosts", &routing.always_direct_hosts)
             .field("on_record", &self.on_record.as_ref().map(|_| "<fn>"))
             .field("direct_overrides", &self.direct_overrides)
             // SecureUpstream 的 Debug 已脱敏：不含密码与 PEM
@@ -953,9 +980,16 @@ async fn handle_connection(mut client: TcpStream, shared: Arc<Shared>) {
         },
     };
 
-    let decision = rules::route_for_host(&target.host);
+    // 分流前拷贝快照并立刻释放读锁，锁不跨 await。已建立的隧道继续用自己的旧上游。
+    let routing = shared
+        .config
+        .routing
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let decision = rules::route_for_host(&target.host, &routing.always_direct_hosts);
     let connect_started = Instant::now();
-    let upstream = connect_upstream(&shared.config, &target, decision).await;
+    let upstream = connect_upstream(&shared.config, &routing, &target, decision).await;
     let mut pending = PendingRecord {
         shared: Arc::clone(&shared),
         kind: target.kind,
@@ -990,21 +1024,23 @@ async fn handle_connection(mut client: TcpStream, shared: Arc<Shared>) {
 }
 
 /// 按分流决策建立上游连接。SOCKS5 路径失败绝不改走直连。
+/// `routing` 是连接开始时的快照，不在这里再读锁。
 async fn connect_upstream(
     config: &ProxyConfig,
+    routing: &Routing,
     target: &ProxyTarget,
     decision: Route,
 ) -> anyhow::Result<BoxedTransport> {
     match decision {
         Route::Socks5 => match &config.secure_upstream {
-            // 安全上游已配置：只走它，失败不回退旧入口
+            // 安全上游已配置：只走它，失败不回退 routing 里的无认证 SOCKS5
             Some(secure) => {
                 crate::upstream::connect_secure(secure, &target.host, target.port).await
             }
             None => {
                 connect_via_socks5_at(
-                    &config.socks5_host,
-                    config.socks5_port,
+                    &routing.socks5_host,
+                    routing.socks5_port,
                     &target.host,
                     target.port,
                 )

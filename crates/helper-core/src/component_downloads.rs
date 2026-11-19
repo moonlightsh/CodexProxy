@@ -663,14 +663,17 @@ mod tests {
     #[test]
     fn github_asset_hosts_use_upstream_proxy() {
         assert_eq!(
-            route_for_host("release-assets.githubusercontent.com"),
+            route_for_host("release-assets.githubusercontent.com", &[]),
             Route::Socks5
         );
         assert_eq!(
-            route_for_host("objects.githubusercontent.com"),
+            route_for_host("objects.githubusercontent.com", &[]),
             Route::Socks5
         );
-        assert_eq!(route_for_host("evil.githubusercontent.com"), Route::Direct);
+        assert_eq!(
+            route_for_host("evil.githubusercontent.com", &[]),
+            Route::Direct
+        );
     }
 
     fn request(id: &str) -> DownloadRequest {
@@ -711,6 +714,18 @@ mod tests {
             .await;
         assert_eq!(result.unwrap_err().code, "downloadProxy");
         assert!(!directory.exists());
+    }
+
+    /// 代理开关关闭的直连原因仍走现有拒绝，不回退直连下载。
+    #[test]
+    fn disabled_proxy_reason_is_still_rejected() {
+        let error = download_client(&NetworkPath::Direct {
+            reason: Some("本地代理未开启，已直连"),
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "downloadProxy");
+        assert!(error.message.contains("请先启用本地代理"));
+        assert!(error.message.contains("不会回退直连"));
     }
 
     #[tokio::test]
