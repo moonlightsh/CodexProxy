@@ -173,7 +173,8 @@ pub fn managed_command(config_path: &Path) -> Result<Option<String>, ConfigError
 /// - `model_provider = "managed_gateway"`；
 /// - 受管根键 `approval_policy = "on-request"`、`approvals_reviewer = "auto_review"`、
 ///   `sandbox_mode = "workspace-write"`（自定义审批策略；调用方已记录原值）；
-/// - `[model_providers.managed_gateway]`：name / base_url / wire_api；移除 env_key、
+/// - `[model_providers.managed_gateway]`：name / base_url / wire_api；未配置 `supports_websockets`
+///   时默认设为 `true`；移除 env_key、
 ///   experimental_bearer_token、requires_openai_auth；`[...auth]` command = `credential_command`、
 ///   args = ["get", "codex-helper/managed-gateway"]；
 /// - 移除根键 `model_catalog_json`（调用方已确认并记录原值）。
@@ -429,6 +430,9 @@ fn ensure_managed(
     set_string(provider, "name", consts::PROVIDER_NAME);
     set_string(provider, "base_url", gateway_base_url);
     set_string(provider, "wire_api", consts::PROVIDER_WIRE_API);
+    if !provider.contains_key("supports_websockets") {
+        set_value(provider, "supports_websockets", Value::from(true));
+    }
     // 命令鉴权与 env_key / experimental_bearer_token / requires_openai_auth 互斥
     for key in EXCLUSIVE_AUTH_KEYS {
         provider.remove(key);

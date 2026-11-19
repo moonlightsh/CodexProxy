@@ -136,6 +136,7 @@ sandbox_mode = "workspace-write"
 name = "Managed Gateway"
 base_url = "http://10.20.30.61:8080"
 wire_api = "responses"
+supports_websockets = true
 
 [model_providers.managed_gateway.auth]
 command = "C:\\Users\\<user>\\AppData\\Local\\Programs\\CodexHelper\\codex-helper-credential.exe"
@@ -143,6 +144,7 @@ args = ["get", "codex-helper/managed-gateway"]
 ```
 
 - `command` 每次校正时改写为当前安装目录下 credential.exe 的规范化绝对路径。
+- 启用或校正时，受管网关缺少 `supports_websockets` 则补写 `true`；保留显式的 `false`，不修改其他 provider。
 - 受管根键 `approval_policy = "on-request"`、`approvals_reviewer = "auto_review"`、
   `sandbox_mode = "workspace-write"`（自定义审批策略）：启用时写入，原值记录到状态文件，停用时还原；
   启用前已等于受管固定值的视为残留，停用后不写回（这些值同时是 Codex 默认值，行为不变）。

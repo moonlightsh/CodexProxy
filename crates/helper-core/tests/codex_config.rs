@@ -159,6 +159,28 @@ fn fixtures_round_trip_byte_for_byte() {
 }
 
 #[test]
+fn managed_gateway_defaults_to_websockets_without_overriding_explicit_opt_out() {
+    for (managed_setting, expected) in [("", true), ("supports_websockets = false\n", false)] {
+        let sandbox = Sandbox::with(&format!(
+            "[model_providers.custom]\nname = \"Custom\"\nsupports_websockets = false\n\n[model_providers.managed_gateway]\n{managed_setting}"
+        ));
+        sandbox.enable();
+        let doc = parse(&sandbox.read());
+        let providers = &doc["model_providers"];
+        assert_eq!(
+            providers["managed_gateway"]
+                .get("supports_websockets")
+                .and_then(toml_edit::Item::as_bool),
+            Some(expected)
+        );
+        assert_eq!(
+            providers["custom"]["supports_websockets"].as_bool(),
+            Some(false)
+        );
+    }
+}
+
+#[test]
 fn consecutive_apply_is_idempotent_for_every_fixture() {
     for (name, original) in FIXTURES {
         let sandbox = Sandbox::with(original);
