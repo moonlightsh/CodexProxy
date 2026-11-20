@@ -276,7 +276,8 @@ button {
 }
 
 input[type="password"],
-input[type="text"] {
+input[type="text"],
+.endpoint-gateway-preset {
   font: inherit;
   color: var(--text);
   background: var(--panel-bg);
@@ -288,6 +289,7 @@ input[type="text"] {
 
 input[type="password"]:focus,
 input[type="text"]:focus,
+.endpoint-gateway-preset:focus-visible,
 .btn:focus-visible,
 .switch-control:focus-visible {
   outline: 2px solid var(--accent);
@@ -442,6 +444,21 @@ input[type="text"]:focus,
   min-width: 0;
 }
 
+.endpoint-gateway-row {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.endpoint-gateway-preset {
+  grid-column: 2;
+  width: fit-content;
+  max-width: 100%;
+}
+
+.endpoint-panel .switch-row {
+  flex-wrap: wrap;
+}
+
 .endpoint-field-error,
 .endpoint-feedback-error {
   margin: 0;
@@ -509,6 +526,11 @@ input[type="text"]:focus,
 
 .switch-state-text {
   color: var(--text-muted);
+}
+
+.switch-hint {
+  color: var(--text-muted);
+  font-size: 13px;
 }
 
 /* ---- 状态灯 ---- */

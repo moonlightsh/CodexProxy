@@ -37,22 +37,28 @@ export interface ToggleControl {
 }
 
 /** 通用开关。忙时禁用并显示 busyText；点击回调的是切换后的目标状态。 */
-export function createToggle(handlers: { onChange: (enabled: boolean) => void }): ToggleControl {
+export function createToggle(options: {
+  onChange: (enabled: boolean) => void;
+  hint?: { id: string; text: string };
+}): ToggleControl {
+  const { onChange, hint } = options;
   const button = el("button", {
     type: "button",
     class: "switch-control",
     role: "switch",
     "aria-checked": "false",
+    "aria-describedby": hint?.id,
   });
   const label = el("span", { class: "switch-label" });
   const stateText = el("span", { class: "switch-state-text" });
-  const root = el("div", { class: "switch-row" }, [label, button, stateText]);
+  const hintText = hint ? el("span", { class: "switch-hint", id: hint.id }, [hint.text]) : null;
+  const root = el("div", { class: "switch-row" }, [label, button, stateText, hintText]);
 
   let currentEnabled = false;
 
   button.addEventListener("click", () => {
     if (button.disabled) return;
-    handlers.onChange(!currentEnabled);
+    onChange(!currentEnabled);
   });
 
   const update = (view: ToggleView) => {

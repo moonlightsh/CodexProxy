@@ -4,6 +4,9 @@ import { endpointWarningText, shouldKeepEndpointDraft, socks5Muted } from "./end
 import { createToggle } from "./switchcontrol";
 import type { EndpointWarning, Status } from "./types";
 
+const INTRANET_GATEWAY_URL = "http://10.20.30.61:8080";
+const INTERNET_GATEWAY_URL = "https://39.106.80.79/";
+
 export interface EndpointPanelHandlers {
   /** 保存当前输入框内容，不做格式校验。 */
   onSave: (gatewayBaseUrl: string, socks5Addr: string) => void;
@@ -31,6 +34,14 @@ export function createEndpointPanel(handlers: EndpointPanelHandlers): EndpointPa
     spellcheck: "false",
     "aria-label": "模型网关",
   }) as HTMLInputElement;
+  const gatewayPreset = el("select", {
+    class: "endpoint-gateway-preset",
+    "aria-label": "模型网关预设",
+  }, [
+    el("option", { value: "", selected: true, disabled: true, hidden: true }, ["选择预设"]),
+    el("option", { value: INTRANET_GATEWAY_URL }, [`${INTRANET_GATEWAY_URL} (内网)`]),
+    el("option", { value: INTERNET_GATEWAY_URL }, [`${INTERNET_GATEWAY_URL} (外网)`]),
+  ]);
   const socks5Input = el("input", {
     type: "text",
     id: "endpoint-socks5",
@@ -45,6 +56,7 @@ export function createEndpointPanel(handlers: EndpointPanelHandlers): EndpointPa
 
   const proxyToggle = createToggle({
     onChange: (enabled) => handlers.onProxyChange(enabled),
+    hint: { id: "endpoint-proxy-hint", text: "使用外网网关时无需开启本地代理" },
   });
 
   const restoreButton = el("button", { type: "button", class: "btn" }, ["恢复默认"]) as HTMLButtonElement;
@@ -53,7 +65,11 @@ export function createEndpointPanel(handlers: EndpointPanelHandlers): EndpointPa
 
   const root = el("div", { class: "endpoint-panel" }, [
     el("h2", { class: "section-title" }, ["网关设置"]),
-    el("div", { class: "endpoint-row" }, [el("span", {}, ["模型网关"]), gatewayInput]),
+    el("div", { class: "endpoint-row endpoint-gateway-row" }, [
+      el("label", { for: gatewayInput.id }, ["模型网关"]),
+      gatewayInput,
+      gatewayPreset,
+    ]),
     gatewayError,
     el("div", { class: "endpoint-row" }, [el("span", {}, ["上游 SOCKS5"]), socks5Input]),
     socks5Error,
@@ -68,6 +84,11 @@ export function createEndpointPanel(handlers: EndpointPanelHandlers): EndpointPa
   let socks5Dirty = false;
 
   gatewayInput.addEventListener("input", () => {
+    gatewayDirty = true;
+    gatewayPreset.value = "";
+  });
+  gatewayPreset.addEventListener("change", () => {
+    gatewayInput.value = gatewayPreset.value;
     gatewayDirty = true;
   });
   socks5Input.addEventListener("input", () => {
@@ -139,6 +160,7 @@ export function createEndpointPanel(handlers: EndpointPanelHandlers): EndpointPa
       shouldKeepEndpointDraft({ focused: socks5Focused, dirty: socks5Dirty });
     if (!keepDraft) {
       gatewayInput.value = status.gatewayBaseUrl;
+      gatewayPreset.value = "";
       socks5Input.value = status.socks5Addr;
     }
     socks5Input.classList.toggle("endpoint-input-muted", socks5Muted(status.proxyEnabled));
