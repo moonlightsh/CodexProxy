@@ -71,13 +71,16 @@ verify_universal() {
 # 凭据程序：两个架构分别编译，lipo 合成 fat 文件，按 Tauri 需要的三个后缀放置（见头部注释）。
 SIDECAR=codex-helper-credential
 BIN_DIR=apps/desktop/src-tauri/binaries
+# Tauri 会在各架构的 release 目录下删除并替换同名 sidecar，因此将 Cargo 产物放到独立目录。
+SIDECAR_TARGET_DIR=target/macos-sidecar
 for t in "${TARGETS[@]}"; do
-  cargo build --release -p "$SIDECAR" --target "$t"
+  cargo build --release -p "$SIDECAR" --target "$t" --target-dir "$SIDECAR_TARGET_DIR"
 done
 mkdir -p "$BIN_DIR"
 UNIVERSAL="$BIN_DIR/$SIDECAR-universal-apple-darwin"
 lipo -create -output "$UNIVERSAL" \
-  "target/aarch64-apple-darwin/release/$SIDECAR" "target/x86_64-apple-darwin/release/$SIDECAR"
+  "$SIDECAR_TARGET_DIR/aarch64-apple-darwin/release/$SIDECAR" \
+  "$SIDECAR_TARGET_DIR/x86_64-apple-darwin/release/$SIDECAR"
 verify_universal "$UNIVERSAL"
 for t in "${TARGETS[@]}"; do
   cp "$UNIVERSAL" "$BIN_DIR/$SIDECAR-$t"
